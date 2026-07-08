@@ -70,9 +70,6 @@ void Measurement::update(SystemBase & system_)
     Eigen::VectorXd x = system.density.mean(); // Set initial decision variable to prior mean
     Eigen::MatrixXd Xi = system.density.sqrtInfoMat();
 
-    // debug print
-    std::println("DEBUG: Prior mean before update: {}", system.density.mean().transpose());
-
     switch (updateMethod_)
     {
         case UpdateMethod::BFGSTRUSTSQRT: 
@@ -149,6 +146,14 @@ void Measurement::update(SystemBase & system_)
 
     // Set posterior mean to maximum a posteriori (MAP) estimate
     Eigen::VectorXd mu = x;
+
+    // Laplace approximation of the log evidence (needs the prior still in system.density):
+    // log p(y) = log p(y, x*) - log p(x* | y)
+    //         ~= -V(x*) + (n/2) log(2 pi) - sum(log|diag(Xi)|)
+    const double V = costJointDensity(mu, system);
+    const double logDetXi = Xi.diagonal().array().abs().log().sum();
+    logEvidence_ = -V + 0.5*nx*std::log(2.0*M_PI) - logDetXi;
+
     system.density = GaussianInfo<double>::fromSqrtInfo(Xi*mu, Xi);
 }
 

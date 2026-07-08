@@ -5,6 +5,7 @@
 #ifndef MEASUREMENT_H
 #define MEASUREMENT_H
 
+#include <limits>
 #include <Eigen/Core>
 #include "SystemBase.h"
 #include "SystemEstimator.h"
@@ -73,6 +74,16 @@ public:
      */
     virtual double logLikelihood(const Eigen::VectorXd & x, const SystemEstimator & system, Eigen::VectorXd & g, Eigen::MatrixXd & H) const = 0;
 
+    /**
+     * @brief Laplace approximation of the log evidence log p(y) from the last update.
+     *
+     * log p(y) ~= -V(x*) + (n/2) log(2 pi) - sum(log|diag(Xi)|)
+     * where V is the negative log joint density at the MAP estimate x* and Xi is
+     * the posterior sqrt information matrix. Useful for hypothesis weighting and
+     * update health monitoring. NaN until update() has run.
+     */
+    double logEvidence() const { return logEvidence_; }
+
 protected:
     /**
      * @brief Calculate the cost of the joint density.
@@ -113,6 +124,8 @@ protected:
     enum class UpdateMethod {BFGSTRUSTSQRT, BFGSLMSQRT, SR1TRUSTEIG, NEWTONTRUSTEIG, AFFINE, GAUSSNEWTON, LEVENBERGMARQUARDT};
 
     UpdateMethod updateMethod_;  ///< The method used for updating the system.
+
+    double logEvidence_ = std::numeric_limits<double>::quiet_NaN();  ///< Laplace log evidence from the last update.
 };
 
 #endif

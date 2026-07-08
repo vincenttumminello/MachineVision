@@ -5,6 +5,7 @@
 #include <print>
 #include <opencv2/core.hpp>
 #include "calibrate.h"
+#include "fieldLocalisation.h"
 #include "visualNavigation.h"
 
 int main(int argc, char* argv [])
@@ -14,6 +15,7 @@ int main(int argc, char* argv [])
         "{help h usage ?  |          | print this help message}"
         "{@input          | <none>   | path to input video or configuration XML}"
         "{calibrate c     |          | perform camera calibration for given configuration XML}"
+        "{robocup r       |          | run RoboCup field localisation on recorded data directory}"
         "{scenario s      | 6        | run visual navigation on input video with scenario type (4:flight, 5:tag, 6:room)}"
         "{interactive i   | 0        | interactivity (0:none, 1:last frame, 2:all frames)}"
         "{export e        |          | export video}";
@@ -59,6 +61,13 @@ int main(int argc, char* argv [])
         std::println("Calibrating camera");
         std::println("Configuration file: {}", inputPath.string());
         calibrateCamera(inputPath);
+    }
+    else if (parser.has("robocup"))
+    {
+        assert(0 <= interactive && interactive <= 2);
+        std::println("Running RoboCup field localisation");
+        std::println("Data directory: {}", inputPath.string());
+        runFieldLocalisation(inputPath, interactive, outputDirectory);
     }
     else
     {
