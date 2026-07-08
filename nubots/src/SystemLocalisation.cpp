@@ -16,7 +16,7 @@ SystemLocalisation::SystemLocalisation(const GaussianInfo<double> & density, con
     : SystemEstimator(density)
     , twistBuffer_(&twistBuffer)
 {
-    assert(density.dim() == 6);
+    assert(density.dim() == nx);
 }
 
 SystemLocalisation * SystemLocalisation::clone() const
@@ -29,7 +29,7 @@ SystemLocalisation * SystemLocalisation::clone() const
 template <typename Scalar>
 static Eigen::VectorX<Scalar> dynamicsLocalisationTemplated(const Eigen::VectorX<Scalar> & x, const Eigen::VectorXd & u)
 {
-    assert(x.size() == 6);
+    assert(x.size() == SystemLocalisation::nx);
     assert(u.size() == 6);
 
     const Eigen::VectorX<Scalar> Theta = x.segment(3, 3);
@@ -39,9 +39,11 @@ static Eigen::VectorX<Scalar> dynamicsLocalisationTemplated(const Eigen::VectorX
     const Eigen::Vector3d vBb = u.head<3>();
     const Eigen::Vector3d omegaBb = u.tail<3>();
 
-    Eigen::VectorX<Scalar> f(6);
+    Eigen::VectorX<Scalar> f(SystemLocalisation::nx);
+    f.setZero();
     f.segment(0, 3) = Rfb * vBb.cast<Scalar>();
     f.segment(3, 3) = TK * omegaBb.cast<Scalar>();
+    // Camera mount bias states are a random walk: zero drift
     return f;
 }
 
@@ -99,18 +101,19 @@ Eigen::VectorXd SystemLocalisation::input(double t, const Eigen::VectorXd & x) c
 GaussianInfo<double> SystemLocalisation::processNoiseDensity(double dt) const
 {
     // dw ~ N^{-1}(0, LambdaQ/dt), i.e., cov(dw) = Q*dt
-    Eigen::VectorXd sigma(6);
+    Eigen::VectorXd sigma(nx);
     sigma << params.sigmaPosXY, params.sigmaPosXY, params.sigmaPosZ,
-             params.sigmaAtt, params.sigmaAtt, params.sigmaYaw;
+             params.sigmaAtt, params.sigmaAtt, params.sigmaYaw,
+             params.sigmaCamBias, params.sigmaCamBias;
 
-    Eigen::MatrixXd XiQ = Eigen::MatrixXd::Zero(6, 6);
+    Eigen::MatrixXd XiQ = Eigen::MatrixXd::Zero(nx, nx);
     XiQ.diagonal() = (sigma*std::sqrt(dt)).cwiseInverse();
     return GaussianInfo<double>::fromSqrtInfo(XiQ);
 }
 
 std::vector<Eigen::Index> SystemLocalisation::processNoiseIndex() const
 {
-    return {0, 1, 2, 3, 4, 5};
+    return {0, 1, 2, 3, 4, 5, 6, 7};
 }
 
 std::vector<BodyTwistSample> SystemLocalisation::twistFromOdometry(const std::vector<SensorsSample> & sensors, double t0, double maxGap)
@@ -162,7 +165,7 @@ std::vector<BodyTwistSample> SystemLocalisation::twistFromOdometry(const std::ve
 
 void SystemLocalisation::resetTo(const GaussianInfo<double> & newDensity, double time)
 {
-    assert(newDensity.dim() == 6);
+    assert(newDensity.dim() == nx);
     density = newDensity;
     time_ = time;
 }

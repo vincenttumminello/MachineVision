@@ -23,19 +23,28 @@ struct BodyTwistSample
 };
 
 /*
- * State contains the 6-DOF torso pose in the field frame {f}
+ * State contains the 6-DOF torso pose in the field frame {f} plus a 2-DOF
+ * camera-mount attitude bias:
  *
- * x = eta = [ rBFf  ] Torso position in field frame (3)
- *           [ Thetafb ] Torso orientation RPY angles (3), Rfb = rpy2rot(Thetafb)
+ *     [ rBFf    ] Torso position in field frame (3)
+ * x = [ Thetafb ] Torso orientation RPY angles (3), Rfb = rpy2rot(Thetafb)
+ *     [ deltaC  ] Camera mount attitude bias (roll, pitch) about the camera axes (2)
  *
  * Field frame {f}: origin at centre of field on the ground plane, z up,
  * consistent with the NUbots Hfw convention.
+ *
+ * The camera bias models a constant error in the kinematic torso-to-camera
+ * chain (evident in the recorded data as ground-projection errors growing
+ * with range^2, ~1 m at 4-5 m range, consistent with a 1.5-2 deg pitch
+ * bias). It is a random-walk state with very small process noise, applied
+ * on the camera side of the extrinsic transform by vision measurements:
+ *   Tfc = Tfb(x) * Tbc * R(deltaC)
  *
  * Prediction is driven by a buffer of body-fixed twist samples obtained by
  * finite-differencing the odometry stream (Htw), treated as a known input
  * with additive process noise:
  *
- *   deta/dt = JK(eta) * nu(t) + dw
+ *   deta/dt = JK(eta) * nu(t) + dw,   ddeltaC/dt = dw_c
  *
  * where JK(eta) = blkdiag(Rfb, TK(Theta)) transports the body twist to
  * field-frame pose rates.
@@ -52,7 +61,10 @@ public:
         double sigmaPosZ   = 0.02;  ///< Position process noise PSD, vertical [m/sqrt(s)]
         double sigmaAtt    = 0.05;  ///< Roll/pitch process noise PSD [rad/sqrt(s)]
         double sigmaYaw    = 0.05;  ///< Yaw process noise PSD [rad/sqrt(s)]
+        double sigmaCamBias = 1e-3; ///< Camera mount bias process noise PSD [rad/sqrt(s)]
     };
+
+    static constexpr Eigen::Index nx = 8;   ///< State dimension
 
     SystemLocalisation(const GaussianInfo<double> & density, const std::vector<BodyTwistSample> & twistBuffer);
     virtual SystemLocalisation * clone() const;
@@ -75,6 +87,19 @@ public:
         Tfb.rotationMatrix = rpy2rot(Eigen::Vector3<Scalar>(x.template segment<3>(3)));
         Tfb.translationVector = x.template segment<3>(0);
         return Tfb;
+    }
+
+    /**
+     * @brief Camera-mount attitude bias correction from a state vector.
+     * @param x State vector (8)
+     * @return Rotation applied on the camera side of the extrinsic: R(deltaC)
+     */
+    template <typename Scalar>
+    static Eigen::Matrix3<Scalar> cameraBiasRotation(const Eigen::VectorX<Scalar> & x)
+    {
+        Eigen::Vector3<Scalar> rpy;
+        rpy << x(6), x(7), Scalar(0);
+        return rpy2rot(rpy);
     }
 
     /**

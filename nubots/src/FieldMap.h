@@ -139,6 +139,24 @@ public:
     explicit FieldMap(const FieldDimensions & dims = {});
 
     /**
+     * @brief A painted line segment on the field (centreline coordinates, ground plane)
+     */
+    struct LineSegment
+    {
+        Eigen::Vector2d a;  ///< Segment start (x, y) in {f}
+        Eigen::Vector2d b;  ///< Segment end (x, y) in {f}
+    };
+
+    /**
+     * @brief A painted circle on the field (centreline coordinates, ground plane)
+     */
+    struct Circle
+    {
+        Eigen::Vector2d centre; ///< Circle centre (x, y) in {f}
+        double radius;          ///< Circle radius
+    };
+
+    /**
      * @brief Get all known landmark positions of a given type
      * @param type Landmark type to retrieve
      * @return Landmark positions rLFf (landmark relative to field origin, expressed in the
@@ -146,16 +164,63 @@ public:
      */
     const std::vector<Eigen::Vector3d> & landmarks(LandmarkType type) const;
 
+    /// @brief Painted line segments (boundary, halfway line, goal/penalty areas)
+    const std::vector<LineSegment> & lineSegments() const { return lineSegments_; }
+
+    /// @brief Painted circles (centre circle)
+    const std::vector<Circle> & lineCircles() const { return lineCircles_; }
+
+    /**
+     * @brief Squared distance from a ground-plane point to the nearest painted line.
+     *
+     * Analytic minimum over all line segments and circles. Working with the
+     * squared distance keeps the function smooth through zero (points exactly
+     * on a line), which matters for derivative-based optimisation.
+     *
+     * @param p Point (x, y) in the field frame {f}
+     * @return Squared distance to the nearest line centreline [m^2]
+     */
+    template <typename Scalar>
+    Scalar distanceSquaredToNearestLine(const Eigen::Vector2<Scalar> & p) const
+    {
+        using std::sqrt;
+        Scalar best = Scalar(1e12);
+        for (const LineSegment & seg : lineSegments_)
+        {
+            const Eigen::Vector2<Scalar> a = seg.a.cast<Scalar>();
+            const Eigen::Vector2<Scalar> ab = (seg.b - seg.a).cast<Scalar>();
+            const double len2 = (seg.b - seg.a).squaredNorm();
+            Scalar t = (p - a).dot(ab)/Scalar(len2);
+            if (t < Scalar(0)) t = Scalar(0);
+            if (t > Scalar(1)) t = Scalar(1);
+            Scalar d2 = (p - (a + t*ab)).squaredNorm();
+            if (d2 < best) best = d2;
+        }
+        for (const Circle & c : lineCircles_)
+        {
+            const Eigen::Vector2<Scalar> pc = p - c.centre.cast<Scalar>();
+            Scalar n2 = pc.squaredNorm();
+            if (n2 < Scalar(1e-12)) n2 = Scalar(1e-12);     // Guard sqrt at the circle centre
+            Scalar n = sqrt(n2);
+            Scalar d = n - Scalar(c.radius);
+            Scalar d2 = d*d;
+            if (d2 < best) best = d2;
+        }
+        return best;
+    }
+
     FieldDimensions dims;   ///< Field dimensions used to build this map
 
 private:
-    /// @brief Populate #landmarksL_, #landmarksT_, #landmarksX_ and #landmarksGoalPost_ from #dims
+    /// @brief Populate the landmarks and line primitives from #dims
     void build();
 
     std::vector<Eigen::Vector3d> landmarksL_;          ///< L-intersection landmarks rLFf
     std::vector<Eigen::Vector3d> landmarksT_;          ///< T-intersection landmarks rLFf
     std::vector<Eigen::Vector3d> landmarksX_;          ///< X-intersection landmarks rLFf
     std::vector<Eigen::Vector3d> landmarksGoalPost_;   ///< Goal post landmarks rLFf
+    std::vector<LineSegment> lineSegments_;            ///< Painted line segments
+    std::vector<Circle> lineCircles_;                  ///< Painted circles
 };
 
 #endif  // FIELDMAP_H

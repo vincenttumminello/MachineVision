@@ -7,11 +7,12 @@
  * @code
  * {"type": "<message type>", "timestamp": <int, microseconds since epoch>, "data": {...}}
  * @endcode
- * Only four message types are of interest for state estimation and are parsed here:
+ * Only five message types are of interest for state estimation and are parsed here:
  *   - message.input.Sensors
  *   - message.vision.BoundingBoxes
  *   - message.behaviour.state.WalkState
  *   - message.localisation.Field
+ *   - message.vision.FieldLines
  *
  * @see SensorLog
  */
@@ -78,11 +79,22 @@ struct FieldBaselineSample
 };
 
 /**
+ * @brief A single message.vision.FieldLines sample (field-line points as camera rays)
+ */
+struct LinePointsSample
+{
+    double t;                                       ///< image capture time [s since epoch]
+    int videoFrame;                                 ///< index into frameTimes / Left.mp4, or -1
+    Pose<double> Hcw;                               ///< world -> camera
+    Eigen::Matrix<double, 3, Eigen::Dynamic> rays;  ///< unit rays in camera frame {c}, one column per field-line point
+};
+
+/**
  * @brief Parses a recorded NUbots sensor log (NDJSON) and aligns vision samples to video frames.
  *
- * Only four message types are parsed (message.input.Sensors, message.vision.BoundingBoxes,
- * message.behaviour.state.WalkState, message.localisation.Field); all other message types are
- * skipped cheaply. Each resulting stream is time-ordered.
+ * Only five message types are parsed (message.input.Sensors, message.vision.BoundingBoxes,
+ * message.behaviour.state.WalkState, message.localisation.Field, message.vision.FieldLines);
+ * all other message types are skipped cheaply. Each resulting stream is time-ordered.
  */
 class SensorLog
 {
@@ -98,6 +110,7 @@ public:
     std::vector<VisionSample> vision;                ///< time-ordered
     std::vector<WalkStateSample> walk;                ///< time-ordered
     std::vector<FieldBaselineSample> fieldBaseline;  ///< time-ordered
+    std::vector<LinePointsSample> linePoints;        ///< time-ordered
     std::vector<double> frameTimes;                  ///< [s since epoch] per video frame
     double t0 = 0;                                    ///< earliest sample time across all streams [s]
 };

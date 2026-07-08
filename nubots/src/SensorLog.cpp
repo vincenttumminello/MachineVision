@@ -177,6 +177,45 @@ double parseIso8601(std::string_view s)
 }
 
 /**
+ * @brief Binary-search frameTimes (sorted ascending) for the closest entry to a capture time
+ * @param t          Capture time to match [s since epoch]
+ * @param frameTimes Video frame times, sorted ascending [s since epoch]
+ * @param maxErr     Maximum allowed |frameTimes[idx] - t| for a match to be accepted [s]
+ * @return The matching frame index, or -1 if t is not finite or no frame is within maxErr
+ */
+int matchVideoFrame(double t, const std::vector<double> & frameTimes, double maxErr)
+{
+    if (std::isnan(t))
+    {
+        return -1;
+    }
+    auto it = std::lower_bound(frameTimes.begin(), frameTimes.end(), t);
+    std::size_t bestIdx = 0;
+    double bestErr = std::numeric_limits<double>::infinity();
+    if (it != frameTimes.end())
+    {
+        std::size_t idx = static_cast<std::size_t>(it - frameTimes.begin());
+        double err = std::abs(frameTimes[idx] - t);
+        if (err < bestErr)
+        {
+            bestErr = err;
+            bestIdx = idx;
+        }
+    }
+    if (it != frameTimes.begin())
+    {
+        std::size_t idx = static_cast<std::size_t>(it - frameTimes.begin()) - 1;
+        double err = std::abs(frameTimes[idx] - t);
+        if (err < bestErr)
+        {
+            bestErr = err;
+            bestIdx = idx;
+        }
+    }
+    return (bestErr <= maxErr) ? static_cast<int>(bestIdx) : -1;
+}
+
+/**
  * @brief Load the video frame timecodes (ms since video start, one per line) from file
  */
 std::vector<double> loadTimecodes(const std::filesystem::path & timecodePath)
@@ -322,7 +361,55 @@ SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesyst
             sample.cost = getDoubleTolerant(data["cost"]);
             fieldBaseline.push_back(std::move(sample));
         }
-        // else: not one of the four wanted types; the document_stream iterator skips the
+        else if (type == "message.vision.FieldLines")
+        {
+            simdjson::ondemand::object data;
+            if (docResult["data"].get_object().get(data) != simdjson::SUCCESS)
+            {
+                continue;
+            }
+            LinePointsSample sample;
+            sample.t = parseIso8601(getStringTolerant(data["timestamp"]));
+            sample.videoFrame = -1;
+            sample.Hcw = parseIso3(data["Hcw"]);
+
+            // rPWw: field-line points on the ground plane in world space, produced upstream by
+            // intersecting camera rays with the ground plane using this same Hcw. Recover the
+            // odometry-independent measurement (a unit ray in the camera frame) by re-applying
+            // Hcw to each point and normalising.
+            std::vector<Eigen::Vector3d> rayList;
+            simdjson::ondemand::array pts;
+            if (data["rPWw"].get_array().get(pts) == simdjson::SUCCESS)
+            {
+                for (auto ptResult : pts)
+                {
+                    Eigen::Vector3d rPWw = parseVec3(ptResult);
+                    if (!rPWw.array().isFinite().all())
+                    {
+                        continue;
+                    }
+                    Eigen::Vector3d rPCc = sample.Hcw * rPWw;
+                    if (!rPCc.array().isFinite().all())
+                    {
+                        continue;
+                    }
+                    double norm = rPCc.norm();
+                    if (!(norm >= 1e-9))
+                    {
+                        continue;
+                    }
+                    rayList.push_back(rPCc / norm);
+                }
+            }
+            sample.rays.resize(3, static_cast<Eigen::Index>(rayList.size()));
+            for (std::size_t col = 0; col < rayList.size(); ++col)
+            {
+                sample.rays.col(static_cast<Eigen::Index>(col)) = rayList[col];
+            }
+
+            linePoints.push_back(std::move(sample));
+        }
+        // else: not one of the five wanted types; the document_stream iterator skips the
         // remainder of this document cheaply (no further parsing/materialisation occurs since
         // on-demand only parses fields that are actually accessed).
     }
@@ -353,49 +440,21 @@ SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesyst
     int nMatched = 0;
     for (VisionSample & v : vision)
     {
-        if (std::isnan(v.t))
+        v.videoFrame = matchVideoFrame(v.t, frameTimes, kMaxFrameMatchError);
+        if (v.videoFrame != -1)
         {
-            v.videoFrame = -1;
-            continue;
-        }
-        // Binary search frameTimes (sorted ascending) for the closest entry to v.t
-        auto it = std::lower_bound(frameTimes.begin(), frameTimes.end(), v.t);
-        std::size_t bestIdx = 0;
-        double bestErr = std::numeric_limits<double>::infinity();
-        if (it != frameTimes.end())
-        {
-            std::size_t idx = static_cast<std::size_t>(it - frameTimes.begin());
-            double err = std::abs(frameTimes[idx] - v.t);
-            if (err < bestErr)
-            {
-                bestErr = err;
-                bestIdx = idx;
-            }
-        }
-        if (it != frameTimes.begin())
-        {
-            std::size_t idx = static_cast<std::size_t>(it - frameTimes.begin()) - 1;
-            double err = std::abs(frameTimes[idx] - v.t);
-            if (err < bestErr)
-            {
-                bestErr = err;
-                bestIdx = idx;
-            }
-        }
-        if (bestErr <= kMaxFrameMatchError)
-        {
-            v.videoFrame = static_cast<int>(bestIdx);
             ++nMatched;
-        }
-        else
-        {
-            v.videoFrame = -1;
         }
     }
 
     if (!vision.empty() && static_cast<double>(nMatched) < 0.99 * static_cast<double>(vision.size()))
     {
         throw std::runtime_error("SensorLog: fewer than 99% of vision samples matched a video frame");
+    }
+
+    for (LinePointsSample & lp : linePoints)
+    {
+        lp.videoFrame = matchVideoFrame(lp.t, frameTimes, kMaxFrameMatchError);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -407,6 +466,7 @@ SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesyst
     std::stable_sort(vision.begin(), vision.end(), byTime);
     std::stable_sort(walk.begin(), walk.end(), byTime);
     std::stable_sort(fieldBaseline.begin(), fieldBaseline.end(), byTime);
+    std::stable_sort(linePoints.begin(), linePoints.end(), byTime);
 
     t0 = std::numeric_limits<double>::infinity();
     if (!sensors.empty())
@@ -424,6 +484,10 @@ SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesyst
     if (!fieldBaseline.empty())
     {
         t0 = std::min(t0, fieldBaseline.front().t);
+    }
+    if (!linePoints.empty())
+    {
+        t0 = std::min(t0, linePoints.front().t);
     }
     if (!std::isfinite(t0))
     {

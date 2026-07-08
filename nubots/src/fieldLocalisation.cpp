@@ -16,6 +16,7 @@
 #include "fieldLocalisation.h"
 #include "GaussianInfo.hpp"
 #include "MeasurementFieldLandmarks.h"
+#include "MeasurementFieldLines.h"
 #include "MeasurementGravity.h"
 #include "MeasurementKinematicHeight.h"
 #include "Pose.hpp"
@@ -165,12 +166,12 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     const double tInit = log.fieldBaseline[initIdx].t - t0;
     std::println("Initialising at t={:.3f} s from baseline (cost {:.3f})", tInit, log.fieldBaseline[initIdx].cost);
 
-    Eigen::VectorXd eta0(6);
+    Eigen::VectorXd eta0 = Eigen::VectorXd::Zero(SystemLocalisation::nx);
     eta0.head<3>() = Tfb0.translationVector;
-    eta0.tail<3>() = rot2rpy(Tfb0.rotationMatrix);
+    eta0.segment<3>(3) = rot2rpy(Tfb0.rotationMatrix);
 
-    Eigen::MatrixXd S0 = Eigen::MatrixXd::Zero(6, 6);
-    S0.diagonal() << 0.3, 0.3, 0.05, 0.05, 0.05, 0.15;  // [m, m, m, rad, rad, rad]
+    Eigen::MatrixXd S0 = Eigen::MatrixXd::Zero(SystemLocalisation::nx, SystemLocalisation::nx);
+    S0.diagonal() << 0.3, 0.3, 0.05, 0.05, 0.05, 0.15, 0.05, 0.05;  // pose [m/rad] + camera bias [rad]
     auto p0 = GaussianInfo<double>::fromSqrtMoment(eta0, S0);
 
     SystemLocalisation system(p0, twists);
@@ -217,13 +218,26 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         std::size_t k = nearestIndex(log.sensors, v.t, [](const SensorsSample & s) { return s.t; });
         Pose<double> Tbc = log.sensors[k].Htw*v.Hcw.inverse();
 
-        // Proprioceptive measurements (validated separately; enable once core pipeline is verified)
+        // Measurement toggles (for ablation experiments)
         constexpr bool useGravity = true;
         constexpr bool useKinematicHeight = true;
+        constexpr bool useFieldLines = false;
 
         auto tic = std::chrono::steady_clock::now();
         MeasurementFieldLandmarks meas(t, v, Tbc, map, system);
         meas.process(system);
+        if (useFieldLines && !log.linePoints.empty())
+        {
+            std::size_t li = nearestIndex(log.linePoints, v.t, [](const LinePointsSample & s) { return s.t; });
+            const LinePointsSample & lp = log.linePoints[li];
+            if (std::abs(lp.t - v.t) < 0.05)
+            {
+                std::size_t lk = nearestIndex(log.sensors, lp.t, [](const SensorsSample & s) { return s.t; });
+                Pose<double> TbcLines = log.sensors[lk].Htw*lp.Hcw.inverse();
+                MeasurementFieldLines measLines(t, lp, TbcLines, map, system);
+                measLines.process(system);
+            }
+        }
         if (useGravity && log.sensors[k].accelerometer.allFinite())
         {
             MeasurementGravity mg(t, log.sensors[k].accelerometer);
@@ -286,6 +300,11 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     // Summary
     std::println("");
     std::println("Processed {} vision updates ({} skipped)", nUpdates, nSkipped);
+    {
+        Eigen::VectorXd xFinal = system.density.mean();
+        std::println("Final camera mount bias estimate: roll {:.2f} deg, pitch {:.2f} deg",
+                     xFinal(6)*180.0/M_PI, xFinal(7)*180.0/M_PI);
+    }
     std::println("Mean update time {:.2f} ms, max {:.2f} ms", nUpdates ? sumMs/nUpdates : 0.0, maxMs);
     if (nCompared > 0)
     {

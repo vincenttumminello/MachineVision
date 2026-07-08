@@ -91,8 +91,9 @@ std::vector<std::pair<std::size_t, std::size_t>> MeasurementFieldLandmarks::asso
         return keys;
     }
 
-    // Predicted ray for every mapped landmark at the given state
-    Pose<double> Tfc = SystemLocalisation::fieldPose<double>(x)*Tbc_;
+    // Predicted ray for every mapped landmark at the given state (incl. camera mount bias)
+    Pose<double> Tbias(SystemLocalisation::cameraBiasRotation<double>(x), Eigen::Vector3d::Zero());
+    Pose<double> Tfc = SystemLocalisation::fieldPose<double>(x)*Tbc_*Tbias;
     const Eigen::Matrix3d Rcf = Tfc.rotationMatrix.transpose();
     const Eigen::Vector3d rCFf = Tfc.translationVector;
 

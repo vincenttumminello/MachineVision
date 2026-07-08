@@ -9,8 +9,8 @@ SCENARIO("SystemLocalisation dynamics and prediction")
 {
     GIVEN("A system at the field origin with an identity-orientation state")
     {
-        Eigen::VectorXd eta0 = Eigen::VectorXd::Zero(6);
-        Eigen::MatrixXd S0 = Eigen::MatrixXd::Identity(6, 6)*0.01;
+        Eigen::VectorXd eta0 = Eigen::VectorXd::Zero(SystemLocalisation::nx);
+        Eigen::MatrixXd S0 = Eigen::MatrixXd::Identity(SystemLocalisation::nx, SystemLocalisation::nx)*0.01;
         auto p0 = GaussianInfo<double>::fromSqrtMoment(eta0, S0);
 
         WHEN("the twist buffer holds a constant forward velocity")
@@ -31,6 +31,7 @@ SCENARIO("SystemLocalisation dynamics and prediction")
                 Eigen::VectorXd u(6);
                 u << 0.5, 0, 0, 0, 0, 0.1;
                 Eigen::VectorXd f = system.dynamics(0.0, eta0, u);
+                REQUIRE(f.size() == SystemLocalisation::nx);
                 CHECK(f(0) == doctest::Approx(0.5));
                 CHECK(f(1) == doctest::Approx(0.0));
                 CHECK(f(5) == doctest::Approx(0.1));
@@ -38,24 +39,25 @@ SCENARIO("SystemLocalisation dynamics and prediction")
 
             THEN("the dynamics Jacobian matches finite differences")
             {
-                Eigen::VectorXd x(6);
-                x << 0.3, -0.2, 0.0, 0.05, -0.1, 0.7;
+                const int n = SystemLocalisation::nx;
+                Eigen::VectorXd x = Eigen::VectorXd::Zero(n);
+                x.head<6>() << 0.3, -0.2, 0.0, 0.05, -0.1, 0.7;
                 Eigen::VectorXd u(6);
                 u << 0.4, 0.1, -0.02, 0.01, 0.03, 0.2;
 
                 Eigen::MatrixXd J;
                 Eigen::VectorXd f = system.dynamics(0.0, x, u, J);
-                REQUIRE(J.rows() == 6);
-                REQUIRE(J.cols() == 6);
+                REQUIRE(J.rows() == n);
+                REQUIRE(J.cols() == n);
 
                 const double h = 1e-6;
-                for (int j = 0; j < 6; ++j)
+                for (int j = 0; j < n; ++j)
                 {
                     Eigen::VectorXd xp = x, xm = x;
                     xp(j) += h;
                     xm(j) -= h;
                     Eigen::VectorXd dfd = (system.dynamics(0.0, xp, u) - system.dynamics(0.0, xm, u))/(2*h);
-                    for (int i = 0; i < 6; ++i)
+                    for (int i = 0; i < n; ++i)
                     {
                         CHECK(J(i, j) == doctest::Approx(dfd(i)).epsilon(1e-4));
                     }

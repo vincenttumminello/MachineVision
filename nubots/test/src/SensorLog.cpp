@@ -73,15 +73,17 @@ SCENARIO("SensorLog: parse recorded_data.json and align to Left_timecode.txt")
                 CHECK(log.vision.size() == 861);
                 CHECK(log.walk.size() == 7607);
                 CHECK(log.fieldBaseline.size() == 846);
+                CHECK(log.linePoints.size() == 848);
                 CHECK(log.frameTimes.size() == 863);
             }
 
-            THEN("All four streams are strictly (weakly) time-ordered")
+            THEN("All five streams are strictly (weakly) time-ordered")
             {
                 CHECK(isTimeOrdered(log.sensors));
                 CHECK(isTimeOrdered(log.vision));
                 CHECK(isTimeOrdered(log.walk));
                 CHECK(isTimeOrdered(log.fieldBaseline));
+                CHECK(isTimeOrdered(log.linePoints));
             }
 
             THEN("Exactly one vision sample has no matching video frame")
@@ -134,6 +136,26 @@ SCENARIO("SensorLog: parse recorded_data.json and align to Left_timecode.txt")
                 double norm = a.norm();
                 CHECK(norm > 8.0);
                 CHECK(norm < 12.0);
+            }
+
+            THEN("Every LinePoints sample has at least one ray, and rays are unit-norm for the first "
+                 "non-empty sample")
+            {
+                bool checked = false;
+                for (const LinePointsSample & lp : log.linePoints)
+                {
+                    CHECK(lp.rays.cols() >= 1);
+                    if (!checked && lp.rays.cols() > 0)
+                    {
+                        for (Eigen::Index col = 0; col < lp.rays.cols(); ++col)
+                        {
+                            Eigen::Vector3d ray = lp.rays.col(col);
+                            CHECK(ray.norm() == doctest::Approx(1.0).epsilon(1e-6));
+                        }
+                        checked = true;
+                    }
+                }
+                CHECK(checked);
             }
         }
     }

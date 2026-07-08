@@ -139,9 +139,11 @@ protected:
 template <typename Scalar>
 Eigen::Matrix<Scalar, 3, Eigen::Dynamic> MeasurementFieldLandmarks::predictRays(const Eigen::VectorX<Scalar> & x) const
 {
-    // Camera pose in field frame: Tfc = Tfb(x) * Tbc
+    // Camera pose in field frame with mount-bias correction:
+    // Tfc = Tfb(x) * Tbc * R(deltaC)
     Pose<Scalar> Tfb = SystemLocalisation::fieldPose(x);
-    Pose<Scalar> Tfc = Tfb*Pose<Scalar>(Tbc_);
+    Pose<Scalar> Tbias(SystemLocalisation::cameraBiasRotation(x), Eigen::Vector3<Scalar>::Zero());
+    Pose<Scalar> Tfc = Tfb*Pose<Scalar>(Tbc_)*Tbias;
 
     const Eigen::Matrix3<Scalar> Rcf = Tfc.rotationMatrix.transpose();
     const Eigen::Vector3<Scalar> rCFf = Tfc.translationVector;

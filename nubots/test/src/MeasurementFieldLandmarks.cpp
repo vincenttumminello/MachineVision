@@ -31,8 +31,9 @@ SCENARIO("MeasurementFieldLandmarks association and MAP update")
         FieldMap map;
 
         // True torso pose: 1 m behind centre, 0.45 m torso height, facing +x
-        Eigen::VectorXd etaTrue(6);
-        etaTrue << -1.0, 0.2, 0.45, 0.0, 0.0, 0.1;
+        // (camera mount bias states zero)
+        Eigen::VectorXd etaTrue = Eigen::VectorXd::Zero(SystemLocalisation::nx);
+        etaTrue.head<6>() << -1.0, 0.2, 0.45, 0.0, 0.0, 0.1;
 
         // Camera 0.1 m above torso origin, aligned with torso
         Pose<double> Tbc;
@@ -75,7 +76,7 @@ SCENARIO("MeasurementFieldLandmarks association and MAP update")
 
         WHEN("the prior is centred at the true pose")
         {
-            auto p0 = GaussianInfo<double>::fromSqrtMoment(etaTrue, Eigen::MatrixXd(Eigen::MatrixXd::Identity(6, 6)*0.1));
+            auto p0 = GaussianInfo<double>::fromSqrtMoment(etaTrue, Eigen::MatrixXd(Eigen::MatrixXd::Identity(SystemLocalisation::nx, SystemLocalisation::nx)*0.1));
             SystemLocalisation system(p0, twists);
             MeasurementFieldLandmarks meas(0.0, sample, Tbc, map, system);
 
@@ -102,7 +103,7 @@ SCENARIO("MeasurementFieldLandmarks association and MAP update")
                 Eigen::VectorXd g;
                 meas.logLikelihood(x, system, g);
                 const double h = 1e-6;
-                for (int j = 0; j < 6; ++j)
+                for (int j = 0; j < SystemLocalisation::nx; ++j)
                 {
                     Eigen::VectorXd xp = x, xm = x;
                     xp(j) += h;
@@ -120,7 +121,9 @@ SCENARIO("MeasurementFieldLandmarks association and MAP update")
             etaPrior(1) -= 0.1;
             etaPrior(5) += 0.05;
 
-            auto p0 = GaussianInfo<double>::fromSqrtMoment(etaPrior, Eigen::MatrixXd(Eigen::MatrixXd::Identity(6, 6)*0.2));
+            Eigen::MatrixXd Sp = Eigen::MatrixXd::Identity(SystemLocalisation::nx, SystemLocalisation::nx)*0.2;
+            Sp.diagonal().tail<2>().setConstant(0.02);  // Tight camera-bias prior: rays here are exact
+            auto p0 = GaussianInfo<double>::fromSqrtMoment(etaPrior, Sp);
             SystemLocalisation system(p0, twists);
             // The synthetic rays are exact, so use a correspondingly tight noise model
             MeasurementFieldLandmarks::Options options;
