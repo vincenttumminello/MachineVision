@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+#
+# mcha4400 — run the MCHA4400 toolchain in a container from the terminal.
+#
+#   ./mcha4400            open an interactive shell in the toolchain
+#   ./mcha4400 build      (re)build the toolchain image
+#   ./mcha4400 <cmd...>   run <cmd> inside the toolchain (e.g. ./mcha4400 cmake --version)
+#
+# GUI programs (cv::imshow, VTK) render on your desktop via the host X server.
+#
+set -euo pipefail
+
+IMAGE="mcha4400:latest"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+build_image() {
+    docker build \
+        --build-arg USER_UID="$(id -u)" \
+        --build-arg USER_GID="$(id -g)" \
+        -t "$IMAGE" \
+        "$HERE/.devcontainer"
+}
+
+ensure_image() {
+    docker image inspect "$IMAGE" >/dev/null 2>&1 || build_image
+}
+
+run_in_container() {
+    ensure_image
+
+    # Allow the container (same uid as us) to talk to the host X server.
+    if command -v xhost >/dev/null 2>&1; then
+        xhost "+SI:localuser:$(id -un)" >/dev/null 2>&1 || true
+    fi
+
+    local args=(--rm -i)
+    # Allocate a TTY only when attached to one (so pipes/CI still work).
+    [[ -t 0 && -t 1 ]] && args+=(-t)
+    args+=(
+        -v "$HERE":/workspace
+        -w /workspace
+        -e DISPLAY="${DISPLAY:-:0}"
+        -v /tmp/.X11-unix:/tmp/.X11-unix:rw
+    )
+    # Pass the GPU render node through if present (hardware OpenGL for VTK).
+    [[ -e /dev/dri ]] && args+=(--device /dev/dri)
+    # Optional software-GL fallback: LIBGL_ALWAYS_SOFTWARE=1 ./mcha4400 ...
+    [[ -n "${LIBGL_ALWAYS_SOFTWARE:-}" ]] && args+=(-e LIBGL_ALWAYS_SOFTWARE)
+
+    docker run "${args[@]}" "$IMAGE" "$@"
+}
+
+case "${1:-shell}" in
+    build)       build_image ;;
+    shell|"")    run_in_container bash ;;
+    *)           run_in_container "$@" ;;
+esac

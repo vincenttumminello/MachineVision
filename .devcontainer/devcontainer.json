@@ -1,0 +1,38 @@
+{
+    "name": "MCHA4400",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".",
+        "args": {
+            "USER_UID": "1000",
+            "USER_GID": "1000"
+        }
+    },
+    "workspaceFolder": "/workspace",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+    "remoteUser": "dev",
+    // Forward the host X server (XWayland) and the GPU render node so
+    // cv::imshow and VTK windows appear on your desktop.
+    "runArgs": [
+        "--device=/dev/dri",
+        "--volume=/tmp/.X11-unix:/tmp/.X11-unix:rw"
+    ],
+    "containerEnv": {
+        "DISPLAY": "${localEnv:DISPLAY}"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "llvm-vs-code-extensions.vscode-clangd",
+                "ms-vscode.cmake-tools",
+                "twxs.cmake"
+            ],
+            "settings": {
+                "cmake.generator": "Ninja",
+                "cmake.configureOnOpen": true,
+                "clangd.arguments": ["--background-index", "--clang-tidy"],
+                "C_Cpp.intelliSenseEngine": "disabled"
+            }
+        }
+    }
+}
