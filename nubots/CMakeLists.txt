@@ -55,16 +55,13 @@ find_package(doctest REQUIRED)
 find_package(Boost 1.74 REQUIRED)
 find_package(Eigen3 3.4 REQUIRED NO_MODULE)
 find_package(autodiff 1.0 REQUIRED)
-find_package(OpenCV 4.7 REQUIRED)
-find_package(VTK 8.2 REQUIRED)
-find_package(onnxruntime QUIET) # optional
+find_package(OpenCV 4.6 REQUIRED)
 find_package(Doxygen QUIET)     # optional
 
-if(onnxruntime_FOUND)
-    add_definitions(-DWITH_ONNX)
-else()
-    message(STATUS "ONNX Runtime not found. Building without ONNX Runtime support.")
-endif()
+# Note: onnxruntime is not searched for; YOLO inference happens on-robot and
+# detections arrive pre-computed in the recorded data. (The image's onnxruntime
+# CMake config is also currently broken.) Re-add find_package(onnxruntime) if
+# on-host inference is needed later.
 
 option(BUILD_DOCUMENTATION "Build documentation" OFF)
 
@@ -93,13 +90,6 @@ if(BUILD_DOCUMENTATION)
     endif()
 endif()
 
-if(VTK_VERSION VERSION_LESS "8.90.0")
-    include(${VTK_USE_FILE})
-else()
-    include_directories(${VTK_PREFIX_PATH}/include/vtk-${VTK_MAJOR_VERSION}.${VTK_MINOR_VERSION})
-    include_directories(${VTK_PREFIX_PATH}/include/vtk) # Support VTK 9.x under MSYS2
-endif()
-
 include_directories(${EIGEN3_INCLUDE_DIR})
 include_directories(${Boost_INCLUDE_DIR})
 include_directories(${OpenCV_INCLUDE_DIRS})
@@ -115,13 +105,8 @@ set(LIBS
     Eigen3::Eigen
     autodiff::autodiff
     ${OpenCV_LIBS}
-    ${VTK_LIBRARIES}
     nanobench
 )
-
-if(onnxruntime_FOUND)
-    list(APPEND LIBS onnxruntime::onnxruntime)
-endif()
 
 # Source files
 set(DIR_SRC src)
@@ -151,10 +136,6 @@ if(SRC_LIB)
     target_link_libraries(${TARGET_BIN} ${TARGET_LIB})
 endif()
 target_link_libraries(${TARGET_BIN} ${LIBS})
-
-if(VTK_VERSION VERSION_GREATER_EQUAL "8.90.0")
-    vtk_module_autoinit(TARGETS ${TARGET_BIN} MODULES ${VTK_LIBRARIES})
-endif()
 
 # Add documentation dependency if applicable
 if(BUILD_DOCUMENTATION AND DOXYGEN_FOUND)

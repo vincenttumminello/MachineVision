@@ -23,6 +23,9 @@ SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 RUN apt-get update && apt-get install -y --no-install-recommends \
         # --- compiler / build system ---
         build-essential \
+        # gcc-14's libstdc++ provides <print> for C++23 (clang picks the
+        # newest installed libstdc++ automatically)
+        g++-14 \
         clang \
         clangd \
         clang-format \
