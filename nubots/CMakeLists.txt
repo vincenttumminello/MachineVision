@@ -51,6 +51,14 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(nanobench)
 
+FetchContent_Declare(
+    simdjson
+    GIT_REPOSITORY https://github.com/simdjson/simdjson.git
+    GIT_TAG v3.10.1
+    GIT_SHALLOW TRUE)
+
+FetchContent_MakeAvailable(simdjson)
+
 find_package(doctest REQUIRED)
 find_package(Boost 1.74 REQUIRED)
 find_package(Eigen3 3.4 REQUIRED NO_MODULE)
@@ -106,6 +114,7 @@ set(LIBS
     autodiff::autodiff
     ${OpenCV_LIBS}
     nanobench
+    simdjson::simdjson
 )
 
 # Source files
