@@ -2,9 +2,11 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <limits>
 #include <print>
+#include <string>
 #include <vector>
 #include <Eigen/Core>
 #include <Eigen/Eigenvalues>
@@ -42,6 +44,24 @@ static std::size_t nearestIndex(const std::vector<T> & v, double t, F && timeOf)
     return (timeOf(v[i]) - t < t - timeOf(v[i-1])) ? i : i - 1;
 }
 
+// Colours (BGR) shared between the plotted marks and the legend so the two
+// can never drift apart.
+namespace plotcolour
+{
+    const cv::Scalar field(255, 255, 255);      ///< Field lines
+    const cv::Scalar goalPost(0, 220, 220);     ///< Goal posts (yellow)
+    const cv::Scalar baseline(180, 180, 180);   ///< NUbots baseline (grey)
+    const cv::Scalar estimateStart(255, 128, 0);///< Our estimate at the start of the run (blue)
+    const cv::Scalar estimateEnd(0, 128, 255);  ///< Our estimate at the end of the run (orange)
+    const cv::Scalar covariance(255, 0, 200);   ///< 2-sigma position ellipse (magenta)
+
+    // Interpolate the estimate trajectory colour by time fraction [0, 1].
+    inline cv::Scalar estimate(double frac)
+    {
+        return cv::Scalar(255*(1 - frac), 128, 255*frac);
+    }
+}
+
 // Simple top-down field renderer for trajectories
 class FieldPlot
 {
@@ -51,21 +71,28 @@ public:
         , scale_(pixelsPerMetre)
     {
         const double borderm = dims.borderStripMinWidth + 0.3;
-        width_  = static_cast<int>((dims.fieldLength + 2*borderm)*scale_);
-        height_ = static_cast<int>((dims.fieldWidth  + 2*borderm)*scale_);
-        img_ = cv::Mat(height_, width_, CV_8UC3, cv::Scalar(30, 100, 30));
+        fieldW_ = static_cast<int>((dims.fieldLength + 2*borderm)*scale_);
+        fieldH_ = static_cast<int>((dims.fieldWidth  + 2*borderm)*scale_);
+        width_  = fieldW_;
+        height_ = topMargin_ + fieldH_ + bottomMargin_;
+
+        // Dark surround, with the playing field painted green in the middle band
+        img_ = cv::Mat(height_, width_, CV_8UC3, cv::Scalar(45, 45, 45));
+        cv::rectangle(img_, cv::Point(0, topMargin_), cv::Point(fieldW_, topMargin_ + fieldH_),
+                      cv::Scalar(30, 100, 30), cv::FILLED);
         drawField();
     }
 
     cv::Point2i toPixel(double xf, double yf) const
     {
-        // Field x to the right, field y up in the image
-        return {static_cast<int>(width_/2.0 + xf*scale_), static_cast<int>(height_/2.0 - yf*scale_)};
+        // Field x to the right, field y up in the image (offset below the title band)
+        return {static_cast<int>(fieldW_/2.0 + xf*scale_),
+                static_cast<int>(topMargin_ + fieldH_/2.0 - yf*scale_)};
     }
 
     void drawField()
     {
-        const cv::Scalar white(255, 255, 255);
+        const cv::Scalar & white = plotcolour::field;
         const int lw = std::max(1, static_cast<int>(dims_.lineWidth*scale_));
         const double hl = dims_.fieldLength/2, hw = dims_.fieldWidth/2;
 
@@ -83,9 +110,65 @@ public:
             cv::drawMarker(img_, toPixel(s*(hl - dims_.penaltyMarkDistance), 0), white, cv::MARKER_CROSS, 8, lw);
             for (int t : {-1, 1})
             {
-                cv::circle(img_, toPixel(s*hl, t*dims_.goalWidth/2), std::max(2, static_cast<int>(dims_.goalpostWidth/2*scale_)), cv::Scalar(0, 220, 220), -1);
+                cv::circle(img_, toPixel(s*hl, t*dims_.goalWidth/2), std::max(2, static_cast<int>(dims_.goalpostWidth/2*scale_)), plotcolour::goalPost, -1);
             }
         }
+    }
+
+    /// @brief Draw the title (and optional subtitle) in the top band.
+    void drawTitle(const std::string & title, const std::string & subtitle = "")
+    {
+        cv::putText(img_, title, cv::Point(14, 27), cv::FONT_HERSHEY_SIMPLEX, 0.62,
+                    cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+        if (!subtitle.empty())
+        {
+            cv::putText(img_, subtitle, cv::Point(14, topMargin_ - 8), cv::FONT_HERSHEY_SIMPLEX, 0.40,
+                        cv::Scalar(190, 190, 190), 1, cv::LINE_AA);
+        }
+    }
+
+    /// @brief Draw the legend explaining every plotted mark in the bottom band.
+    void drawLegend()
+    {
+        const int y0 = topMargin_ + fieldH_;
+        const int col1 = 16;
+        const int col2 = fieldW_/2 + 8;
+        const int rowH = 30;
+        const int textDx = 26;
+
+        auto label = [&](int x, int row, const std::string & text)
+        {
+            cv::putText(img_, text, cv::Point(x + textDx, y0 + row*rowH + 5),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.44, cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
+        };
+        auto dot = [&](int x, int row, const cv::Scalar & colour)
+        {
+            cv::circle(img_, cv::Point(x + 8, y0 + row*rowH), 5, colour, cv::FILLED, cv::LINE_AA);
+        };
+
+        // NUbots baseline (grey dot)
+        dot(col1, 1, plotcolour::baseline);
+        label(col1, 1, "NUbots baseline pose (localisation.Field)");
+
+        // Our estimate: blue->orange gradient swatch
+        {
+            const int cx = col1 + 8, cy = y0 + 2*rowH;
+            for (int dx = -12; dx <= 12; ++dx)
+            {
+                double f = (dx + 12)/24.0;
+                cv::line(img_, cv::Point(cx + dx, cy - 4), cv::Point(cx + dx, cy + 4), plotcolour::estimate(f), 1);
+            }
+        }
+        label(col1, 2, "Our estimate (blue = start -> orange = end)");
+
+        // 2-sigma covariance ring (magenta)
+        cv::ellipse(img_, cv::Point(col2 + 8, y0 + rowH), cv::Size(9, 6), 0, 0, 360, plotcolour::covariance, 1, cv::LINE_AA);
+        label(col2, 1, "2-sigma position uncertainty");
+
+        // Goal posts (yellow) and field lines (white line)
+        dot(col2, 2, plotcolour::goalPost);
+        cv::line(img_, cv::Point(col2 + 2, y0 + 2*rowH + 12), cv::Point(col2 + 14, y0 + 2*rowH + 12), plotcolour::field, 1, cv::LINE_AA);
+        label(col2, 2, "Goal posts / field lines (map)");
     }
 
     void drawPoint(double xf, double yf, const cv::Scalar & colour, int radius = 2)
@@ -111,6 +194,9 @@ private:
     FieldDimensions dims_;
     double scale_;
     int width_, height_;
+    int fieldW_ = 0, fieldH_ = 0;
+    const int topMargin_ = 44;      ///< Title band height [px]
+    const int bottomMargin_ = 104;  ///< Legend band height [px]
     cv::Mat img_;
 };
 
@@ -323,7 +409,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     {
         if (std::isfinite(r.baseX))
         {
-            plot.drawPoint(r.baseX, r.baseY, cv::Scalar(180, 180, 180), 2);
+            plot.drawPoint(r.baseX, r.baseY, plotcolour::baseline, 2);
         }
     }
     double lastEllipse = -1e9;
@@ -331,15 +417,23 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     {
         const Record & r = records[i];
         double frac = records.size() > 1 ? static_cast<double>(i)/(records.size() - 1) : 0.0;
-        plot.drawPoint(r.mean(0), r.mean(1), cv::Scalar(255*(1 - frac), 128, 255*frac), 2);
+        plot.drawPoint(r.mean(0), r.mean(1), plotcolour::estimate(frac), 2);
         if (r.t - lastEllipse >= 2.0)
         {
             Eigen::Matrix2d Pxy;
             Pxy << r.sigma(0)*r.sigma(0), 0, 0, r.sigma(1)*r.sigma(1);
-            plot.drawCovarianceEllipse(r.mean(0), r.mean(1), Pxy, cv::Scalar(0, 220, 255));
+            plot.drawCovarianceEllipse(r.mean(0), r.mean(1), Pxy, plotcolour::covariance);
             lastEllipse = r.t;
         }
     }
+
+    plot.drawTitle("RoboCup field localisation (top-down)",
+                   nTrusted > 0
+                       ? std::format("{} vision updates over {:.0f} s   |   RMSE vs trusted baseline: {:.2f} m, {:.1f} deg",
+                                     nUpdates, records.empty() ? 0.0 : records.back().t - records.front().t,
+                                     std::sqrt(sumSqErrXYTrusted/nTrusted), std::sqrt(sumSqErrYawTrusted/nTrusted)*180.0/M_PI)
+                       : std::format("{} vision updates", nUpdates));
+    plot.drawLegend();
 
     if (!outputDirectory.empty())
     {
