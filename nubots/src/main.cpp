@@ -1,27 +1,25 @@
 #include <cstdlib>
 #include <cassert>
-#include <string>  
+#include <string>
 #include <filesystem>
 #include <print>
 #include <opencv2/core.hpp>
 #include "calibrate.h"
 #include "fieldLocalisation.h"
-#include "visualNavigation.h"
 
 int main(int argc, char* argv [])
 {
     const cv::String keys =
         // Argument names | defaults | help message
         "{help h usage ?  |          | print this help message}"
-        "{@input          | <none>   | path to input video or configuration XML}"
+        "{@input          | <none>   | path to recorded data directory or calibration XML}"
         "{calibrate c     |          | perform camera calibration for given configuration XML}"
         "{robocup r       |          | run RoboCup field localisation on recorded data directory}"
-        "{scenario s      | 6        | run visual navigation on input video with scenario type (4:flight, 5:tag, 6:room)}"
         "{interactive i   | 0        | interactivity (0:none, 1:last frame, 2:all frames)}"
-        "{export e        |          | export video}";
+        "{export e        |          | export results}";
 
     cv::CommandLineParser parser(argc, argv, keys);
-    parser.about("MCHA4400 Assignment 2");
+    parser.about("MCHA4400 RoboCup field localisation");
 
     if (parser.has("help"))
     {
@@ -29,7 +27,6 @@ int main(int argc, char* argv [])
         return EXIT_SUCCESS;
     }
 
-    int scenario = parser.get<int>("scenario");
     int interactive = parser.get<int>("interactive");
     bool hasExport = parser.has("export");
     bool hasCalibrate = parser.has("calibrate");
@@ -62,21 +59,12 @@ int main(int argc, char* argv [])
         std::println("Configuration file: {}", inputPath.string());
         calibrateCamera(inputPath);
     }
-    else if (parser.has("robocup"))
+    else
     {
         assert(0 <= interactive && interactive <= 2);
         std::println("Running RoboCup field localisation");
         std::println("Data directory: {}", inputPath.string());
         runFieldLocalisation(inputPath, interactive, outputDirectory);
-    }
-    else
-    {
-        assert(1 <= scenario && scenario <= 6); // Optionally support earlier scenarios from Assignment 1
-        assert(0 <= interactive && interactive <= 2);
-        std::println("Running visual navigation");
-        std::println("Input video: {}", inputPath.string());
-        std::filesystem::path cameraPath = inputPath.parent_path() / "camera.xml"; 
-        runVisualNavigationFromVideo(inputPath, cameraPath, scenario, interactive, outputDirectory);
     }
 
     return EXIT_SUCCESS;
