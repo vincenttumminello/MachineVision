@@ -216,7 +216,12 @@ int matchVideoFrame(double t, const std::vector<double> & frameTimes, double max
 }
 
 /**
- * @brief Load the video frame timecodes (ms since video start, one per line) from file
+ * @brief Load the video frame timecodes from file
+ *
+ * One value per line, one line per video frame, in frame order. Each value is the absolute
+ * capture time of that frame as a Unix timestamp in seconds (fractional seconds allowed).
+ * Because the frames are captured in order the values are expected to be monotonically
+ * non-decreasing; the caller verifies this.
  */
 std::vector<double> loadTimecodes(const std::filesystem::path & timecodePath)
 {
@@ -242,7 +247,8 @@ std::vector<double> loadTimecodes(const std::filesystem::path & timecodePath)
 
 SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesystem::path & timecodePath)
 {
-    std::vector<double> timecodesMs = loadTimecodes(timecodePath);
+    // frameTimes[i] is the absolute capture time (Unix seconds) of video frame i, in frame order.
+    frameTimes = loadTimecodes(timecodePath);
 
     simdjson::ondemand::parser parser;
     simdjson::padded_string json = simdjson::padded_string::load(jsonPath.string());
@@ -251,9 +257,6 @@ SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesyst
     {
         throw std::runtime_error("SensorLog: failed to open " + jsonPath.string());
     }
-
-    bool haveFirstVisionCapture = false;
-    double firstVisionCapture = 0.0;
 
     for (auto docResult : docs)
     {
@@ -319,12 +322,6 @@ SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesyst
                     }
                     sample.detections.push_back(std::move(det));
                 }
-            }
-
-            if (!haveFirstVisionCapture && !std::isnan(sample.t))
-            {
-                haveFirstVisionCapture = true;
-                firstVisionCapture = sample.t;
             }
 
             vision.push_back(std::move(sample));
@@ -417,23 +414,28 @@ SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesyst
     // ------------------------------------------------------------------------------------------
     // Video frame alignment
     //
-    // T0 = (first BoundingBoxes capture time) - tc[2]/1000, since the first two video frames
-    // precede the first vision message (empirically verified to sub-millisecond accuracy).
+    // frameTimes already holds each frame's absolute capture time (Unix seconds), on the same
+    // clock as the message capture timestamps, so a vision sample is aligned to a frame purely
+    // by matching capture times. No per-run offset estimation is needed. Dropped video frames,
+    // dropped message packets, and asynchronously logged messages all fall out gracefully: a
+    // sample with no frame within the match tolerance simply keeps videoFrame == -1.
     // ------------------------------------------------------------------------------------------
-    if (!haveFirstVisionCapture)
+    if (frameTimes.empty())
     {
-        throw std::runtime_error("SensorLog: no message.vision.BoundingBoxes samples with a valid capture time");
-    }
-    if (timecodesMs.size() < 3)
-    {
-        throw std::runtime_error("SensorLog: timecode file has fewer than 3 entries");
+        throw std::runtime_error("SensorLog: timecode file is empty");
     }
 
-    double T0 = firstVisionCapture - timecodesMs[2] / 1000.0;
-    frameTimes.resize(timecodesMs.size());
-    for (std::size_t j = 0; j < timecodesMs.size(); ++j)
+    // Frames are captured in order, so their timestamps must be non-decreasing; matchVideoFrame
+    // also relies on frameTimes being sorted ascending. A violation means the file is not in
+    // frame order (or not Unix timestamps at all), which would silently corrupt alignment.
+    for (std::size_t j = 1; j < frameTimes.size(); ++j)
     {
-        frameTimes[j] = T0 + timecodesMs[j] / 1000.0;
+        if (frameTimes[j] < frameTimes[j - 1])
+        {
+            throw std::runtime_error(
+                "SensorLog: timecode file is not monotonically non-decreasing at line "
+                + std::to_string(j + 1) + "; expected Unix timestamps (seconds) in frame order");
+        }
     }
 
     constexpr double kMaxFrameMatchError = 5e-3; // 5 ms
@@ -447,9 +449,13 @@ SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesyst
         }
     }
 
-    if (!vision.empty() && static_cast<double>(nMatched) < 0.99 * static_cast<double>(vision.size()))
+    // Sanity check that the two clocks are genuinely aligned. Individual unmatched samples are
+    // expected (dropped frames / async messages), but a wholesale mismatch means the timecode
+    // file and the log are on different clocks or otherwise incompatible.
+    if (!vision.empty() && static_cast<double>(nMatched) < 0.9 * static_cast<double>(vision.size()))
     {
-        throw std::runtime_error("SensorLog: fewer than 99% of vision samples matched a video frame");
+        throw std::runtime_error("SensorLog: fewer than 90% of vision samples matched a video frame; "
+                                 "timecode and log clocks appear unaligned");
     }
 
     for (LinePointsSample & lp : linePoints)

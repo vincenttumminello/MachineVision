@@ -102,7 +102,8 @@ public:
     /**
      * @brief Load and parse a recorded sensor log and a matching video timecode file
      * @param jsonPath      Path to the NDJSON recorded sensor log
-     * @param timecodePath  Path to the video timecode file (one float per line, ms since video start)
+     * @param timecodePath  Path to the video timecode file (one Unix timestamp in seconds per line,
+     *                      one line per video frame, in frame order)
      */
     SensorLog(const std::filesystem::path & jsonPath, const std::filesystem::path & timecodePath);
 
