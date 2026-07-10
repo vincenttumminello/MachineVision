@@ -1,13 +1,9 @@
 {
     "name": "MCHA4400",
-    "build": {
-        "dockerfile": "Dockerfile",
-        "context": ".",
-        "args": {
-            "USER_UID": "1000",
-            "USER_GID": "1000"
-        }
-    },
+    // Pinned to a prebuilt local image so "Reopen in Container" never triggers
+    // the (slow, OpenCV-from-source) build. Rebuild deliberately after editing
+    // the Dockerfile with: .devcontainer/build.sh
+    "image": "mcha4400:latest",
     "workspaceFolder": "/workspace",
     "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
     "remoteUser": "dev",
