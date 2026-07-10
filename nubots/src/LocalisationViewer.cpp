@@ -16,6 +16,10 @@ namespace
 constexpr int    kPanelH   = 760;    ///< Panel height [px]
 constexpr int    kHeaderH  = 36;     ///< Header strip height [px]
 constexpr double kHalfFov  = 75.0*M_PI/180.0;  ///< Half field-of-view for the top-down wedge
+// True capture rate. The recording was made at 10 fps; the mp4 container metadata
+// says 25 fps, but frame timing everywhere else comes from the timecode file, so
+// this constant only sets the auto-play speed.
+constexpr double kPlaybackFps = 10.0;
 
 // -------- colours (BGR) --------
 cv::Scalar classColour(const std::string & name)
@@ -426,7 +430,7 @@ void LocalisationViewer::run(const std::vector<ViewerFrame> & frames, int mode, 
         cv::Mat composite = renderComposite(frames, idx, raw);
         cv::imshow(win, composite);
 
-        const int delay = paused ? 0 : std::max(1, static_cast<int>(1000.0/25.0));
+        const int delay = paused ? 0 : std::max(1, static_cast<int>(1000.0/kPlaybackFps));
         const int key = cv::waitKey(delay);
         const int k = key & 0xFF;
 
