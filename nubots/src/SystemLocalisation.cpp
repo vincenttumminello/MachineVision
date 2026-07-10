@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <limits>
+#include <numeric>
 #include <vector>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -9,6 +11,8 @@
 #include "GaussianInfo.hpp"
 #include "kinematics_helper.h"
 #include "rotation.hpp"
+#include "Event.h"
+#include "Measurement.h"
 #include "SystemEstimator.h"
 #include "SystemLocalisation.h"
 
@@ -178,4 +182,242 @@ GaussianInfo<double> SystemLocalisation::positionDensity() const
 GaussianInfo<double> SystemLocalisation::orientationDensity() const
 {
     return density.marginal(Eigen::seqN(3, 3));
+}
+
+// =========================================================================
+// Hypothesis bank
+// =========================================================================
+
+Eigen::VectorXd SystemLocalisation::mirrorState(const Eigen::VectorXd & x)
+{
+    assert(x.size() == nx);
+    // 180 deg rotation about the field-centre z axis: premultiplying the pose
+    // by Rz(pi) negates the horizontal position and offsets yaw by pi, leaving
+    // roll, pitch, height and the camera-mount bias unchanged.
+    Eigen::VectorXd y = x;
+    y(0) = -x(0);
+    y(1) = -x(1);
+    y(5) = std::remainder(x(5) + M_PI, 2.0*M_PI);
+    return y;
+}
+
+GaussianInfo<double> SystemLocalisation::mirrorDensity(const GaussianInfo<double> & g)
+{
+    assert(g.dim() == nx);
+    // The mirror map is affine: y = M*x + c with M = diag(-1,-1,1,1,1,1,1,1)
+    // (the yaw offset pi lives in c and does not affect the covariance).
+    // Hence mu' = mirrorState(mu) and P' = M*P*M^T, which for a diagonal sign
+    // matrix simply flips the sign of the cross-covariances between the negated
+    // (x, y) block and the rest.
+    Eigen::VectorXd m = Eigen::VectorXd::Ones(nx);
+    m(0) = -1.0;
+    m(1) = -1.0;
+
+    Eigen::VectorXd mu = mirrorState(g.mean());
+    Eigen::MatrixXd P = g.cov();
+    Eigen::MatrixXd Pm = m.asDiagonal()*P*m.asDiagonal();
+    // Symmetrise to remove any tiny asymmetry before the Cholesky in fromMoment
+    Pm = 0.5*(Pm + Pm.transpose()).eval();
+    return GaussianInfo<double>::fromMoment(mu, Pm);
+}
+
+void SystemLocalisation::initialiseHypotheses()
+{
+    components_.clear();
+    logWeights_.clear();
+    components_.push_back(density);
+    components_.push_back(mirrorDensity(density));
+    logWeights_.assign(components_.size(), 0.0);   // Equal weights
+    setRepresentative();
+}
+
+void SystemLocalisation::spawnMirror()
+{
+    if (components_.empty())
+    {
+        initialiseHypotheses();
+        return;
+    }
+    // Mirror the current leading hypothesis and add it at equal weight to the
+    // leader, so a symmetry flip can be recovered from.
+    std::size_t best = std::distance(logWeights_.begin(),
+        std::max_element(logWeights_.begin(), logWeights_.end()));
+    components_.push_back(mirrorDensity(components_[best]));
+    logWeights_.push_back(logWeights_[best]);
+    normaliseWeights();
+    pruneComponents();
+    setRepresentative();
+}
+
+std::vector<double> SystemLocalisation::hypothesisWeights() const
+{
+    if (components_.empty())
+    {
+        return {1.0};
+    }
+    const double logZ = std::log(std::accumulate(logWeights_.begin(), logWeights_.end(), 0.0,
+        [maxLog = *std::max_element(logWeights_.begin(), logWeights_.end())](double acc, double lw)
+        { return acc + std::exp(lw - maxLog); })) + *std::max_element(logWeights_.begin(), logWeights_.end());
+    std::vector<double> w(components_.size());
+    for (std::size_t i = 0; i < components_.size(); ++i)
+    {
+        w[i] = std::exp(logWeights_[i] - logZ);
+    }
+    return w;
+}
+
+void SystemLocalisation::normaliseWeights()
+{
+    if (logWeights_.empty()) return;
+    const double maxLog = *std::max_element(logWeights_.begin(), logWeights_.end());
+    double sum = 0.0;
+    for (double lw : logWeights_) sum += std::exp(lw - maxLog);
+    const double logZ = maxLog + std::log(sum);
+    for (double & lw : logWeights_) lw -= logZ;     // Now sum(exp(logWeights_)) == 1
+}
+
+void SystemLocalisation::mergeComponents()
+{
+    // Greedy keep-best merge: components whose means lie within the position and
+    // yaw gates are collapsed, retaining the higher-weight density and summing
+    // their weights (log-sum-exp). Symmetric field hypotheses sit a whole field
+    // apart, so this only fuses genuine duplicates.
+    bool merged = true;
+    while (merged && components_.size() > 1)
+    {
+        merged = false;
+        for (std::size_t i = 0; i < components_.size() && !merged; ++i)
+        {
+            for (std::size_t j = i + 1; j < components_.size(); ++j)
+            {
+                Eigen::VectorXd mi = components_[i].mean();
+                Eigen::VectorXd mj = components_[j].mean();
+                double dPos = (mi.head<2>() - mj.head<2>()).norm();
+                double dYaw = std::abs(std::remainder(mi(5) - mj(5), 2.0*M_PI));
+                if (dPos < hyp.mergePosition && dYaw < hyp.mergeYaw)
+                {
+                    std::size_t keep = logWeights_[i] >= logWeights_[j] ? i : j;
+                    std::size_t drop = keep == i ? j : i;
+                    double a = logWeights_[i], b = logWeights_[j];
+                    double m = std::max(a, b);
+                    double combined = m + std::log(std::exp(a - m) + std::exp(b - m));
+                    components_[keep] = components_[keep];   // density unchanged (keep-best)
+                    logWeights_[keep] = combined;
+                    components_.erase(components_.begin() + drop);
+                    logWeights_.erase(logWeights_.begin() + drop);
+                    merged = true;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+void SystemLocalisation::pruneComponents()
+{
+    if (components_.size() <= 1) return;
+
+    normaliseWeights();
+    std::vector<double> w = hypothesisWeights();
+
+    // Drop components below the minimum normalised weight, always keeping the
+    // single strongest hypothesis.
+    std::size_t best = std::distance(w.begin(), std::max_element(w.begin(), w.end()));
+    std::vector<GaussianInfo<double>> keepC;
+    std::vector<double> keepLW;
+    for (std::size_t i = 0; i < components_.size(); ++i)
+    {
+        if (i == best || w[i] >= hyp.minWeight)
+        {
+            keepC.push_back(components_[i]);
+            keepLW.push_back(logWeights_[i]);
+        }
+    }
+    components_.swap(keepC);
+    logWeights_.swap(keepLW);
+
+    // Cap to the strongest maxComponents hypotheses.
+    if (components_.size() > hyp.maxComponents)
+    {
+        std::vector<std::size_t> order(components_.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(),
+            [&](std::size_t a, std::size_t b) { return logWeights_[a] > logWeights_[b]; });
+        std::vector<GaussianInfo<double>> topC;
+        std::vector<double> topLW;
+        for (std::size_t r = 0; r < hyp.maxComponents; ++r)
+        {
+            topC.push_back(components_[order[r]]);
+            topLW.push_back(logWeights_[order[r]]);
+        }
+        components_.swap(topC);
+        logWeights_.swap(topLW);
+    }
+    normaliseWeights();
+}
+
+void SystemLocalisation::respawnIfUnconfident()
+{
+    // Once the bank has collapsed to a single hypothesis it can no longer
+    // recover from a symmetry flip. If that lone hypothesis is spatially
+    // uncertain (large horizontal position std), re-seed its mirror so the
+    // symmetry can be re-resolved by future evidence.
+    if (components_.size() != 1) return;
+
+    Eigen::MatrixXd P = components_.front().cov();
+    double posStd = std::sqrt(std::max(P(0, 0), P(1, 1)));
+    if (posStd > hyp.respawnPosStd)
+    {
+        components_.push_back(mirrorDensity(components_.front()));
+        logWeights_.push_back(logWeights_.front());
+        normaliseWeights();
+    }
+}
+
+void SystemLocalisation::setRepresentative()
+{
+    if (components_.empty()) return;
+    std::size_t best = std::distance(logWeights_.begin(),
+        std::max_element(logWeights_.begin(), logWeights_.end()));
+    density = components_[best];
+}
+
+void SystemLocalisation::process(Event & event)
+{
+    // Single-hypothesis mode: ordinary single-Gaussian event processing.
+    if (components_.empty())
+    {
+        event.process(*this);
+        return;
+    }
+
+    // Multi-hypothesis mode: apply the event to each component through the same
+    // verified predict/update path, rewinding the shared system clock each time
+    // so every component predicts over the identical interval.
+    const double t0 = time_;
+    Measurement * meas = dynamic_cast<Measurement *>(&event);
+    event.setVerbosity(0);                       // Suppress per-component log spam
+
+    for (std::size_t i = 0; i < components_.size(); ++i)
+    {
+        time_ = t0;
+        density = components_[i];
+        event.process(*this);
+        components_[i] = density;
+        if (meas)
+        {
+            double le = meas->logEvidence();
+            if (std::isfinite(le))
+            {
+                logWeights_[i] += le;
+            }
+        }
+    }
+    // time_ is now the event time (set by the last component's predict).
+
+    normaliseWeights();
+    mergeComponents();
+    pruneComponents();
+    respawnIfUnconfident();
+    setRepresentative();
 }

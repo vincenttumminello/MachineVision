@@ -5,7 +5,6 @@
 #include <opencv2/imgproc.hpp>
 #include "BufferedVideo.h"
 #include "Camera.h"
-#include "DJIVideoCaption.h"
 #include "GaussianInfo.hpp"
 #include "SystemVisualNav.h"
 #include "plot_visual_odometry.h"

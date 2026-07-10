@@ -263,6 +263,17 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     SystemLocalisation system(p0, twists);
     system.resetTo(p0, tInit);
 
+    // Multi-hypothesis field-symmetry handling. When enabled the belief is a
+    // Gaussian mixture seeded with the initial pose and its 180 deg mirror; the
+    // wrong mirror is down-weighted by the asymmetric landmark evidence and
+    // pruned. Default off preserves the single-hypothesis shipping behaviour
+    // (initialised here from a known-good baseline, so no ambiguity to resolve).
+    constexpr bool useHypothesisBank = false;
+    if (useHypothesisBank)
+    {
+        system.initialiseHypotheses();
+    }
+
     // Output accumulators
     struct Record
     {
@@ -310,8 +321,12 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         constexpr bool useFieldLines = false;
 
         auto tic = std::chrono::steady_clock::now();
+        // Route every measurement through system.process(): with the hypothesis
+        // bank inactive this is identical to meas.process(system); with it active
+        // each measurement is applied to every mixture component and its
+        // log-evidence updates the component weights.
         MeasurementFieldLandmarks meas(t, v, Tbc, map, system);
-        meas.process(system);
+        system.process(meas);
         if (useFieldLines && !log.linePoints.empty())
         {
             std::size_t li = nearestIndex(log.linePoints, v.t, [](const LinePointsSample & s) { return s.t; });
@@ -321,13 +336,13 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                 std::size_t lk = nearestIndex(log.sensors, lp.t, [](const SensorsSample & s) { return s.t; });
                 Pose<double> TbcLines = log.sensors[lk].Htw*lp.Hcw.inverse();
                 MeasurementFieldLines measLines(t, lp, TbcLines, map, system);
-                measLines.process(system);
+                system.process(measLines);
             }
         }
         if (useGravity && log.sensors[k].accelerometer.allFinite())
         {
             MeasurementGravity mg(t, log.sensors[k].accelerometer);
-            mg.process(system);
+            system.process(mg);
         }
         if (useKinematicHeight)
         {
@@ -336,7 +351,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
             if (std::isfinite(h))
             {
                 MeasurementKinematicHeight mh(t, h);
-                mh.process(system);
+                system.process(mh);
             }
         }
         double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tic).count();

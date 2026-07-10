@@ -42,6 +42,15 @@ public:
      */
     void process(SystemBase & system);
 
+    /**
+     * @brief Set the verbosity level for this event.
+     * @param verbosity New verbosity level (0 silences per-event logging).
+     *
+     * Used by multi-hypothesis processing to suppress the per-component log
+     * lines that would otherwise be emitted once per mixture component.
+     */
+    void setVerbosity(int verbosity) { verbosity_ = verbosity; }
+
 protected:
     /**
      * @brief Update the system based on this event.

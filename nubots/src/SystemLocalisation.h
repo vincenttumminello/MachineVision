@@ -12,6 +12,8 @@
 #include "SystemEstimator.h"
 #include "SensorLog.h"
 
+class Event;    // Forward declaration (mixture event processing)
+
 /**
  * @brief A body-fixed twist sample derived from odometry.
  */
@@ -128,8 +130,112 @@ public:
 
     Parameters params;
 
+    // ---------------------------------------------------------------------
+    // Hypothesis bank (multi-hypothesis field-symmetry handling)
+    //
+    // The RoboCup field has a 180 deg rotational symmetry about its centre:
+    // the pose (rBFf, Thetafb) and its mirror produce identical landmark
+    // observations, so a single Gaussian cannot represent the true belief
+    // when the symmetry is unbroken. Following the B-Human multi-hypothesis
+    // approach (Rofer et al.), the belief is a weighted Gaussian mixture; each
+    // component is an independent 8-DOF pose density carried through the same
+    // predict/update machinery, and the weights are updated from the Laplace
+    // log-evidence each measurement reports (Measurement::logEvidence()).
+    //
+    // When no hypotheses are active (components_ empty) the estimator behaves
+    // exactly as a single-Gaussian filter over `density`. Activating the bank
+    // (initialiseHypotheses / spawnMirror) switches process() to iterate over
+    // all components; `density` then always mirrors the maximum-weight
+    // component so all existing single-Gaussian accessors keep working.
+    // ---------------------------------------------------------------------
+
+    /**
+     * @brief Parameters governing hypothesis spawning, pruning and merging.
+     */
+    struct HypothesisParameters
+    {
+        double minWeight      = 0.02;   ///< Prune components below this normalised weight
+        std::size_t maxComponents = 4;  ///< Cap on the number of live components
+        double mergePosition  = 0.30;   ///< Merge gate on position separation [m]
+        double mergeYaw       = 0.20;   ///< Merge gate on yaw separation [rad]
+        double respawnPosStd  = 0.60;   ///< Respawn a mirror when the lone component's
+                                        ///< horizontal position std exceeds this [m]
+    };
+
+    HypothesisParameters hyp;
+
+    /**
+     * @brief Activate the mixture with the current density and its 180 deg mirror.
+     *
+     * Seeds two equally weighted hypotheses (the current pose and its field
+     * mirror) so a symmetry ambiguity present at initialisation can be resolved
+     * by later asymmetric evidence. No-op inputs (single confident pose) still
+     * benefit: the wrong mirror is down-weighted and pruned automatically.
+     */
+    void initialiseHypotheses();
+
+    /**
+     * @brief Add the 180 deg mirror of the maximum-weight component as a new,
+     *        equally weighted hypothesis (used for symmetry-flip recovery).
+     */
+    void spawnMirror();
+
+    /**
+     * @brief Process an event across every active hypothesis.
+     *
+     * For each component the shared system clock is rewound and the event is
+     * applied through the ordinary single-Gaussian path (predict + update),
+     * so the verified machinery is reused unchanged. Measurement events
+     * additionally accumulate their Laplace log-evidence into the component
+     * weight. Afterwards the mixture is normalised, merged, pruned and (if it
+     * has collapsed to a single uncertain component) a mirror is respawned,
+     * and `density` is set to the maximum-weight component.
+     *
+     * With no active hypotheses this is exactly `event.process(*this)`.
+     *
+     * @param event The event to apply (typically a Measurement)
+     */
+    void process(Event & event);
+
+    /**
+     * @brief Number of live hypotheses (1 in single-hypothesis mode).
+     */
+    std::size_t numHypotheses() const { return components_.empty() ? 1 : components_.size(); }
+
+    /**
+     * @brief Normalised (sum-to-one) linear weights of the live hypotheses.
+     */
+    std::vector<double> hypothesisWeights() const;
+
+    /**
+     * @brief Read-only access to the live hypothesis densities.
+     */
+    const std::vector<GaussianInfo<double>> & hypotheses() const { return components_; }
+
+    /**
+     * @brief The 180 deg field-symmetry mirror of a state vector.
+     *
+     * Rotates the pose by pi about the field-centre z axis:
+     *   (x, y) -> (-x, -y),  yaw -> yaw + pi,  roll/pitch/z/cam-bias unchanged.
+     */
+    static Eigen::VectorXd mirrorState(const Eigen::VectorXd & x);
+
+    /**
+     * @brief The 180 deg field-symmetry mirror of a pose density.
+     */
+    static GaussianInfo<double> mirrorDensity(const GaussianInfo<double> & g);
+
 protected:
     const std::vector<BodyTwistSample> * twistBuffer_;  ///< Non-owning; ZOH input lookup
+
+    std::vector<GaussianInfo<double>> components_;   ///< Mixture components (empty => single-hypothesis)
+    std::vector<double> logWeights_;                 ///< Unnormalised log weights per component
+
+    void normaliseWeights();        ///< Renormalise logWeights_ (subtract log-sum-exp)
+    void mergeComponents();         ///< Merge components within the merge gate (keep-best)
+    void pruneComponents();         ///< Drop low-weight components; cap to maxComponents
+    void respawnIfUnconfident();    ///< Respawn a mirror if collapsed to one uncertain component
+    void setRepresentative();       ///< Set `density` to the maximum-weight component
 };
 
 #endif
