@@ -16,7 +16,9 @@
 #include <opencv2/highgui.hpp>
 #include "FieldMap.h"
 #include "fieldLocalisation.h"
+#include "FisheyeLens.h"
 #include "GaussianInfo.hpp"
+#include "LocalisationViewer.h"
 #include "MeasurementFieldLandmarks.h"
 #include "MeasurementFieldLines.h"
 #include "MeasurementGravity.h"
@@ -288,6 +290,13 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     std::vector<Record> records;
     records.reserve(log.vision.size());
 
+    // Per-frame data for the interactive visualiser (captured only when needed).
+    std::vector<ViewerFrame> viewFrames;
+    if (interactive > 0)
+    {
+        viewFrames.reserve(log.vision.size());
+    }
+
     // The NUbots baseline is itself an estimate whose cost spikes when it is
     // lost; restrict the headline comparison to samples where it is trustworthy.
     const double trustedBaselineCost = 1.0;
@@ -320,6 +329,8 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         constexpr bool useKinematicHeight = true;
         constexpr bool useFieldLines = false;
 
+        Eigen::Matrix<double, 3, Eigen::Dynamic> frameLineRays;  // captured for the viewer
+
         auto tic = std::chrono::steady_clock::now();
         // Route every measurement through system.process(): with the hypothesis
         // bank inactive this is identical to meas.process(system); with it active
@@ -337,6 +348,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                 Pose<double> TbcLines = log.sensors[lk].Htw*lp.Hcw.inverse();
                 MeasurementFieldLines measLines(t, lp, TbcLines, map, system);
                 system.process(measLines);
+                frameLineRays = lp.rays;
             }
         }
         if (useGravity && log.sensors[k].accelerometer.allFinite())
@@ -396,6 +408,87 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
             }
         }
         records.push_back(r);
+
+        // Capture the per-frame view for the interactive visualiser.
+        if (interactive > 0)
+        {
+            ViewerFrame vf;
+            vf.videoFrame = v.videoFrame;
+            vf.t = t;
+            vf.Tfc = SystemLocalisation::fieldPose<double>(r.mean)*Tbc
+                     *Pose<double>(SystemLocalisation::cameraBiasRotation<double>(r.mean), Eigen::Vector3d::Zero());
+            vf.estPos = r.mean.head<2>();
+            vf.estYaw = r.mean(5);
+            vf.estCov = system.density.cov().topLeftCorner<2, 2>();
+
+            // Hypotheses (falls back to the single density when the bank is off).
+            std::vector<double> hw = system.hypothesisWeights();
+            if (system.hypotheses().empty())
+            {
+                HypothesisView h;
+                h.pos = r.mean.head<2>();
+                h.yaw = r.mean(5);
+                h.cov = vf.estCov;
+                h.weight = 1.0;
+                vf.hypotheses.push_back(h);
+            }
+            else
+            {
+                const auto & comps = system.hypotheses();
+                for (std::size_t i = 0; i < comps.size(); ++i)
+                {
+                    Eigen::VectorXd m = comps[i].mean();
+                    HypothesisView h;
+                    h.pos = m.head<2>();
+                    h.yaw = m(5);
+                    h.cov = comps[i].cov().topLeftCorner<2, 2>();
+                    h.weight = i < hw.size() ? hw[i] : 0.0;
+                    vf.hypotheses.push_back(h);
+                }
+            }
+
+            // Raw YOLO detections (boxes), flagged by whether the estimator uses the class.
+            auto usedClass = [](const std::string & n) {
+                return n == "L-intersection" || n == "T-intersection" || n == "X-intersection" || n == "goal post";
+            };
+            for (const Detection & det : v.detections)
+            {
+                if (!det.corners.allFinite()) continue;
+                DetectionView dv;
+                dv.name = det.name;
+                dv.confidence = det.confidence;
+                dv.corners = det.corners;
+                dv.used = usedClass(det.name);
+                vf.detections.push_back(std::move(dv));
+            }
+
+            // Accepted associations (measured ray <-> map landmark).
+            const auto & um = meas.measuredRays();
+            const auto & lmk = meas.associatedLandmarks();
+            for (Eigen::Index j = 0; j < um.cols() && j < lmk.cols(); ++j)
+            {
+                AssociationView av;
+                av.measRay = um.col(j);
+                av.landmark = lmk.col(j);
+                vf.associations.push_back(av);
+            }
+
+            vf.lineRays = frameLineRays;
+            if (std::isfinite(r.baseX))
+            {
+                vf.hasBaseline = true;
+                vf.basePos = Eigen::Vector2d(r.baseX, r.baseY);
+                vf.baseYaw = r.baseYaw;
+                vf.baseCost = r.baseCost;
+                vf.hasError = true;
+                vf.errXY = r.errXY;
+                vf.errYaw = r.errYaw;
+            }
+            vf.nAssoc = r.nAssoc;
+            vf.nCand = r.nCand;
+            vf.updateMs = r.updateMs;
+            viewFrames.push_back(std::move(vf));
+        }
     }
 
     // Summary
@@ -471,10 +564,13 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         std::println("Exported field_localisation.csv and field_trajectory.png to {}", outputDirectory.string());
     }
 
+    // Interactive two-panel visualiser: camera with re-projected detections and
+    // associations on the left, top-down field with hypotheses on the right.
+    // Mode 1 auto-plays; mode 2 steps frame-by-frame.
     if (interactive > 0)
     {
-        cv::imshow("Field localisation", plot.image());
-        std::println("Press any key to exit.");
-        cv::waitKey(0);
+        FisheyeLens lens;   // NUbots equidistant lens (1280x1024); tune per-robot k/centre if known
+        LocalisationViewer viewer(map, lens, dataDir / "Left.mp4");
+        viewer.run(viewFrames, interactive, outputDirectory);
     }
 }
