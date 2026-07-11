@@ -569,7 +569,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     // Mode 1 auto-plays; mode 2 steps frame-by-frame.
     if (interactive > 0)
     {
-        FisheyeLens lens;   // NUbots equidistant lens (1280x1024); tune per-robot k/centre if known
+        FisheyeLens lens;   // NUbots equidistant lens (1280x1024); defaults to frankie (the recording robot) TODO: Adjust if replacing recording
         LocalisationViewer viewer(map, lens, dataDir / "Left.mp4");
         viewer.run(viewFrames, interactive, outputDirectory);
     }

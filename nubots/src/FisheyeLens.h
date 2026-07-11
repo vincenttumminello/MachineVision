@@ -14,9 +14,12 @@
  * The lens parameters (focal length, centre offset and distortion coefficients)
  * are normalised by the image width, exactly as in the NUbots camera configs
  * (module/input/Camera/data/config/<robot>/Cameras/Left.yaml). The default
- * values are for the Lensagon BF10M19828S118C used on the recorded robot; they
- * are close across units (same lens) but the exact per-unit k/centre can be
- * substituted if the recording's calibration is known.
+ * values are frankie's calibration, which is the robot that captured the
+ * recording used here: the ground-truth lens embedded in the recorded
+ * CompressedImage messages (projection EQUIDISTANT, focal_length 0.34,
+ * centre [0.02072, -0.00116], k [0.38554, 0.14984]) matches frankie's config
+ * exactly. Using another unit's calibration (e.g. kevin's) shifts and scales
+ * the projection so re-projected detections no longer line up with the frame.
  */
 #ifndef FISHEYELENS_H
 #define FISHEYELENS_H
@@ -34,9 +37,10 @@ struct FisheyeLens
     double height = 1024.0;     ///< Image height [px]
 
     // All of the following are normalised by the image width, per the NUbots convention.
-    double focalLength = 0.34607022208588906;                       ///< Normalised focal length
-    Eigen::Vector2d centre{-0.008429632815260277, 0.003767345048721181}; ///< Normalised optical-centre offset
-    Eigen::Vector2d k{0.4718296027381958, 0.22726744036437643};     ///< Radial distortion coefficients [k1, k2]
+    // Values are frankie's Left.yaml calibration (the robot that made the recording).
+    double focalLength = 0.34;                                        ///< Normalised focal length
+    Eigen::Vector2d centre{0.02072339174622414, -0.0011612242293956145}; ///< Normalised optical-centre offset
+    Eigen::Vector2d k{0.38553542593448015, 0.1498415334589703};      ///< Radial distortion coefficients [k1, k2]
 
     /// @brief Inverse-distortion polynomial coefficients (undistorted radius -> distorted radius).
     Eigen::Vector4d inverseCoefficients() const
