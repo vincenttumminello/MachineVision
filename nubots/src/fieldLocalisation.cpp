@@ -211,10 +211,15 @@ private:
 // (x, y, yaw) are unknown and are found by a coarse global grid search that
 // maximises the landmark measurement log-likelihood (association + robust
 // residual reuse MeasurementFieldLandmarks, so scoring matches the filter's own
-// model). Field symmetry leaves a 180 deg ambiguity: the global maximum is taken
-// here; enable the hypothesis bank if the first frame cannot break it.
+// model).
+//
+// On-field landmarks leave a 180 deg (own-half vs opponent-half) ambiguity that
+// they fundamentally cannot resolve. It is broken with external game context:
+// the robot always starts in its own half, so ownHalfXSign (the sign of field-x
+// for the starting half, from the GameController team side in deployment) selects
+// between the global maximum and its mirror.
 static bool solveInitialPose(const SensorLog & log, const FieldMap & map,
-                             const std::vector<BodyTwistSample> & twists, double t0,
+                             const std::vector<BodyTwistSample> & twists, double t0, double ownHalfXSign,
                              Eigen::VectorXd & eta0Out, double & tInitOut, std::size_t & visIdxOut)
 {
     const FieldDimensions & dims = map.dims;
@@ -278,6 +283,25 @@ static bool solveInitialPose(const SensorLog & log, const FieldMap & map,
 
         if (bestAssoc < minAssoc) continue;   // not enough to localise on this frame; try the next
 
+        // Resolve the own-half/opponent-half symmetry from game context: force the
+        // solution onto the starting half. The mirror has identical likelihood, so
+        // this loses no fit; it only picks the physically valid side.
+        Eigen::VectorXd mirrorEta = SystemLocalisation::mirrorState(bestEta);
+        if (ownHalfXSign != 0.0 && bestEta(0)*ownHalfXSign < 0.0)
+        {
+            std::swap(bestEta, mirrorEta);
+        }
+
+        // DIAGNOSTIC: confirm the two halves are indistinguishable from on-field
+        // landmarks (near-equal log-likelihood) — the side comes from the prior.
+        probe.resetTo(GaussianInfo<double>::fromSqrtMoment(mirrorEta, Stmp), tInit);
+        MeasurementFieldLandmarks mmir(tInit, v, Tbc, map, probe);
+        double mirrorScore = mmir.numAssociated() > 0 ? mmir.logLikelihood(mirrorEta, probe)
+                                                       : -std::numeric_limits<double>::infinity();
+        std::println("  symmetry check: chosen-half logLik {:.2f} vs opponent-half logLik {:.2f} "
+                     "(near-equal => side set by the start-half prior, not the landmarks)",
+                     bestScore, mirrorScore);
+
         eta0Out = bestEta;
         tInitOut = tInit;
         visIdxOut = vi;
@@ -310,11 +334,17 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     // Baseline-free initialisation: solve the first usable vision frame's pose
     // from the landmark detections and the field map. The NUbots baseline is
     // used ONLY for later comparison/plotting, never by the estimator.
+    // External game context (RoboCup): the robot always starts in its own half,
+    // which breaks the field's 180-degree symmetry that on-field landmarks cannot.
+    // Sign of field-x for the starting half; supply from the GameController team
+    // side in deployment. For this recording the robot starts in the +x half.
+    constexpr double ownHalfXSign = +1.0;
+
     Eigen::VectorXd eta0;
     double tInit = 0.0;
     std::size_t initVisIdx = 0;
     auto ticInit = std::chrono::steady_clock::now();
-    bool solved = solveInitialPose(log, map, twists, t0, eta0, tInit, initVisIdx);
+    bool solved = solveInitialPose(log, map, twists, t0, ownHalfXSign, eta0, tInit, initVisIdx);
     double initMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ticInit).count();
     std::println("Initial global grid solve took {:.1f} ms", initMs);
     if (!solved)
@@ -399,6 +429,14 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     double sumResidSelf = 0, sumResidBase = 0;
     std::size_t nResid = 0;
 
+    // DIAGNOSTIC: capture one representative stationary frame to probe how sharply
+    // the landmark residual rises as the pose is perturbed (i.e. the geometric
+    // observability / honest uncertainty in each direction).
+    VisionSample statFrame;
+    Pose<double> statTbc;
+    Eigen::VectorXd statMean;
+    bool haveStat = false;
+
     for (const VisionSample & v : log.vision)
     {
         const double t = v.t - t0;
@@ -464,6 +502,14 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         nUpdates++;
         sumMs += ms;
         maxMs = std::max(maxMs, ms);
+
+        if (!haveStat && t > 6.0 && t < 8.0 && meas.numAssociated() >= 6)
+        {
+            statFrame = v;
+            statTbc = Tbc;
+            statMean = system.density.mean();
+            haveStat = true;
+        }
 
         // Record state and comparison to NUbots baseline
         Record r;
@@ -627,6 +673,23 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         std::println("Stationary landmark reprojection residual: ours {:.2f} deg vs baseline {:.2f} deg over {} frames "
                      "(lower = better explains the detections)",
                      sumResidSelf/nResid*180.0/M_PI, sumResidBase/nResid*180.0/M_PI, nResid);
+    }
+    if (haveStat)
+    {
+        std::println("Residual-vs-offset probe at a stationary frame (converged x={:.2f}, y={:.2f}):",
+                     statMean(0), statMean(1));
+        for (int axis = 0; axis < 2; ++axis)
+        {
+            std::string s = axis == 0 ? "  dx" : "  dy";
+            for (double d : {-1.0, -0.7, -0.5, -0.3, 0.0, 0.3, 0.5, 0.7, 1.0})
+            {
+                Eigen::VectorXd eta = statMean;
+                eta(axis) += d;
+                auto [res, n] = meanReprojResidual(eta, statFrame, statTbc);
+                s += std::format("  {:+.2f}m:{:.2f}deg", d, res*180.0/M_PI);
+            }
+            std::println("{}", s);
+        }
     }
 
     // Trajectory plot
