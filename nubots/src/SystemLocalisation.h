@@ -59,11 +59,11 @@ public:
      */
     struct Parameters
     {
-        double sigmaPosXY  = 0.05;  ///< Position process noise PSD, horizontal [m/sqrt(s)]
+        double sigmaPosXY  = 0.08;  ///< Position process noise PSD, horizontal [m/sqrt(s)] (floor vs collapse in weakly-observable directions)
         double sigmaPosZ   = 0.02;  ///< Position process noise PSD, vertical [m/sqrt(s)]
         double sigmaAtt    = 0.05;  ///< Roll/pitch process noise PSD [rad/sqrt(s)]
         double sigmaYaw    = 0.05;  ///< Yaw process noise PSD [rad/sqrt(s)]
-        double sigmaCamBias = 1e-3; ///< Camera mount bias process noise PSD [rad/sqrt(s)]
+        double sigmaCamBias = 3e-4; ///< Camera mount bias process noise PSD [rad/sqrt(s)] (kept small so bias cannot wander while stationary)
     };
 
     static constexpr Eigen::Index nx = 8;   ///< State dimension

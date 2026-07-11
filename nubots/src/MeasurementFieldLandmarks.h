@@ -48,7 +48,7 @@ public:
      */
     struct Options
     {
-        double sigmaAngular         = 0.10;             ///< Inlier ray angular noise std dev [rad]
+        double sigmaAngular         = 0.25;             ///< Inlier ray angular noise std dev [rad] (total per-frame error incl. systematic)
         double gateAngle            = 0.35;             ///< Max association residual angle [rad] (~20 deg)
         double minConfidence        = 0.5;              ///< Minimum detection confidence
         double inlierProbability    = 0.7;              ///< Mixture weight of the inlier component
