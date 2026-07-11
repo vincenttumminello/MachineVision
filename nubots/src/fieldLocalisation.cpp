@@ -202,6 +202,90 @@ private:
     cv::Mat img_;
 };
 
+// Baseline-free initial pose from the first usable vision frame. The NUbots
+// baseline is never read by the estimator; it solves the field pose purely from
+// the YOLO landmark rays and the field map.
+//
+// Roll, pitch and torso height are taken from the kinematic chain (the odometry
+// world frame is gravity-aligned, so its z axis coincides with field-up); only
+// (x, y, yaw) are unknown and are found by a coarse global grid search that
+// maximises the landmark measurement log-likelihood (association + robust
+// residual reuse MeasurementFieldLandmarks, so scoring matches the filter's own
+// model). Field symmetry leaves a 180 deg ambiguity: the global maximum is taken
+// here; enable the hypothesis bank if the first frame cannot break it.
+static bool solveInitialPose(const SensorLog & log, const FieldMap & map,
+                             const std::vector<BodyTwistSample> & twists, double t0,
+                             Eigen::VectorXd & eta0Out, double & tInitOut, std::size_t & visIdxOut)
+{
+    const FieldDimensions & dims = map.dims;
+    const double halfL = dims.fieldLength/2 + dims.borderStripMinWidth;
+    const double halfW = dims.fieldWidth/2  + dims.borderStripMinWidth;
+    const double dxy   = 0.35;                 // grid step, position [m]
+    const double dyaw  = 18.0*M_PI/180.0;      // grid step, heading [rad]
+    const std::size_t minAssoc = 4;            // constraints needed to trust a solve
+
+    for (std::size_t vi = 0; vi < log.vision.size(); ++vi)
+    {
+        const VisionSample & v = log.vision[vi];
+        if (v.detections.empty()) continue;
+        if (!v.Hcw.rotationMatrix.allFinite() || !v.Hcw.translationVector.allFinite()) continue;
+
+        std::size_t k = nearestIndex(log.sensors, v.t, [](const SensorsSample & s) { return s.t; });
+        if (std::abs(log.sensors[k].t - v.t) > 0.1) continue;
+
+        // Camera pose w.r.t. torso, and gravity-aligned torso attitude/height.
+        Pose<double> Tbc = log.sensors[k].Htw*v.Hcw.inverse();
+        Pose<double> Twt = log.sensors[k].Htw.inverse();
+        const Eigen::Vector3d rpyTorso = rot2rpy(Twt.rotationMatrix);
+        const double roll0 = rpyTorso.x();
+        const double pitch0 = rpyTorso.y();
+        const double z0 = Twt.translationVector.z();
+        const double tInit = v.t - t0;
+
+        // Probe system used only to drive association/likelihood scoring.
+        const Eigen::MatrixXd Stmp = Eigen::MatrixXd::Identity(SystemLocalisation::nx, SystemLocalisation::nx)*0.01;
+        SystemLocalisation probe(GaussianInfo<double>::fromSqrtMoment(
+                                     Eigen::VectorXd::Zero(SystemLocalisation::nx), Stmp), twists);
+
+        double bestScore = -std::numeric_limits<double>::infinity();
+        std::size_t bestAssoc = 0;
+        Eigen::VectorXd bestEta = Eigen::VectorXd::Zero(SystemLocalisation::nx);
+
+        for (double x = -halfL; x <= halfL; x += dxy)
+        {
+            for (double y = -halfW; y <= halfW; y += dxy)
+            {
+                for (double yaw = -M_PI; yaw < M_PI; yaw += dyaw)
+                {
+                    Eigen::VectorXd cand(SystemLocalisation::nx);
+                    cand << x, y, z0, roll0, pitch0, yaw, 0.0, 0.0;
+                    probe.resetTo(GaussianInfo<double>::fromSqrtMoment(cand, Stmp), tInit);
+                    MeasurementFieldLandmarks meas(tInit, v, Tbc, map, probe);
+                    if (meas.numAssociated() < minAssoc) continue;
+                    // Robust log-likelihood already rewards inliers and floors
+                    // outliers at the clutter density, so it favours the pose
+                    // that explains the most rays well.
+                    const double score = meas.logLikelihood(cand, probe);
+                    if (score > bestScore)
+                    {
+                        bestScore = score;
+                        bestAssoc = meas.numAssociated();
+                        bestEta = cand;
+                    }
+                }
+            }
+        }
+
+        if (bestAssoc < minAssoc) continue;   // not enough to localise on this frame; try the next
+
+        eta0Out = bestEta;
+        tInitOut = tInit;
+        visIdxOut = vi;
+        return true;
+    }
+    return false;
+}
+
 void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive, const std::filesystem::path & outputDirectory)
 {
     const std::filesystem::path jsonPath = dataDir / "recorded_data.json";
@@ -223,43 +307,30 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     // Field landmark map
     FieldMap map;
 
-    // Initialise from the first finite NUbots baseline estimate (offline convenience;
-    // replaced by hypothesis-bank global initialisation later)
-    std::size_t initIdx = 0;
-    bool haveInit = false;
-    Pose<double> Tfb0;
-    for (std::size_t i = 0; i < log.fieldBaseline.size(); ++i)
+    // Baseline-free initialisation: solve the first usable vision frame's pose
+    // from the landmark detections and the field map. The NUbots baseline is
+    // used ONLY for later comparison/plotting, never by the estimator.
+    Eigen::VectorXd eta0;
+    double tInit = 0.0;
+    std::size_t initVisIdx = 0;
+    auto ticInit = std::chrono::steady_clock::now();
+    bool solved = solveInitialPose(log, map, twists, t0, eta0, tInit, initVisIdx);
+    double initMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ticInit).count();
+    std::println("Initial global grid solve took {:.1f} ms", initMs);
+    if (!solved)
     {
-        const FieldBaselineSample & b = log.fieldBaseline[i];
-        if (!b.Hfw.rotationMatrix.allFinite() || !b.Hfw.translationVector.allFinite() || !std::isfinite(b.cost))
-        {
-            continue;
-        }
-        std::size_t k = nearestIndex(log.sensors, b.t, [](const SensorsSample & s) { return s.t; });
-        if (std::abs(log.sensors[k].t - b.t) > 0.1)
-        {
-            continue;
-        }
-        // Torso pose in field: Tfb = Hfw * Htw^{-1}
-        Tfb0 = b.Hfw*log.sensors[k].Htw.inverse();
-        initIdx = i;
-        haveInit = true;
-        break;
-    }
-    if (!haveInit)
-    {
-        std::println("ERROR: no valid baseline sample available to initialise from");
+        std::println("ERROR: could not solve an initial pose from the landmark detections");
         return;
     }
-    const double tInit = log.fieldBaseline[initIdx].t - t0;
-    std::println("Initialising at t={:.3f} s from baseline (cost {:.3f})", tInit, log.fieldBaseline[initIdx].cost);
+    std::println("Initialising at t={:.3f} s from first-frame landmark solve "
+                 "(x={:.2f} m, y={:.2f} m, yaw={:.1f} deg)",
+                 tInit, eta0(0), eta0(1), eta0(5)*180.0/M_PI);
 
-    Eigen::VectorXd eta0 = Eigen::VectorXd::Zero(SystemLocalisation::nx);
-    eta0.head<3>() = Tfb0.translationVector;
-    eta0.segment<3>(3) = rot2rpy(Tfb0.rotationMatrix);
-
+    // Deliberately loose prior: the grid localises coarsely and the recursive
+    // updates sharpen it over the first (stationary) seconds. z, roll and pitch
+    // come from kinematics so their prior is tight; (x, y, yaw) start wide.
     Eigen::MatrixXd S0 = Eigen::MatrixXd::Zero(SystemLocalisation::nx, SystemLocalisation::nx);
-    S0.diagonal() << 0.3, 0.3, 0.05, 0.05, 0.05, 0.15, 0.05, 0.05;  // pose [m/rad] + camera bias [rad]
+    S0.diagonal() << 1.0, 1.0, 0.05, 0.05, 0.05, 0.5, 0.02, 0.02;  // pose [m/rad] + camera bias [rad]
     auto p0 = GaussianInfo<double>::fromSqrtMoment(eta0, S0);
 
     SystemLocalisation system(p0, twists);
@@ -304,6 +375,27 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     double sumSqErrXY = 0, sumSqErrYaw = 0, sumMs = 0, maxMs = 0;
     double sumSqErrXYTrusted = 0, sumSqErrYawTrusted = 0;
     std::size_t nCompared = 0, nTrusted = 0, nUpdates = 0, nSkipped = 0;
+
+    // DIAGNOSTIC: mean landmark reprojection residual at a given pose, using that
+    // pose's own associations. Lets us ask which pose the vision data supports
+    // (our estimate vs the baseline) without treating either as ground truth.
+    auto meanReprojResidual = [&](const Eigen::VectorXd & eta, const VisionSample & vv,
+                                  const Pose<double> & TbcArg) -> std::pair<double, std::size_t>
+    {
+        const Eigen::MatrixXd Stmp = Eigen::MatrixXd::Identity(SystemLocalisation::nx, SystemLocalisation::nx)*0.01;
+        SystemLocalisation probe(GaussianInfo<double>::fromSqrtMoment(eta, Stmp), twists);
+        probe.resetTo(GaussianInfo<double>::fromSqrtMoment(eta, Stmp), 0.0);
+        MeasurementFieldLandmarks m(0.0, vv, TbcArg, map, probe);
+        const auto & U = m.measuredRays();
+        if (U.cols() == 0) return {std::numeric_limits<double>::quiet_NaN(), 0};
+        Eigen::Matrix<double, 3, Eigen::Dynamic> P = m.predictRays<double>(eta);
+        double s = 0;
+        for (Eigen::Index j = 0; j < U.cols(); ++j)
+            s += std::acos(std::clamp(U.col(j).dot(P.col(j)), -1.0, 1.0));
+        return {s/U.cols(), static_cast<std::size_t>(U.cols())};
+    };
+    double sumResidSelf = 0, sumResidBase = 0;
+    std::size_t nResid = 0;
 
     for (const VisionSample & v : log.vision)
     {
@@ -399,6 +491,24 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                 sumSqErrXY += r.errXY*r.errXY;
                 sumSqErrYaw += r.errYaw*r.errYaw;
                 nCompared++;
+
+                // DIAGNOSTIC: which pose does the vision support during the initial
+                // stationary window? Compare landmark reprojection residual at our
+                // estimate vs the baseline pose.
+                if (t < 10.0 && std::isfinite(b.cost) && b.cost < trustedBaselineCost)
+                {
+                    Eigen::VectorXd baseEta = Eigen::VectorXd::Zero(SystemLocalisation::nx);
+                    baseEta.head<3>() = TfbBase.translationVector;
+                    baseEta.segment<3>(3) = rot2rpy(TfbBase.rotationMatrix);
+                    auto [rs, ns] = meanReprojResidual(r.mean, v, Tbc);
+                    auto [rb, nb] = meanReprojResidual(baseEta, v, Tbc);
+                    if (ns > 0 && nb > 0)
+                    {
+                        sumResidSelf += rs;
+                        sumResidBase += rb;
+                        nResid++;
+                    }
+                }
                 if (std::isfinite(b.cost) && b.cost < trustedBaselineCost)
                 {
                     sumSqErrXYTrusted += r.errXY*r.errXY;
@@ -510,6 +620,12 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         std::println("vs trusted baseline (cost < {:.1f}) over {} samples: RMSE position {:.3f} m, yaw {:.2f} deg",
                      trustedBaselineCost, nTrusted, std::sqrt(sumSqErrXYTrusted/nTrusted), std::sqrt(sumSqErrYawTrusted/nTrusted)*180.0/M_PI);
     }
+    if (nResid > 0)
+    {
+        std::println("Stationary landmark reprojection residual: ours {:.2f} deg vs baseline {:.2f} deg over {} frames "
+                     "(lower = better explains the detections)",
+                     sumResidSelf/nResid*180.0/M_PI, sumResidBase/nResid*180.0/M_PI, nResid);
+    }
 
     // Trajectory plot
     FieldPlot plot(map.dims);
@@ -549,12 +665,13 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
 
         // CSV export
         std::ofstream csv(outputDirectory / "field_localisation.csv");
-        csv << "t,x,y,z,roll,pitch,yaw,sx,sy,sz,sroll,spitch,syaw,nAssoc,nCand,baseX,baseY,baseYaw,baseCost,errXY,errYaw,updateMs\n";
+        csv << "t,x,y,z,roll,pitch,yaw,sx,sy,sz,sroll,spitch,syaw,camBiasRoll,camBiasPitch,sCamRoll,sCamPitch,nAssoc,nCand,baseX,baseY,baseYaw,baseCost,errXY,errYaw,updateMs\n";
         for (const Record & r : records)
         {
             csv << r.t;
             for (int i = 0; i < 6; ++i) csv << ',' << r.mean(i);
             for (int i = 0; i < 6; ++i) csv << ',' << r.sigma(i);
+            csv << ',' << r.mean(6) << ',' << r.mean(7) << ',' << r.sigma(6) << ',' << r.sigma(7);
             csv << ',' << r.nAssoc << ',' << r.nCand
                 << ',' << r.baseX << ',' << r.baseY << ',' << r.baseYaw << ',' << r.baseCost
                 << ',' << r.errXY << ',' << r.errYaw << ',' << r.updateMs << '\n';
