@@ -363,6 +363,56 @@ cv::Mat LocalisationViewer::renderComposite(const std::vector<ViewerFrame> & fra
 }
 
 // ===========================================================================
+// Headless video export
+// ===========================================================================
+void LocalisationViewer::exportVideo(const std::vector<ViewerFrame> & frames,
+                                     const std::filesystem::path & outPath, double fps) const
+{
+    if (frames.empty())
+    {
+        std::println("Viewer: no frames to export.");
+        return;
+    }
+
+    cv::VideoCapture cap(videoPath_.string());
+    const bool haveVideo = cap.isOpened();
+    if (!haveVideo)
+        std::println("Viewer: could not open video {} (camera panel will be blank in the export).", videoPath_.string());
+
+    // Sequential decode: frames are processed in order, so read forward and only
+    // seek when the requested frame is not the next one (matches run()).
+    int lastDecoded = -2;
+    auto grabFrame = [&](int videoFrame) -> cv::Mat {
+        cv::Mat raw;
+        if (!haveVideo || videoFrame < 0) return raw;
+        if (videoFrame != lastDecoded + 1)
+            cap.set(cv::CAP_PROP_POS_FRAMES, static_cast<double>(videoFrame));
+        cap.read(raw);
+        lastDecoded = videoFrame;
+        return raw;
+    };
+
+    cv::VideoWriter writer;
+    const int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
+    for (std::size_t i = 0; i < frames.size(); ++i)
+    {
+        cv::Mat raw = grabFrame(frames[i].videoFrame);
+        cv::Mat composite = renderComposite(frames, i, raw);
+        if (!writer.isOpened())
+        {
+            if (!writer.open(outPath.string(), fourcc, fps, composite.size()))
+            {
+                std::println("Viewer: failed to open VideoWriter for {}", outPath.string());
+                return;
+            }
+        }
+        writer.write(composite);
+    }
+    writer.release();
+    std::println("Exported {} ({} frames at {:.0f} fps)", outPath.string(), frames.size(), fps);
+}
+
+// ===========================================================================
 // Interactive replay
 // ===========================================================================
 void LocalisationViewer::run(const std::vector<ViewerFrame> & frames, int mode, const std::filesystem::path & snapshotDir)

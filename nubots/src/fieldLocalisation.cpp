@@ -361,9 +361,11 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     std::vector<Record> records;
     records.reserve(log.vision.size());
 
-    // Per-frame data for the interactive visualiser (captured only when needed).
+    // Per-frame data for the interactive visualiser. Captured for the live viewer
+    // (interactive) and also when exporting, so --export can render the mp4.
+    const bool captureFrames = interactive > 0 || !outputDirectory.empty();
     std::vector<ViewerFrame> viewFrames;
-    if (interactive > 0)
+    if (captureFrames)
     {
         viewFrames.reserve(log.vision.size());
     }
@@ -519,8 +521,8 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         }
         records.push_back(r);
 
-        // Capture the per-frame view for the interactive visualiser.
-        if (interactive > 0)
+        // Capture the per-frame view for the interactive visualiser / mp4 export.
+        if (captureFrames)
         {
             ViewerFrame vf;
             vf.videoFrame = v.videoFrame;
@@ -681,13 +683,21 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         std::println("Exported field_localisation.csv and field_trajectory.png to {}", outputDirectory.string());
     }
 
-    // Interactive two-panel visualiser: camera with re-projected detections and
-    // associations on the left, top-down field with hypotheses on the right.
-    // Mode 1 auto-plays; mode 2 steps frame-by-frame.
-    if (interactive > 0)
+    // Two-panel visualiser (camera with re-projected detections/associations on
+    // the left, top-down field with hypotheses on the right). With --export the
+    // whole replay is rendered to an mp4 (no display needed); with --interactive
+    // it also opens the live scrubbable window. Mode 1 auto-plays; mode 2 steps.
+    if (captureFrames)
     {
         FisheyeLens lens;   // NUbots equidistant lens (1280x1024); defaults to frankie (the recording robot) TODO: Adjust if replacing recording
         LocalisationViewer viewer(map, lens, dataDir / "Left.mp4");
-        viewer.run(viewFrames, interactive, outputDirectory);
+        if (!outputDirectory.empty())
+        {
+            viewer.exportVideo(viewFrames, outputDirectory / "localisation.mp4");
+        }
+        if (interactive > 0)
+        {
+            viewer.run(viewFrames, interactive, outputDirectory);
+        }
     }
 }

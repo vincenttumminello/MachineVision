@@ -102,6 +102,14 @@ public:
      */
     void run(const std::vector<ViewerFrame> & frames, int mode, const std::filesystem::path & snapshotDir = {});
 
+    /**
+     * @brief Render every recorded frame to an mp4 video (no display required).
+     * @param frames  Recorded per-frame view data
+     * @param outPath Output video path (e.g. out/localisation.mp4)
+     * @param fps     Output frame rate (defaults to the true capture rate)
+     */
+    void exportVideo(const std::vector<ViewerFrame> & frames, const std::filesystem::path & outPath, double fps = 10.0) const;
+
     /// @brief Render a single composite (camera | top-down) image without a window.
     cv::Mat renderComposite(const std::vector<ViewerFrame> & frames, std::size_t idx, const cv::Mat & rawFrame) const;
 
