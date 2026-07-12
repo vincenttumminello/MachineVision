@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -24,7 +25,7 @@
 #include "MeasurementFieldLines.h"
 #include "MeasurementGravity.h"
 #include "MeasurementKinematicHeight.h"
-#include "OutOfFieldFeatures.h"
+#include "SideDisambiguator.h"
 #include "Pose.hpp"
 #include "rotation.hpp"
 #include "SensorLog.h"
@@ -342,9 +343,22 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     // the field's 180 deg symmetry, but the background scenery is not: corner
     // features beyond the field carpet carry the own-half/opponent-half
     // information the landmarks lack (mid-game kidnap recovery, complementing
-    // the start-half prior used at initialisation).
+    // the start-half prior used at initialisation). The disambiguator maps
+    // background corners online and compares how well the estimate and its
+    // mirror explain them; a sustained mirror preference flips the filter.
     constexpr bool useOutOfField = true;
-    OutOfFieldDetector oofDetector(lens, map.dims);
+    SideDisambiguator sideDis(lens, map.dims);
+
+    // Simulated kidnap for verification: KIDNAP_T=<seconds> mirrors the filter
+    // state once at that time WITHOUT telling the disambiguator, emulating an
+    // unnoticed symmetry flip that it must detect and correct.
+    double kidnapT = std::numeric_limits<double>::quiet_NaN();
+    if (const char * kidnapEnv = std::getenv("KIDNAP_T"))
+    {
+        kidnapT = std::atof(kidnapEnv);
+        std::println("Simulated kidnap armed: state will be mirrored at t={:.1f} s", kidnapT);
+    }
+    bool kidnapDone = false;
     cv::VideoCapture videoCap;
     if (useOutOfField)
     {
@@ -431,6 +445,8 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         double baseX, baseY, baseYaw, baseCost;
         double errXY, errYaw;
         double updateMs;
+        double sideLlr;         ///< Accumulated own-vs-mirror out-of-field evidence [nats]
+        std::size_t oofAssoc;   ///< Out-of-field corners associated to map landmarks
     };
     std::vector<Record> records;
     records.reserve(log.vision.size());
@@ -452,7 +468,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     double sumSqErrXYTrusted = 0, sumSqErrYawTrusted = 0;
     std::size_t nCompared = 0, nTrusted = 0, nUpdates = 0, nSkipped = 0;
     double sumOofMs = 0, maxOofMs = 0;
-    std::size_t nOofFrames = 0, sumOofOut = 0, sumOofTotal = 0;
+    std::size_t nOofFrames = 0, sumOofOut = 0, sumOofTotal = 0, sumOofAssoc = 0, nSideFlips = 0;
 
     // DIAGNOSTIC: mean landmark reprojection residual at a given pose, using that
     // pose's own associations. Lets us ask which pose the vision data supports
@@ -501,6 +517,17 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         // Tbc = Htw * Hcw^{-1}
         std::size_t k = nearestIndex(log.sensors, v.t, [](const SensorsSample & s) { return s.t; });
         Pose<double> Tbc = log.sensors[k].Htw*v.Hcw.inverse();
+
+        // Simulated kidnap: mirror the filter state once, without notifying the
+        // side disambiguator, and let it detect and correct the flip.
+        if (!kidnapDone && std::isfinite(kidnapT) && t >= kidnapT)
+        {
+            system.resetTo(SystemLocalisation::mirrorDensity(system.density), t);
+            kidnapDone = true;
+            Eigen::VectorXd xk = system.density.mean();
+            std::println("KIDNAP: state mirrored at t={:.2f} s -> x={:.2f} m, y={:.2f} m, yaw={:.1f} deg",
+                         t, xk(0), xk(1), xk(5)*180.0/M_PI);
+        }
 
         // Measurement toggles (for ablation experiments)
         constexpr bool useGravity = true;
@@ -566,6 +593,8 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         r.nCand = meas.numCandidates();
         r.updateMs = ms;
         r.baseX = r.baseY = r.baseYaw = r.baseCost = r.errXY = r.errYaw = std::numeric_limits<double>::quiet_NaN();
+        r.sideLlr = std::numeric_limits<double>::quiet_NaN();
+        r.oofAssoc = 0;
 
         if (!log.fieldBaseline.empty())
         {
@@ -611,29 +640,60 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                 }
             }
         }
-        records.push_back(r);
-
         // Estimated camera pose in {f} at the posterior mean (with mount-bias
         // correction), shared by the out-of-field pipeline and the visualiser.
         const Pose<double> TfcEst = SystemLocalisation::fieldPose<double>(r.mean)*Tbc
                  *Pose<double>(SystemLocalisation::cameraBiasRotation<double>(r.mean), Eigen::Vector3d::Zero());
 
-        // Out-of-field corner features from the raw video frame.
-        std::vector<OutOfFieldFeature> oofFeatures;
+        // Out-of-field side disambiguation from the raw video frame: map the
+        // background corners and compare the pose against its 180 deg mirror.
+        SideDisambiguator::FrameResult side;
+        bool sideRan = false;
         if (useOutOfField && fetchVideoFrame(v.videoFrame))
         {
             auto ticOof = std::chrono::steady_clock::now();
             cv::Mat gray;
             cv::cvtColor(videoFrameBgr, gray, cv::COLOR_BGR2GRAY);
-            oofFeatures = oofDetector.detect(gray, TfcEst);
+
+            // Camera pose under the mirrored state (same kinematics, mirrored torso pose).
+            Eigen::VectorXd mirrorEta = SystemLocalisation::mirrorState(r.mean);
+            const Pose<double> TfcMirror = SystemLocalisation::fieldPose<double>(mirrorEta)*Tbc
+                     *Pose<double>(SystemLocalisation::cameraBiasRotation<double>(mirrorEta), Eigen::Vector3d::Zero());
+
+            side = sideDis.process(t, gray, TfcEst, TfcMirror,
+                                   std::max(r.sigma(0), r.sigma(1)), r.sigma(5),
+                                   std::abs(log.sensors[k].gyroscope.z()));
+            sideRan = true;
             double oofMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ticOof).count();
             sumOofMs += oofMs;
             maxOofMs = std::max(maxOofMs, oofMs);
             nOofFrames++;
-            sumOofTotal += oofFeatures.size();
-            sumOofOut += std::count_if(oofFeatures.begin(), oofFeatures.end(),
-                                       [](const OutOfFieldFeature & of) { return of.outOfField; });
+            sumOofTotal += side.nFeatures;
+            sumOofOut += side.nOutOfField;
+            sumOofAssoc += side.nAssociated;
+            r.sideLlr = side.llr;
+            r.oofAssoc = side.nAssociated;
+
+            if (nOofFrames % 100 == 0 || side.llr < 0.0)
+            {
+                std::println("  side t={:6.1f}s: {} landmarks, {} candidates, assoc {}/{} visible {}/{} own/mirror, llr {:+.1f}{}",
+                             t, side.nLandmarks, side.nCandidates, side.nAssociated, side.nAssociatedMirror,
+                             side.nVisibleOwn, side.nVisibleMirror, side.llr, side.mapFrozen ? " [frozen]" : "");
+            }
+
+            if (side.flipRequested)
+            {
+                // The background evidence says we are on the wrong side: mirror
+                // the filter belief and tell the disambiguator the flip happened.
+                system.resetTo(SystemLocalisation::mirrorDensity(system.density), t);
+                sideDis.notifyFlipApplied(t);
+                nSideFlips++;
+                Eigen::VectorXd xf = system.density.mean();
+                std::println("SIDE FLIP at t={:.2f} s (llr={:+.1f}, assoc {}/{} own/mirror): corrected to x={:.2f} m, y={:.2f} m, yaw={:.1f} deg",
+                             t, side.llr, side.nAssociated, side.nAssociatedMirror, xf(0), xf(1), xf(5)*180.0/M_PI);
+            }
         }
+        records.push_back(r);
 
         // Capture the per-frame view for the interactive visualiser / mp4 export.
         if (captureFrames)
@@ -699,9 +759,16 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
             }
 
             // Out-of-field corner features (on-carpet rejects kept for mask verification).
-            for (const OutOfFieldFeature & of : oofFeatures)
+            if (sideRan)
             {
-                vf.oofFeatures.push_back({of.px, of.outOfField ? 1 : 0});
+                for (std::size_t i = 0; i < side.features.size(); ++i)
+                {
+                    vf.oofFeatures.push_back({side.features[i].px, side.featureStatus[i]});
+                }
+                vf.hasSide = true;
+                vf.sideLlr = side.llr;
+                vf.nOofLandmarks = side.nLandmarks;
+                vf.sideFrozen = side.mapFrozen;
             }
 
             vf.lineRays = frameLineRays;
@@ -743,9 +810,16 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     }
     if (nOofFrames > 0)
     {
-        std::println("Out-of-field features: {:.0f} corners/frame ({:.0f} out-of-field), detect {:.2f} ms mean / {:.2f} ms max over {} frames",
+        std::println("Out-of-field features: {:.0f} corners/frame ({:.0f} out-of-field, {:.1f} associated), {:.2f} ms mean / {:.2f} ms max over {} frames",
                      static_cast<double>(sumOofTotal)/nOofFrames, static_cast<double>(sumOofOut)/nOofFrames,
-                     sumOofMs/nOofFrames, maxOofMs, nOofFrames);
+                     static_cast<double>(sumOofAssoc)/nOofFrames, sumOofMs/nOofFrames, maxOofMs, nOofFrames);
+        std::println("Side disambiguator: {} map landmarks, final llr {:+.1f} nats, {} flips",
+                     sideDis.landmarks().size(), sideDis.llr(), nSideFlips);
+        const SideDisambiguator::Stats & ss = sideDis.stats();
+        std::println("  map funnel: {} promote attempts ({} parallax-wait, tri fail {} geom / {} range / {} chi2, {} on-carpet, {} jittery) -> {} point + {} bearing-only ({} upgraded); culled {} chi2 / {} miss",
+                     ss.promoteAttempts, ss.parallaxWait, ss.triFailGeometry, ss.triFailRange, ss.triFailChi2,
+                     ss.backgroundFail, ss.farSpreadFail, ss.promoted, ss.promotedFar, ss.upgraded,
+                     ss.landmarkCulledChi2, ss.landmarkCulledMiss);
     }
     if (nResid > 0)
     {
@@ -809,7 +883,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
 
         // CSV export
         std::ofstream csv(outputDirectory / "field_localisation.csv");
-        csv << "t,x,y,z,roll,pitch,yaw,sx,sy,sz,sroll,spitch,syaw,camBiasRoll,camBiasPitch,sCamRoll,sCamPitch,nAssoc,nCand,baseX,baseY,baseYaw,baseCost,errXY,errYaw,updateMs\n";
+        csv << "t,x,y,z,roll,pitch,yaw,sx,sy,sz,sroll,spitch,syaw,camBiasRoll,camBiasPitch,sCamRoll,sCamPitch,nAssoc,nCand,baseX,baseY,baseYaw,baseCost,errXY,errYaw,updateMs,sideLlr,oofAssoc\n";
         for (const Record & r : records)
         {
             csv << r.t;
@@ -818,7 +892,8 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
             csv << ',' << r.mean(6) << ',' << r.mean(7) << ',' << r.sigma(6) << ',' << r.sigma(7);
             csv << ',' << r.nAssoc << ',' << r.nCand
                 << ',' << r.baseX << ',' << r.baseY << ',' << r.baseYaw << ',' << r.baseCost
-                << ',' << r.errXY << ',' << r.errYaw << ',' << r.updateMs << '\n';
+                << ',' << r.errXY << ',' << r.errYaw << ',' << r.updateMs
+                << ',' << r.sideLlr << ',' << r.oofAssoc << '\n';
         }
 
         cv::imwrite((outputDirectory / "field_trajectory.png").string(), plot.image());

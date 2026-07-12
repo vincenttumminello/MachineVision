@@ -246,8 +246,16 @@ cv::Mat LocalisationViewer::renderCameraPanel(const ViewerFrame & f, const cv::M
     {
         const auto nOut = std::count_if(f.oofFeatures.begin(), f.oofFeatures.end(),
                                         [](const OofFeatureView & of) { return of.status >= 1; });
-        hudText(panel, std::format("out-of-field corners {}/{}", nOut, f.oofFeatures.size()),
+        const auto nAssoc = std::count_if(f.oofFeatures.begin(), f.oofFeatures.end(),
+                                          [](const OofFeatureView & of) { return of.status >= 2; });
+        hudText(panel, std::format("out-of-field corners {}/{}  associated {}", nOut, f.oofFeatures.size(), nAssoc),
                 cv::Point(10, 66), 0.42, cv::Scalar(255, 255, 180));
+    }
+    if (f.hasSide)
+    {
+        hudText(panel, std::format("side llr {:+.1f} nats  oof map {} lm{}",
+                                   f.sideLlr, f.nOofLandmarks, f.sideFrozen ? "  [map frozen]" : ""),
+                cv::Point(10, 88), 0.42, cv::Scalar(255, 220, 255));
     }
     return panel;
 }

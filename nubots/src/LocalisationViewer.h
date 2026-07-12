@@ -83,6 +83,10 @@ struct ViewerFrame
     std::size_t nAssoc = 0;
     std::size_t nCand = 0;
     double updateMs = 0.0;
+    bool hasSide = false;               ///< Side-disambiguator ran on this frame
+    double sideLlr = 0.0;               ///< Accumulated own-vs-mirror evidence [nats]
+    std::size_t nOofLandmarks = 0;      ///< Out-of-field map size
+    bool sideFrozen = false;            ///< Map building frozen (pose/side in doubt)
     bool hasError = false;
     double errXY = 0.0;
     double errYaw = 0.0;
