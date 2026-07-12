@@ -3,6 +3,6 @@
 
 # Except this file
 !.gitignore
-# and the video
+# and the video and png
 !localisation.mp4
-
+!field_trajectory.png
