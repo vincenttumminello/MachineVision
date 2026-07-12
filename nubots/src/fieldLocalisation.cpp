@@ -14,6 +14,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/highgui.hpp>
+#include <opencv2/videoio.hpp>
 #include "FieldMap.h"
 #include "fieldLocalisation.h"
 #include "FisheyeLens.h"
@@ -23,6 +24,7 @@
 #include "MeasurementFieldLines.h"
 #include "MeasurementGravity.h"
 #include "MeasurementKinematicHeight.h"
+#include "OutOfFieldFeatures.h"
 #include "Pose.hpp"
 #include "rotation.hpp"
 #include "SensorLog.h"
@@ -331,6 +333,48 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     // Field landmark map
     FieldMap map;
 
+    // NUbots equidistant lens (1280x1024); defaults to frankie (the recording
+    // robot). Shared by the out-of-field feature pipeline and the visualiser.
+    // TODO: Adjust if replacing recording
+    FisheyeLens lens;
+
+    // Out-of-field side disambiguation. On-field landmarks are invariant under
+    // the field's 180 deg symmetry, but the background scenery is not: corner
+    // features beyond the field carpet carry the own-half/opponent-half
+    // information the landmarks lack (mid-game kidnap recovery, complementing
+    // the start-half prior used at initialisation).
+    constexpr bool useOutOfField = true;
+    OutOfFieldDetector oofDetector(lens, map.dims);
+    cv::VideoCapture videoCap;
+    if (useOutOfField)
+    {
+        videoCap.open((dataDir / "Left.mp4").string());
+        if (!videoCap.isOpened())
+        {
+            std::println("WARNING: could not open {} - out-of-field features disabled", (dataDir / "Left.mp4").string());
+        }
+    }
+    // Sequential fetch of a video frame by index (vision samples are time-ordered,
+    // so targets are non-decreasing; a backwards seek is supported but not expected).
+    int videoNextFrame = 0;
+    cv::Mat videoFrameBgr;
+    auto fetchVideoFrame = [&](int target) -> bool
+    {
+        if (!videoCap.isOpened() || target < 0) return false;
+        if (target < videoNextFrame - 1)
+        {
+            videoCap.set(cv::CAP_PROP_POS_FRAMES, target);
+            videoNextFrame = target;
+        }
+        if (target == videoNextFrame - 1) return !videoFrameBgr.empty();   // Same frame as last fetch
+        while (videoNextFrame <= target)
+        {
+            if (!videoCap.read(videoFrameBgr)) return false;
+            videoNextFrame++;
+        }
+        return !videoFrameBgr.empty();
+    };
+
     // Baseline-free initialisation: solve the first usable vision frame's pose
     // from the landmark detections and the field map. The NUbots baseline is
     // used ONLY for later comparison/plotting, never by the estimator.
@@ -407,6 +451,8 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     double sumSqErrXY = 0, sumSqErrYaw = 0, sumMs = 0, maxMs = 0;
     double sumSqErrXYTrusted = 0, sumSqErrYawTrusted = 0;
     std::size_t nCompared = 0, nTrusted = 0, nUpdates = 0, nSkipped = 0;
+    double sumOofMs = 0, maxOofMs = 0;
+    std::size_t nOofFrames = 0, sumOofOut = 0, sumOofTotal = 0;
 
     // DIAGNOSTIC: mean landmark reprojection residual at a given pose, using that
     // pose's own associations. Lets us ask which pose the vision data supports
@@ -567,14 +613,35 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         }
         records.push_back(r);
 
+        // Estimated camera pose in {f} at the posterior mean (with mount-bias
+        // correction), shared by the out-of-field pipeline and the visualiser.
+        const Pose<double> TfcEst = SystemLocalisation::fieldPose<double>(r.mean)*Tbc
+                 *Pose<double>(SystemLocalisation::cameraBiasRotation<double>(r.mean), Eigen::Vector3d::Zero());
+
+        // Out-of-field corner features from the raw video frame.
+        std::vector<OutOfFieldFeature> oofFeatures;
+        if (useOutOfField && fetchVideoFrame(v.videoFrame))
+        {
+            auto ticOof = std::chrono::steady_clock::now();
+            cv::Mat gray;
+            cv::cvtColor(videoFrameBgr, gray, cv::COLOR_BGR2GRAY);
+            oofFeatures = oofDetector.detect(gray, TfcEst);
+            double oofMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ticOof).count();
+            sumOofMs += oofMs;
+            maxOofMs = std::max(maxOofMs, oofMs);
+            nOofFrames++;
+            sumOofTotal += oofFeatures.size();
+            sumOofOut += std::count_if(oofFeatures.begin(), oofFeatures.end(),
+                                       [](const OutOfFieldFeature & of) { return of.outOfField; });
+        }
+
         // Capture the per-frame view for the interactive visualiser / mp4 export.
         if (captureFrames)
         {
             ViewerFrame vf;
             vf.videoFrame = v.videoFrame;
             vf.t = t;
-            vf.Tfc = SystemLocalisation::fieldPose<double>(r.mean)*Tbc
-                     *Pose<double>(SystemLocalisation::cameraBiasRotation<double>(r.mean), Eigen::Vector3d::Zero());
+            vf.Tfc = TfcEst;
             vf.estPos = r.mean.head<2>();
             vf.estYaw = r.mean(5);
             vf.estCov = system.density.cov().topLeftCorner<2, 2>();
@@ -631,6 +698,12 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                 vf.associations.push_back(av);
             }
 
+            // Out-of-field corner features (on-carpet rejects kept for mask verification).
+            for (const OutOfFieldFeature & of : oofFeatures)
+            {
+                vf.oofFeatures.push_back({of.px, of.outOfField ? 1 : 0});
+            }
+
             vf.lineRays = frameLineRays;
             if (std::isfinite(r.baseX))
             {
@@ -667,6 +740,12 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     {
         std::println("vs trusted baseline (cost < {:.1f}) over {} samples: RMSE position {:.3f} m, yaw {:.2f} deg",
                      trustedBaselineCost, nTrusted, std::sqrt(sumSqErrXYTrusted/nTrusted), std::sqrt(sumSqErrYawTrusted/nTrusted)*180.0/M_PI);
+    }
+    if (nOofFrames > 0)
+    {
+        std::println("Out-of-field features: {:.0f} corners/frame ({:.0f} out-of-field), detect {:.2f} ms mean / {:.2f} ms max over {} frames",
+                     static_cast<double>(sumOofTotal)/nOofFrames, static_cast<double>(sumOofOut)/nOofFrames,
+                     sumOofMs/nOofFrames, maxOofMs, nOofFrames);
     }
     if (nResid > 0)
     {
@@ -752,7 +831,6 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     // it also opens the live scrubbable window. Mode 1 auto-plays; mode 2 steps.
     if (captureFrames)
     {
-        FisheyeLens lens;   // NUbots equidistant lens (1280x1024); defaults to frankie (the recording robot) TODO: Adjust if replacing recording
         LocalisationViewer viewer(map, lens, dataDir / "Left.mp4");
         if (!outputDirectory.empty())
         {

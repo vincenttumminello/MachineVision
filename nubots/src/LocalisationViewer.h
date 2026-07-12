@@ -42,6 +42,13 @@ struct AssociationView
     int type = 0;                ///< LandmarkType (for colour)
 };
 
+/// @brief One out-of-field corner feature (side disambiguation) for the camera panel.
+struct OofFeatureView
+{
+    Eigen::Vector2d px = Eigen::Vector2d::Zero();   ///< Pixel position (full lens resolution)
+    int status = 0;   ///< 0: on-carpet (rejected), 1: out-of-field, 2: associated to a map landmark
+};
+
 /// @brief One pose hypothesis for the top-down panel.
 struct HypothesisView
 {
@@ -65,6 +72,7 @@ struct ViewerFrame
     std::vector<HypothesisView> hypotheses;
     std::vector<DetectionView> detections;
     std::vector<AssociationView> associations;
+    std::vector<OofFeatureView> oofFeatures;   ///< Out-of-field corner features (may be empty)
     Eigen::Matrix<double, 3, Eigen::Dynamic> lineRays;  ///< Field-line rays in {c} (may be empty)
 
     bool hasBaseline = false;

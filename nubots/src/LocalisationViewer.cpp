@@ -150,6 +150,24 @@ cv::Mat LocalisationViewer::renderCameraPanel(const ViewerFrame & f, const cv::M
         }
     }
 
+    // ---- out-of-field corner features (side disambiguation) ----
+    for (const OofFeatureView & of : f.oofFeatures)
+    {
+        const cv::Point2d p = toPanel(of.px);
+        switch (of.status)
+        {
+            case 0:  // On-carpet: rejected, drawn faintly to verify the mask
+                cv::circle(panel, p, 1, cv::Scalar(90, 90, 90), cv::FILLED, cv::LINE_AA);
+                break;
+            case 1:  // Out-of-field: usable background feature (cyan)
+                cv::circle(panel, p, 2, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
+                break;
+            default: // Associated to an out-of-field map landmark (magenta)
+                cv::circle(panel, p, 3, cv::Scalar(255, 0, 255), 1, cv::LINE_AA);
+                break;
+        }
+    }
+
     // ---- YOLO detections (curved fisheye boxes) ----
     for (const DetectionView & d : f.detections)
     {
@@ -224,6 +242,13 @@ cv::Mat LocalisationViewer::renderCameraPanel(const ViewerFrame & f, const cv::M
     hudText(panel, std::format("camera  t={:.2f}s  video frame {}", f.t, f.videoFrame), cv::Point(10, 22), 0.45);
     hudText(panel, std::format("detections {}  associated {}/{}", f.detections.size(), f.nAssoc, f.nCand),
             cv::Point(10, 44), 0.42, cv::Scalar(200, 255, 200));
+    if (!f.oofFeatures.empty())
+    {
+        const auto nOut = std::count_if(f.oofFeatures.begin(), f.oofFeatures.end(),
+                                        [](const OofFeatureView & of) { return of.status >= 1; });
+        hudText(panel, std::format("out-of-field corners {}/{}", nOut, f.oofFeatures.size()),
+                cv::Point(10, 66), 0.42, cv::Scalar(255, 255, 180));
+    }
     return panel;
 }
 
