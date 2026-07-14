@@ -7,12 +7,13 @@
  * @code
  * {"type": "<message type>", "timestamp": <int, microseconds since epoch>, "data": {...}}
  * @endcode
- * Only five message types are of interest for state estimation and are parsed here:
+ * Only six message types are of interest for state estimation and are parsed here:
  *   - message.input.Sensors
  *   - message.vision.BoundingBoxes
  *   - message.behaviour.state.WalkState
  *   - message.localisation.Field
  *   - message.vision.FieldLines
+ *   - message.input.MotionCapture (OptiTrack ground truth; evaluation only)
  *
  * @see SensorLog
  */
@@ -79,6 +80,22 @@ struct FieldBaselineSample
 };
 
 /**
+ * @brief A single message.input.MotionCapture sample (OptiTrack rigid-body ground truth).
+ *
+ * The pose is the raw Motive rigid body in the mocap frame {m}; the mapping to the
+ * field frame (and the rigid-body-to-torso extrinsics) is applied by the consumer,
+ * since it is a property of the capture-volume calibration, not of the log format.
+ * Ground truth is for evaluation/visualisation only and must never reach the estimator.
+ */
+struct MocapSample
+{
+    double t;                       ///< receive time [s since epoch]
+    Eigen::Vector3d position;       ///< rigid-body position in {m} [m]
+    Eigen::Matrix3d R;              ///< rigid-body orientation in {m} (from the streamed quaternion)
+    bool valid = false;             ///< OptiTrack trackingValid flag
+};
+
+/**
  * @brief A single message.vision.FieldLines sample (field-line points as camera rays)
  */
 struct LinePointsSample
@@ -92,9 +109,10 @@ struct LinePointsSample
 /**
  * @brief Parses a recorded NUbots sensor log (NDJSON) and aligns vision samples to video frames.
  *
- * Only five message types are parsed (message.input.Sensors, message.vision.BoundingBoxes,
- * message.behaviour.state.WalkState, message.localisation.Field, message.vision.FieldLines);
- * all other message types are skipped cheaply. Each resulting stream is time-ordered.
+ * Only six message types are parsed (message.input.Sensors, message.vision.BoundingBoxes,
+ * message.behaviour.state.WalkState, message.localisation.Field, message.vision.FieldLines,
+ * message.input.MotionCapture); all other message types are skipped cheaply. Each resulting
+ * stream is time-ordered.
  */
 class SensorLog
 {
@@ -112,6 +130,7 @@ public:
     std::vector<WalkStateSample> walk;                ///< time-ordered
     std::vector<FieldBaselineSample> fieldBaseline;  ///< time-ordered
     std::vector<LinePointsSample> linePoints;        ///< time-ordered
+    std::vector<MocapSample> mocap;                  ///< time-ordered (empty if the log has no mocap)
     std::vector<double> frameTimes;                  ///< [s since epoch] per video frame
     double t0 = 0;                                    ///< earliest sample time across all streams [s]
 };

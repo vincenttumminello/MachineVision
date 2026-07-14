@@ -358,6 +358,66 @@ SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesyst
             sample.cost = getDoubleTolerant(data["cost"]);
             fieldBaseline.push_back(std::move(sample));
         }
+        else if (type == "message.input.MotionCapture")
+        {
+            int64_t timestampUs = 0;
+            bool haveTimestamp = docResult["timestamp"].get_int64().get(timestampUs) == simdjson::SUCCESS;
+
+            simdjson::ondemand::object data;
+            if (docResult["data"].get_object().get(data) != simdjson::SUCCESS)
+            {
+                continue;
+            }
+            // The NatNet per-frame timestamps in the payload are uninitialised garbage in this
+            // log; the envelope timestamp (receive time, same clock as everything else) is used.
+            // Only the first rigid body is taken: the capture volume tracks the one robot.
+            simdjson::ondemand::array bodies;
+            if (data["rigidBodies"].get_array().get(bodies) != simdjson::SUCCESS)
+            {
+                continue;
+            }
+            for (auto bodyResult : bodies)
+            {
+                simdjson::ondemand::object body;
+                if (bodyResult.get_object().get(body) != simdjson::SUCCESS)
+                {
+                    break;
+                }
+                MocapSample sample;
+                sample.t = haveTimestamp ? static_cast<double>(timestampUs) * 1e-6 : NaN;
+                sample.position = parseVec3(body["position"]);
+
+                // Quaternion streamed as {x, y, z, t} with t the scalar (w) part.
+                simdjson::ondemand::object rot;
+                double qx = NaN, qy = NaN, qz = NaN, qw = NaN;
+                if (body["rotation"].get_object().get(rot) == simdjson::SUCCESS)
+                {
+                    qx = getDoubleTolerant(rot["x"]);
+                    qy = getDoubleTolerant(rot["y"]);
+                    qz = getDoubleTolerant(rot["z"]);
+                    qw = getDoubleTolerant(rot["t"]);
+                }
+                const double n2 = qx*qx + qy*qy + qz*qz + qw*qw;
+                bool trackingValid = false;
+                (void) body["trackingValid"].get_bool().get(trackingValid);
+                sample.valid = trackingValid && sample.position.allFinite()
+                               && std::isfinite(n2) && n2 > 1e-12;
+                if (sample.valid)
+                {
+                    const double s = 1.0 / std::sqrt(n2);
+                    qx *= s; qy *= s; qz *= s; qw *= s;
+                    sample.R << 1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw),
+                                2*(qx*qy + qz*qw),     1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qx*qw),
+                                2*(qx*qz - qy*qw),     2*(qy*qz + qx*qw),     1 - 2*(qx*qx + qy*qy);
+                }
+                else
+                {
+                    sample.R.setConstant(NaN);
+                }
+                mocap.push_back(std::move(sample));
+                break;
+            }
+        }
         else if (type == "message.vision.FieldLines")
         {
             simdjson::ondemand::object data;
@@ -473,6 +533,7 @@ SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesyst
     std::stable_sort(walk.begin(), walk.end(), byTime);
     std::stable_sort(fieldBaseline.begin(), fieldBaseline.end(), byTime);
     std::stable_sort(linePoints.begin(), linePoints.end(), byTime);
+    std::stable_sort(mocap.begin(), mocap.end(), byTime);
 
     t0 = std::numeric_limits<double>::infinity();
     if (!sensors.empty())

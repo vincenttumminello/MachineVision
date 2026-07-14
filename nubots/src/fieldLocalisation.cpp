@@ -49,6 +49,72 @@ static std::size_t nearestIndex(const std::vector<T> & v, double t, F && timeOf)
     return (timeOf(v[i]) - t < t - timeOf(v[i-1])) ? i : i - 1;
 }
 
+// ---------------------------------------------------------------------------
+// Motion-capture ground truth (OptiTrack, data2 recordings).
+//
+// The mocap stream is the EVALUATION REFERENCE ONLY: it is never given to the
+// estimator, which must localise from the robot's own sensors alone.
+//
+// Frame: the capture volume was calibrated z-up with its origin at the field
+// centre and the ground-plane axes along the field lines, rotated -90 deg
+// relative to the field frame: field x = mocap y, field y = -mocap x. This was
+// verified against the data (candidate rotations scored against the trusted
+// NUbots baseline: the -90 deg mapping fits at 0.39 m RMSE; the other three at
+// 2.3-3.2 m).
+//
+// Rigid-body extrinsics: the Motive rigid-body axes are defined arbitrarily at
+// creation, so the marker-body yaw leads the torso yaw by a constant. The
+// constant below is a one-time calibration: the circular-mean offset against
+// the trusted NUbots baseline over 1988 samples (std 2.2 deg; sanity-checked
+// against the walk direction). Its residual error is bounded by the baseline's
+// own systematic yaw bias (~1-2 deg).
+//
+// No positional lever-arm correction is applied: the rigid-body origin is the
+// marker centroid, which sits on the torso (checked from the streamed marker
+// positions), so truth position is torso position to within a few cm -- except
+// in z, where the markers sit ~6 cm above the torso origin. Truth z is reported
+// as the raw marker height for exactly that reason: "correcting" it would hide
+// genuine height-axis errors behind a fitted constant.
+// ---------------------------------------------------------------------------
+namespace mocaptruth
+{
+    /// Ground-plane rotation {m} -> {f}: field x = mocap y, field y = -mocap x.
+    const Eigen::Matrix3d Rfm = (Eigen::Matrix3d() << 0, 1, 0,
+                                                     -1, 0, 0,
+                                                      0, 0, 1).finished();
+    /// Marker-body yaw minus torso yaw [rad] (Motive rigid-body definition).
+    constexpr double yawOffset = 59.07*M_PI/180.0;
+}
+
+/// @brief One ground-truth pose in the field frame.
+struct TruthSample
+{
+    double t;               ///< Time since log start [s]
+    Eigen::Vector3d rBFf;   ///< Marker-body position in {f} (z is marker height)
+    double yaw;             ///< Torso yaw in {f} (extrinsics-corrected)
+};
+
+/// @brief Convert the raw mocap stream to field-frame ground truth.
+static std::vector<TruthSample> buildTruth(const std::vector<MocapSample> & mocap, double t0)
+{
+    std::vector<TruthSample> truth;
+    truth.reserve(mocap.size());
+    for (const MocapSample & m : mocap)
+    {
+        if (!m.valid || !std::isfinite(m.t))
+        {
+            continue;
+        }
+        TruthSample s;
+        s.t = m.t - t0;
+        s.rBFf = mocaptruth::Rfm*m.position;
+        const Eigen::Vector3d bx = mocaptruth::Rfm*m.R.col(0);   // marker-body x axis in {f}
+        s.yaw = std::atan2(bx.y(), bx.x()) - mocaptruth::yawOffset;
+        truth.push_back(s);
+    }
+    return truth;
+}
+
 // Colours (BGR) shared between the plotted marks and the legend so the two
 // can never drift apart.
 namespace plotcolour
@@ -56,6 +122,7 @@ namespace plotcolour
     const cv::Scalar field(255, 255, 255);      ///< Field lines
     const cv::Scalar goalPost(0, 220, 220);     ///< Goal posts (yellow)
     const cv::Scalar baseline(180, 180, 180);   ///< NUbots baseline (grey)
+    const cv::Scalar truth(80, 220, 80);        ///< Mocap ground truth (green)
     const cv::Scalar estimateStart(255, 128, 0);///< Our estimate at the start of the run (blue)
     const cv::Scalar estimateEnd(0, 128, 255);  ///< Our estimate at the end of the run (orange)
     const cv::Scalar covariance(255, 0, 200);   ///< 2-sigma position ellipse (magenta)
@@ -67,7 +134,16 @@ namespace plotcolour
     }
 }
 
-// Simple top-down field renderer for trajectories
+// Top-down field renderer for the exported trajectory figure.
+//
+// Rendering niceties (this is the headline figure of a run):
+//  - two-tone mowing stripes and a darker border strip so the carpet reads as a
+//    pitch rather than a flat green rectangle;
+//  - trajectories drawn as connected anti-aliased polylines (not dot spray);
+//  - covariance ellipses accumulated on an overlay and alpha-blended so dozens
+//    of rings shade the corridor instead of scribbling over the trails;
+//  - a title band tall enough for the title and the RMSE subtitle;
+//  - goal structure (posts + net box) drawn behind each goal line.
 class FieldPlot
 {
 public:
@@ -75,105 +151,128 @@ public:
         : dims_(dims)
         , scale_(pixelsPerMetre)
     {
-        const double borderm = dims.borderStripMinWidth + 0.3;
+        const double borderm = dims.borderStripMinWidth + 0.35;
         fieldW_ = static_cast<int>((dims.fieldLength + 2*borderm)*scale_);
         fieldH_ = static_cast<int>((dims.fieldWidth  + 2*borderm)*scale_);
         width_  = fieldW_;
         height_ = topMargin_ + fieldH_ + bottomMargin_;
 
-        // Dark surround, with the playing field painted green in the middle band
-        img_ = cv::Mat(height_, width_, CV_8UC3, cv::Scalar(45, 45, 45));
-        cv::rectangle(img_, cv::Point(0, topMargin_), cv::Point(fieldW_, topMargin_ + fieldH_),
-                      cv::Scalar(30, 100, 30), cv::FILLED);
+        img_ = cv::Mat(height_, width_, CV_8UC3, cv::Scalar(34, 32, 30));
         drawField();
     }
 
     cv::Point2i toPixel(double xf, double yf) const
     {
         // Field x to the right, field y up in the image (offset below the title band)
-        return {static_cast<int>(fieldW_/2.0 + xf*scale_),
-                static_cast<int>(topMargin_ + fieldH_/2.0 - yf*scale_)};
+        return {static_cast<int>(std::lround(fieldW_/2.0 + xf*scale_)),
+                static_cast<int>(std::lround(topMargin_ + fieldH_/2.0 - yf*scale_))};
     }
 
     void drawField()
     {
-        const cv::Scalar & white = plotcolour::field;
-        const int lw = std::max(1, static_cast<int>(dims_.lineWidth*scale_));
+        const int lw = std::max(2, static_cast<int>(dims_.lineWidth*scale_));
         const double hl = dims_.fieldLength/2, hw = dims_.fieldWidth/2;
+        const double hbx = fieldW_/(2.0*scale_), hby = fieldH_/(2.0*scale_);
 
-        auto rect = [&](double x0, double y0, double x1, double y1)
+        // Border strip (darker) under the playing field (striped)
+        cv::rectangle(img_, toPixel(-hbx, hby), toPixel(hbx, -hby), cv::Scalar(24, 78, 24), cv::FILLED);
+        for (int i = 0; ; ++i)
         {
-            cv::rectangle(img_, toPixel(x0, y0), toPixel(x1, y1), white, lw);
+            const double x0 = -hl + i*1.0;
+            if (x0 >= hl) break;
+            const double x1 = std::min(x0 + 1.0, hl);
+            const cv::Scalar green = (i % 2 == 0) ? cv::Scalar(33, 105, 33) : cv::Scalar(29, 96, 29);
+            cv::rectangle(img_, toPixel(x0, hw), toPixel(x1, -hw), green, cv::FILLED);
+        }
+
+        const cv::Scalar & white = plotcolour::field;
+        auto rect = [&](double x0, double y0, double x1, double y1, const cv::Scalar & col)
+        {
+            cv::rectangle(img_, toPixel(x0, y0), toPixel(x1, y1), col, lw, cv::LINE_AA);
         };
-        rect(-hl, -hw, hl, hw);                                                     // Boundary
-        cv::line(img_, toPixel(0, -hw), toPixel(0, hw), white, lw);                 // Halfway line
-        cv::circle(img_, toPixel(0, 0), static_cast<int>(dims_.centreCircleDiameter/2*scale_), white, lw);
+        rect(-hl, -hw, hl, hw, white);                                              // Boundary
+        cv::line(img_, toPixel(0, -hw), toPixel(0, hw), white, lw, cv::LINE_AA);    // Halfway line
+        cv::circle(img_, toPixel(0, 0), static_cast<int>(dims_.centreCircleDiameter/2*scale_), white, lw, cv::LINE_AA);
+        cv::circle(img_, toPixel(0, 0), lw, white, cv::FILLED, cv::LINE_AA);        // Centre mark
         for (int s : {-1, 1})
         {
-            rect(s*hl, -dims_.goalAreaWidth/2, s*(hl - dims_.goalAreaLength), dims_.goalAreaWidth/2);
-            rect(s*hl, -dims_.penaltyAreaWidth/2, s*(hl - dims_.penaltyAreaLength), dims_.penaltyAreaWidth/2);
-            cv::drawMarker(img_, toPixel(s*(hl - dims_.penaltyMarkDistance), 0), white, cv::MARKER_CROSS, 8, lw);
+            rect(s*hl, -dims_.goalAreaWidth/2, s*(hl - dims_.goalAreaLength), dims_.goalAreaWidth/2, white);
+            rect(s*hl, -dims_.penaltyAreaWidth/2, s*(hl - dims_.penaltyAreaLength), dims_.penaltyAreaWidth/2, white);
+            cv::drawMarker(img_, toPixel(s*(hl - dims_.penaltyMarkDistance), 0), white, cv::MARKER_CROSS, 10, lw, cv::LINE_AA);
+
+            // Goal: net box behind the goal line, posts on it
+            rect(s*hl, -dims_.goalWidth/2, s*(hl + dims_.goalDepth), dims_.goalWidth/2, cv::Scalar(150, 150, 150));
             for (int t : {-1, 1})
             {
-                cv::circle(img_, toPixel(s*hl, t*dims_.goalWidth/2), std::max(2, static_cast<int>(dims_.goalpostWidth/2*scale_)), plotcolour::goalPost, -1);
+                const cv::Point2i p = toPixel(s*hl, t*dims_.goalWidth/2);
+                const int r = std::max(3, static_cast<int>(dims_.goalpostWidth*0.75*scale_));
+                cv::circle(img_, p, r, plotcolour::goalPost, cv::FILLED, cv::LINE_AA);
+                cv::circle(img_, p, r, cv::Scalar(30, 30, 30), 1, cv::LINE_AA);
             }
         }
     }
 
-    /// @brief Draw the title (and optional subtitle) in the top band.
+    /// @brief Draw the title and optional subtitle in the top band (two clear lines).
     void drawTitle(const std::string & title, const std::string & subtitle = "")
     {
-        cv::putText(img_, title, cv::Point(14, 27), cv::FONT_HERSHEY_SIMPLEX, 0.62,
-                    cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+        cv::putText(img_, title, cv::Point(16, 30), cv::FONT_HERSHEY_SIMPLEX, 0.72,
+                    cv::Scalar(245, 245, 245), 2, cv::LINE_AA);
         if (!subtitle.empty())
         {
-            cv::putText(img_, subtitle, cv::Point(14, topMargin_ - 8), cv::FONT_HERSHEY_SIMPLEX, 0.40,
-                        cv::Scalar(190, 190, 190), 1, cv::LINE_AA);
+            // Shrink to fit: RMSE summaries vary in length and must not clip.
+            double scale = 0.46;
+            while (scale > 0.30
+                   && cv::getTextSize(subtitle, cv::FONT_HERSHEY_SIMPLEX, scale, 1, nullptr).width > width_ - 32)
+            {
+                scale -= 0.02;
+            }
+            cv::putText(img_, subtitle, cv::Point(16, topMargin_ - 12), cv::FONT_HERSHEY_SIMPLEX, scale,
+                        cv::Scalar(185, 185, 185), 1, cv::LINE_AA);
         }
     }
 
     /// @brief Draw the legend explaining every plotted mark in the bottom band.
     void drawLegend()
     {
-        const int y0 = topMargin_ + fieldH_;
-        const int col1 = 16;
-        const int col2 = fieldW_/2 + 8;
-        const int rowH = 30;
-        const int textDx = 26;
+        const int y0 = topMargin_ + fieldH_ + 14;
+        const int rowH = 34;
+        const int col1 = 18;
+        const int col2 = static_cast<int>(fieldW_*0.47);
+        const int col3 = static_cast<int>(fieldW_*0.80);
+        const int textDx = 34;
 
         auto label = [&](int x, int row, const std::string & text)
         {
             cv::putText(img_, text, cv::Point(x + textDx, y0 + row*rowH + 5),
-                        cv::FONT_HERSHEY_SIMPLEX, 0.44, cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
+                        cv::FONT_HERSHEY_SIMPLEX, 0.42, cv::Scalar(225, 225, 225), 1, cv::LINE_AA);
         };
-        auto dot = [&](int x, int row, const cv::Scalar & colour)
+        auto lineSwatch = [&](int x, int row, const cv::Scalar & colour, int thick)
         {
-            cv::circle(img_, cv::Point(x + 8, y0 + row*rowH), 5, colour, cv::FILLED, cv::LINE_AA);
+            cv::line(img_, cv::Point(x, y0 + row*rowH), cv::Point(x + 24, y0 + row*rowH),
+                     colour, thick, cv::LINE_AA);
         };
 
-        // NUbots baseline (grey dot)
-        dot(col1, 1, plotcolour::baseline);
-        label(col1, 1, "NUbots baseline pose (localisation.Field)");
-
-        // Our estimate: blue->orange gradient swatch
+        // Row 1: our estimate (gradient swatch), baseline, goal posts
+        for (int dx = 0; dx <= 24; ++dx)
         {
-            const int cx = col1 + 8, cy = y0 + 2*rowH;
-            for (int dx = -12; dx <= 12; ++dx)
-            {
-                double f = (dx + 12)/24.0;
-                cv::line(img_, cv::Point(cx + dx, cy - 4), cv::Point(cx + dx, cy + 4), plotcolour::estimate(f), 1);
-            }
+            cv::line(img_, cv::Point(col1 + dx, y0 + rowH - 3), cv::Point(col1 + dx, y0 + rowH + 3),
+                     plotcolour::estimate(dx/24.0), 1);
         }
-        label(col1, 2, "Our estimate (blue = start -> orange = end)");
+        label(col1, 1, "Our estimate (blue start -> orange end)");
+        lineSwatch(col2, 1, plotcolour::baseline, 2);
+        label(col2, 1, "NUbots baseline (localisation.Field)");
+        cv::circle(img_, cv::Point(col3 + 12, y0 + rowH), 5, plotcolour::goalPost, cv::FILLED, cv::LINE_AA);
+        cv::circle(img_, cv::Point(col3 + 12, y0 + rowH), 5, cv::Scalar(30, 30, 30), 1, cv::LINE_AA);
+        label(col3, 1, "Goal posts");
 
-        // 2-sigma covariance ring (magenta)
-        cv::ellipse(img_, cv::Point(col2 + 8, y0 + rowH), cv::Size(9, 6), 0, 0, 360, plotcolour::covariance, 1, cv::LINE_AA);
-        label(col2, 1, "2-sigma position uncertainty");
-
-        // Goal posts (yellow) and field lines (white line)
-        dot(col2, 2, plotcolour::goalPost);
-        cv::line(img_, cv::Point(col2 + 2, y0 + 2*rowH + 12), cv::Point(col2 + 14, y0 + 2*rowH + 12), plotcolour::field, 1, cv::LINE_AA);
-        label(col2, 2, "Goal posts / field lines (map)");
+        // Row 2: mocap truth, 2-sigma ellipse, field lines
+        lineSwatch(col1, 2, plotcolour::truth, 2);
+        label(col1, 2, "Mocap ground truth (held-out reference)");
+        cv::ellipse(img_, cv::Point(col2 + 12, y0 + 2*rowH), cv::Size(11, 7), 0, 0, 360,
+                    plotcolour::covariance, 1, cv::LINE_AA);
+        label(col2, 2, "2-sigma position uncertainty");
+        lineSwatch(col3, 2, plotcolour::field, 2);
+        label(col3, 2, "Field lines (map)");
     }
 
     void drawPoint(double xf, double yf, const cv::Scalar & colour, int radius = 2)
@@ -181,6 +280,18 @@ public:
         cv::circle(img_, toPixel(xf, yf), radius, colour, -1, cv::LINE_AA);
     }
 
+    void drawSegment(double x0, double y0, double x1, double y1, const cv::Scalar & colour, int thick = 2)
+    {
+        cv::line(img_, toPixel(x0, y0), toPixel(x1, y1), colour, thick, cv::LINE_AA);
+    }
+
+    /// @brief Ring marker (trajectory start/end emphasis).
+    void drawRing(double xf, double yf, const cv::Scalar & colour, int radius, int thick = 2)
+    {
+        cv::circle(img_, toPixel(xf, yf), radius, colour, thick, cv::LINE_AA);
+    }
+
+    /// @brief Accumulate a covariance ellipse on the translucent overlay (see blendOverlay).
     void drawCovarianceEllipse(double xf, double yf, const Eigen::Matrix2d & P, const cv::Scalar & colour, double nSigma = 2.0)
     {
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(P);
@@ -190,7 +301,16 @@ public:
         double angleDeg = std::atan2(-v.y(), v.x())*180.0/M_PI;     // Image y is flipped
         cv::Size axes(std::max(1, static_cast<int>(nSigma*std::sqrt(val(1))*scale_)),
                       std::max(1, static_cast<int>(nSigma*std::sqrt(val(0))*scale_)));
-        cv::ellipse(img_, toPixel(xf, yf), axes, angleDeg, 0, 360, colour, 1, cv::LINE_AA);
+        if (overlay_.empty()) overlay_ = img_.clone();
+        cv::ellipse(overlay_, toPixel(xf, yf), axes, angleDeg, 0, 360, colour, 1, cv::LINE_AA);
+    }
+
+    /// @brief Blend the accumulated ellipse overlay into the figure.
+    void blendOverlay(double alpha = 0.45)
+    {
+        if (overlay_.empty()) return;
+        cv::addWeighted(img_, 1.0 - alpha, overlay_, alpha, 0.0, img_);
+        overlay_.release();
     }
 
     const cv::Mat & image() const { return img_; }
@@ -200,9 +320,10 @@ private:
     double scale_;
     int width_, height_;
     int fieldW_ = 0, fieldH_ = 0;
-    const int topMargin_ = 44;      ///< Title band height [px]
-    const int bottomMargin_ = 104;  ///< Legend band height [px]
+    const int topMargin_ = 66;      ///< Title band height [px] (title + subtitle lines)
+    const int bottomMargin_ = 106;  ///< Legend band height [px]
     cv::Mat img_;
+    cv::Mat overlay_;               ///< Covariance ellipses, blended once at the end
 };
 
 // Baseline-free initial pose from the first usable vision frame. The NUbots
@@ -331,11 +452,24 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     std::vector<BodyTwistSample> twists = SystemLocalisation::twistFromOdometry(log.sensors, t0);
     std::println("Derived {} body twist samples from odometry", twists.size());
 
+    // Motion-capture ground truth (evaluation only; see mocaptruth above).
+    const std::vector<TruthSample> truth = buildTruth(log.mocap, t0);
+    if (!truth.empty())
+    {
+        std::println("Ground truth: {} mocap samples spanning t={:.1f}..{:.1f} s", truth.size(),
+                     truth.front().t, truth.back().t);
+    }
+    else
+    {
+        std::println("Ground truth: none in this log (mocap comparisons disabled)");
+    }
+
     // Field landmark map
     FieldMap map;
 
-    // NUbots equidistant lens (1280x1024); defaults to frankie (the recording
-    // robot). Shared by the out-of-field feature pipeline and the visualiser.
+    // NUbots equidistant lens (1280x1024); defaults to sarah (the robot that
+    // made the data2 ground-truth recording). Shared by the out-of-field
+    // feature pipeline and the visualiser.
     // TODO: Adjust if replacing recording
     FisheyeLens lens;
 
@@ -447,6 +581,8 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         double updateMs;
         double sideLlr;         ///< Accumulated own-vs-mirror out-of-field evidence [nats]
         std::size_t oofAssoc;   ///< Out-of-field corners associated to map landmarks
+        double truthX, truthY, truthZ, truthYaw;    ///< Mocap ground truth (NaN if unmatched)
+        double errXYTruth, errYawTruth;             ///< Our estimate vs truth
     };
     std::vector<Record> records;
     records.reserve(log.vision.size());
@@ -467,6 +603,16 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     double sumSqErrXY = 0, sumSqErrYaw = 0, sumMs = 0, maxMs = 0;
     double sumSqErrXYTrusted = 0, sumSqErrYawTrusted = 0;
     std::size_t nCompared = 0, nTrusted = 0, nUpdates = 0, nSkipped = 0;
+
+    // Ground-truth comparison accumulators: ours over every truth-matched frame,
+    // plus a head-to-head over the frames where the NUbots baseline also reported
+    // a (finite) pose, so both estimators are judged on identical samples.
+    double sumSqTruthXY = 0, sumSqTruthYaw = 0;
+    std::size_t nTruth = 0;
+    double sumSqTruthXYBoth = 0, sumSqTruthYawBoth = 0;
+    double sumSqBaseTruthXY = 0, sumSqBaseTruthYaw = 0;
+    std::size_t nTruthBoth = 0;
+    double sumZerr = 0, sumSqZerr = 0;      ///< est z - truth marker z
     double sumOofMs = 0, maxOofMs = 0;
     std::size_t nOofFrames = 0, sumOofOut = 0, sumOofTotal = 0, sumOofAssoc = 0, nSideFlips = 0;
 
@@ -595,6 +741,8 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         r.baseX = r.baseY = r.baseYaw = r.baseCost = r.errXY = r.errYaw = std::numeric_limits<double>::quiet_NaN();
         r.sideLlr = std::numeric_limits<double>::quiet_NaN();
         r.oofAssoc = 0;
+        r.truthX = r.truthY = r.truthZ = r.truthYaw = std::numeric_limits<double>::quiet_NaN();
+        r.errXYTruth = r.errYawTruth = std::numeric_limits<double>::quiet_NaN();
 
         if (!log.fieldBaseline.empty())
         {
@@ -640,6 +788,38 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                 }
             }
         }
+        // Mocap ground truth at this frame (evaluation only). The mocap stream
+        // runs at ~120 Hz, so the nearest sample is within a few ms.
+        if (!truth.empty())
+        {
+            std::size_t ti = nearestIndex(truth, t, [](const TruthSample & s) { return s.t; });
+            const TruthSample & g = truth[ti];
+            if (std::abs(g.t - t) < 0.05)
+            {
+                r.truthX = g.rBFf.x();
+                r.truthY = g.rBFf.y();
+                r.truthZ = g.rBFf.z();
+                r.truthYaw = g.yaw;
+                r.errXYTruth = (r.mean.head<2>() - g.rBFf.head<2>()).norm();
+                r.errYawTruth = wrapAngle(r.mean(5) - g.yaw);
+                sumSqTruthXY += r.errXYTruth*r.errXYTruth;
+                sumSqTruthYaw += r.errYawTruth*r.errYawTruth;
+                sumZerr += r.mean(2) - g.rBFf.z();
+                sumSqZerr += (r.mean(2) - g.rBFf.z())*(r.mean(2) - g.rBFf.z());
+                nTruth++;
+                if (std::isfinite(r.baseX))
+                {
+                    const double be = std::hypot(r.baseX - g.rBFf.x(), r.baseY - g.rBFf.y());
+                    const double by = wrapAngle(r.baseYaw - g.yaw);
+                    sumSqBaseTruthXY += be*be;
+                    sumSqBaseTruthYaw += by*by;
+                    sumSqTruthXYBoth += r.errXYTruth*r.errXYTruth;
+                    sumSqTruthYawBoth += r.errYawTruth*r.errYawTruth;
+                    nTruthBoth++;
+                }
+            }
+        }
+
         // Estimated camera pose in {f} at the posterior mean (with mount-bias
         // correction), shared by the out-of-field pipeline and the visualiser.
         const Pose<double> TfcEst = SystemLocalisation::fieldPose<double>(r.mean)*Tbc
@@ -704,7 +884,10 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
             vf.Tfc = TfcEst;
             vf.estPos = r.mean.head<2>();
             vf.estYaw = r.mean(5);
-            vf.estCov = system.density.cov().topLeftCorner<2, 2>();
+            const Eigen::Matrix3d Ppos = system.density.cov().topLeftCorner<3, 3>();
+            vf.estCov = Ppos.topLeftCorner<2, 2>();
+            vf.estPos3 = r.mean.head<3>();
+            vf.estCov3 = Ppos;
 
             // Hypotheses (falls back to the single density when the bank is off).
             std::vector<double> hw = system.hypothesisWeights();
@@ -714,6 +897,8 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                 h.pos = r.mean.head<2>();
                 h.yaw = r.mean(5);
                 h.cov = vf.estCov;
+                h.pos3 = vf.estPos3;
+                h.cov3 = vf.estCov3;
                 h.weight = 1.0;
                 vf.hypotheses.push_back(h);
             }
@@ -726,7 +911,9 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                     HypothesisView h;
                     h.pos = m.head<2>();
                     h.yaw = m(5);
-                    h.cov = comps[i].cov().topLeftCorner<2, 2>();
+                    h.pos3 = m.head<3>();
+                    h.cov3 = comps[i].cov().topLeftCorner<3, 3>();
+                    h.cov = h.cov3.topLeftCorner<2, 2>();
                     h.weight = i < hw.size() ? hw[i] : 0.0;
                     vf.hypotheses.push_back(h);
                 }
@@ -769,9 +956,22 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                 vf.sideLlr = side.llr;
                 vf.nOofLandmarks = side.nLandmarks;
                 vf.sideFrozen = side.mapFrozen;
+
+                // Snapshot of the out-of-field landmark map for the 3D panel.
+                vf.oofLandmarks.reserve(sideDis.landmarks().size());
+                for (const SideDisambiguator::Landmark & lm : sideDis.landmarks())
+                {
+                    vf.oofLandmarks.push_back({lm.rPFf, lm.P, lm.far});
+                }
             }
 
             vf.lineRays = frameLineRays;
+            if (std::isfinite(r.truthX))
+            {
+                vf.hasTruth = true;
+                vf.truthPos = Eigen::Vector3d(r.truthX, r.truthY, r.truthZ);
+                vf.truthYaw = r.truthYaw;
+            }
             if (std::isfinite(r.baseX))
             {
                 vf.hasBaseline = true;
@@ -807,6 +1007,25 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     {
         std::println("vs trusted baseline (cost < {:.1f}) over {} samples: RMSE position {:.3f} m, yaw {:.2f} deg",
                      trustedBaselineCost, nTrusted, std::sqrt(sumSqErrXYTrusted/nTrusted), std::sqrt(sumSqErrYawTrusted/nTrusted)*180.0/M_PI);
+    }
+    if (nTruth > 0)
+    {
+        std::println("");
+        std::println("vs MOCAP GROUND TRUTH over {} samples: ours RMSE position {:.3f} m, yaw {:.2f} deg",
+                     nTruth, std::sqrt(sumSqTruthXY/nTruth), std::sqrt(sumSqTruthYaw/nTruth)*180.0/M_PI);
+        if (nTruthBoth > 0)
+        {
+            std::println("head-to-head on the {} samples where the NUbots baseline also reported:", nTruthBoth);
+            std::println("  ours            RMSE position {:.3f} m, yaw {:.2f} deg",
+                         std::sqrt(sumSqTruthXYBoth/nTruthBoth), std::sqrt(sumSqTruthYawBoth/nTruthBoth)*180.0/M_PI);
+            std::println("  NUbots baseline RMSE position {:.3f} m, yaw {:.2f} deg",
+                         std::sqrt(sumSqBaseTruthXY/nTruthBoth), std::sqrt(sumSqBaseTruthYaw/nTruthBoth)*180.0/M_PI);
+        }
+        const double zMean = sumZerr/nTruth;
+        const double zStd = std::sqrt(std::max(0.0, sumSqZerr/nTruth - zMean*zMean));
+        std::println("height: est z - truth marker z = {:+.3f} m mean, {:.3f} m std "
+                     "(markers sit ~6 cm above the torso origin, so ~-0.06 m is expected)",
+                     zMean, zStd);
     }
     if (nOofFrames > 0)
     {
@@ -845,21 +1064,52 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         }
     }
 
-    // Trajectory plot
+    // Trajectory plot: trails as connected polylines (baseline underneath, truth,
+    // then our estimate on top), start/end markers, then the covariance corridor
+    // blended translucently so it shades rather than scribbles.
     FieldPlot plot(map.dims);
-    for (const Record & r : records)
+    for (std::size_t i = 1; i < records.size(); ++i)
     {
-        if (std::isfinite(r.baseX))
+        // Skip teleports: the baseline re-localises in jumps, and a straight
+        // line across such a jump is not a path the robot took.
+        if (std::isfinite(records[i-1].baseX) && std::isfinite(records[i].baseX)
+            && std::hypot(records[i].baseX - records[i-1].baseX,
+                          records[i].baseY - records[i-1].baseY) < 0.5)
         {
-            plot.drawPoint(r.baseX, r.baseY, plotcolour::baseline, 2);
+            plot.drawSegment(records[i-1].baseX, records[i-1].baseY,
+                             records[i].baseX, records[i].baseY, plotcolour::baseline, 2);
+        }
+    }
+    for (std::size_t i = 1; i < records.size(); ++i)
+    {
+        if (std::isfinite(records[i-1].truthX) && std::isfinite(records[i].truthX))
+        {
+            plot.drawSegment(records[i-1].truthX, records[i-1].truthY,
+                             records[i].truthX, records[i].truthY, plotcolour::truth, 2);
+        }
+    }
+    for (std::size_t i = 1; i < records.size(); ++i)
+    {
+        const double frac = static_cast<double>(i)/(records.size() - 1);
+        plot.drawSegment(records[i-1].mean(0), records[i-1].mean(1),
+                         records[i].mean(0), records[i].mean(1), plotcolour::estimate(frac), 2);
+    }
+    if (!records.empty())
+    {
+        plot.drawRing(records.front().mean(0), records.front().mean(1), plotcolour::estimate(0.0), 7);
+        plot.drawRing(records.back().mean(0), records.back().mean(1), plotcolour::estimate(1.0), 7);
+        for (auto it = records.rbegin(); it != records.rend(); ++it)
+        {
+            if (std::isfinite(it->truthX))
+            {
+                plot.drawRing(it->truthX, it->truthY, plotcolour::truth, 7);
+                break;
+            }
         }
     }
     double lastEllipse = -1e9;
-    for (std::size_t i = 0; i < records.size(); ++i)
+    for (const Record & r : records)
     {
-        const Record & r = records[i];
-        double frac = records.size() > 1 ? static_cast<double>(i)/(records.size() - 1) : 0.0;
-        plot.drawPoint(r.mean(0), r.mean(1), plotcolour::estimate(frac), 2);
         if (r.t - lastEllipse >= 2.0)
         {
             Eigen::Matrix2d Pxy;
@@ -868,9 +1118,18 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
             lastEllipse = r.t;
         }
     }
+    plot.blendOverlay();
 
     plot.drawTitle("RoboCup field localisation (top-down)",
-                   nTrusted > 0
+                   nTruth > 0
+                       ? std::format("{} vision updates over {:.0f} s   |   RMSE vs mocap truth: ours {:.2f} m, {:.1f} deg{}",
+                                     nUpdates, records.empty() ? 0.0 : records.back().t - records.front().t,
+                                     std::sqrt(sumSqTruthXY/nTruth), std::sqrt(sumSqTruthYaw/nTruth)*180.0/M_PI,
+                                     nTruthBoth > 0
+                                         ? std::format("  |  baseline {:.2f} m, {:.1f} deg",
+                                                       std::sqrt(sumSqBaseTruthXY/nTruthBoth), std::sqrt(sumSqBaseTruthYaw/nTruthBoth)*180.0/M_PI)
+                                         : std::string{})
+                   : nTrusted > 0
                        ? std::format("{} vision updates over {:.0f} s   |   RMSE vs trusted baseline: {:.2f} m, {:.1f} deg",
                                      nUpdates, records.empty() ? 0.0 : records.back().t - records.front().t,
                                      std::sqrt(sumSqErrXYTrusted/nTrusted), std::sqrt(sumSqErrYawTrusted/nTrusted)*180.0/M_PI)
@@ -883,7 +1142,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
 
         // CSV export
         std::ofstream csv(outputDirectory / "field_localisation.csv");
-        csv << "t,x,y,z,roll,pitch,yaw,sx,sy,sz,sroll,spitch,syaw,camBiasRoll,camBiasPitch,sCamRoll,sCamPitch,nAssoc,nCand,baseX,baseY,baseYaw,baseCost,errXY,errYaw,updateMs,sideLlr,oofAssoc\n";
+        csv << "t,x,y,z,roll,pitch,yaw,sx,sy,sz,sroll,spitch,syaw,camBiasRoll,camBiasPitch,sCamRoll,sCamPitch,nAssoc,nCand,baseX,baseY,baseYaw,baseCost,errXY,errYaw,updateMs,sideLlr,oofAssoc,truthX,truthY,truthZ,truthYaw,errXYTruth,errYawTruth\n";
         for (const Record & r : records)
         {
             csv << r.t;
@@ -893,7 +1152,9 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
             csv << ',' << r.nAssoc << ',' << r.nCand
                 << ',' << r.baseX << ',' << r.baseY << ',' << r.baseYaw << ',' << r.baseCost
                 << ',' << r.errXY << ',' << r.errYaw << ',' << r.updateMs
-                << ',' << r.sideLlr << ',' << r.oofAssoc << '\n';
+                << ',' << r.sideLlr << ',' << r.oofAssoc
+                << ',' << r.truthX << ',' << r.truthY << ',' << r.truthZ << ',' << r.truthYaw
+                << ',' << r.errXYTruth << ',' << r.errYawTruth << '\n';
         }
 
         cv::imwrite((outputDirectory / "field_trajectory.png").string(), plot.image());

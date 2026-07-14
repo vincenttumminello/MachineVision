@@ -50,6 +50,22 @@ static ViewerFrame makeFrame(const FieldMap & map)
     vf.baseYaw = 0.03;
     vf.hasError = true; vf.errXY = 0.05; vf.errYaw = 0.03;
     vf.nAssoc = 1; vf.nCand = 1; vf.updateMs = 0.3;
+
+    // 3D-panel data: full position/covariance, mocap truth and one mapped
+    // out-of-field landmark
+    vf.estPos3 = Eigen::Vector3d(-1.0, 0.0, 0.44);
+    vf.estCov3 = (Eigen::Matrix3d() << 0.04, 0.0, 0.0,
+                                       0.0, 0.02, 0.0,
+                                       0.0, 0.0, 0.001).finished();
+    vf.hypotheses[0].pos3 = vf.estPos3;
+    vf.hypotheses[0].cov3 = vf.estCov3;
+    vf.hasTruth = true;
+    vf.truthPos = Eigen::Vector3d(-0.95, 0.05, 0.50);
+    vf.truthYaw = 0.02;
+    vf.oofLandmarks.push_back({Eigen::Vector3d(6.0, 2.0, 1.5),
+                               Eigen::Matrix3d::Identity()*0.01, false});
+    vf.oofLandmarks.push_back({Eigen::Vector3d(-7.0, -3.0, 2.0),
+                               Eigen::Matrix3d::Identity()*4.0, true});
     return vf;
 }
 
@@ -85,6 +101,21 @@ SCENARIO("LocalisationViewer renders a composite without a display")
             {
                 REQUIRE_FALSE(composite.empty());
                 CHECK(composite.rows > 700);
+            }
+        }
+
+        WHEN("the right pane is switched to the 3D map")
+        {
+            viewer.setRightPane3D(true);
+            cv::Mat composite3d = viewer.renderComposite(frames, 0, cv::Mat());
+            viewer.setRightPane3D(false);
+            cv::Mat composite2d = viewer.renderComposite(frames, 0, cv::Mat());
+
+            THEN("the 3D composite renders at the same size as the top-down one")
+            {
+                REQUIRE_FALSE(composite3d.empty());
+                CHECK(composite3d.rows == composite2d.rows);
+                CHECK(composite3d.cols == composite2d.cols);
             }
         }
     }

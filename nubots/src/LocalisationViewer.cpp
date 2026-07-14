@@ -16,10 +16,24 @@ namespace
 constexpr int    kPanelH   = 760;    ///< Panel height [px]
 constexpr int    kHeaderH  = 36;     ///< Header strip height [px]
 constexpr double kHalfFov  = 75.0*M_PI/180.0;  ///< Half field-of-view for the top-down wedge
-// True capture rate. The recording was made at 10 fps; the mp4 container metadata
-// says 25 fps, but frame timing everywhere else comes from the timecode file, so
-// this constant only sets the auto-play speed.
-constexpr double kPlaybackFps = 10.0;
+
+// True capture rate, derived from the recorded frame times. Container fps metadata
+// is unreliable for these recordings (e.g. a 10 fps capture whose mp4 claims 25),
+// and different datasets use different rates, so real-time playback speed comes
+// from the median spacing of the frames actually being replayed.
+double playbackFps(const std::vector<ViewerFrame> & frames)
+{
+    std::vector<double> dts;
+    dts.reserve(frames.size());
+    for (std::size_t i = 1; i < frames.size(); ++i)
+    {
+        const double dt = frames[i].t - frames[i-1].t;
+        if (dt > 1e-4) dts.push_back(dt);
+    }
+    if (dts.empty()) return 10.0;
+    std::nth_element(dts.begin(), dts.begin() + dts.size()/2, dts.end());
+    return 1.0/dts[dts.size()/2];
+}
 
 // -------- colours (BGR) --------
 cv::Scalar classColour(const std::string & name)
@@ -59,6 +73,47 @@ void hudText(cv::Mat & img, const std::string & s, cv::Point org, double scale =
     cv::rectangle(img, org + cv::Point(-3, 3), org + cv::Point(sz.width + 3, -sz.height - 3),
                   cv::Scalar(0, 0, 0), cv::FILLED);
     cv::putText(img, s, org, cv::FONT_HERSHEY_SIMPLEX, scale, colour, thickness, cv::LINE_AA);
+}
+
+// Compact colour legend drawn in the bottom-left corner of a panel.
+struct LegendEntry
+{
+    cv::Scalar colour;
+    std::string label;
+    bool ring = false;      // ring swatch (covariance) instead of a line (trail/marker)
+};
+
+void drawPanelLegend(cv::Mat & panel, const std::vector<LegendEntry> & entries)
+{
+    const int rowH = 20;
+    const int pad = 8;
+    int maxText = 0;
+    for (const LegendEntry & e : entries)
+    {
+        maxText = std::max(maxText, cv::getTextSize(e.label, cv::FONT_HERSHEY_SIMPLEX, 0.38, 1, nullptr).width);
+    }
+    const int w = pad + 30 + maxText + pad;
+    const int h = pad + static_cast<int>(entries.size())*rowH;
+    const cv::Point org(10, panel.rows - h - 10);
+
+    cv::Mat backing = panel(cv::Rect(org.x, org.y, std::min(w, panel.cols - org.x), h));
+    backing *= 0.25;    // darken behind the legend for legibility
+
+    for (std::size_t i = 0; i < entries.size(); ++i)
+    {
+        const LegendEntry & e = entries[i];
+        const int cy = org.y + pad/2 + static_cast<int>(i)*rowH + rowH/2;
+        if (e.ring)
+        {
+            cv::ellipse(panel, cv::Point(org.x + pad + 10, cy), cv::Size(9, 5), 0, 0, 360, e.colour, 1, cv::LINE_AA);
+        }
+        else
+        {
+            cv::line(panel, cv::Point(org.x + pad, cy), cv::Point(org.x + pad + 20, cy), e.colour, 2, cv::LINE_AA);
+        }
+        cv::putText(panel, e.label, cv::Point(org.x + pad + 30, cy + 4),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.38, cv::Scalar(230, 230, 230), 1, cv::LINE_AA);
+    }
 }
 
 // 2x2 covariance -> ellipse axes (half-lengths in metres) and angle (deg, CCW in field frame).
@@ -296,7 +351,12 @@ cv::Mat LocalisationViewer::renderTopDownPanel(const std::vector<ViewerFrame> & 
     if (idx >= frames.size()) return panel;
     const ViewerFrame & cur = frames[idx];
 
-    // ---- trajectory trail ----
+    // ---- trajectory trails (truth beneath the estimate) ----
+    for (std::size_t i = 0; i <= idx; ++i)
+    {
+        if (frames[i].hasTruth)
+            cv::circle(panel, toPix(frames[i].truthPos.head<2>()), 1, cv::Scalar(80, 220, 80), cv::FILLED, cv::LINE_AA);
+    }
     for (std::size_t i = 0; i <= idx; ++i)
     {
         const double frac = idx > 0 ? static_cast<double>(i)/idx : 0.0;
@@ -346,6 +406,14 @@ cv::Mat LocalisationViewer::renderTopDownPanel(const std::vector<ViewerFrame> & 
     if (cur.hasBaseline)
         drawRobot(cur.basePos, cur.baseYaw, cv::Scalar(180, 180, 180), std::max(4, int(0.15*ppm)), 2);
 
+    // ---- mocap ground truth (green, cross-hatched so it reads as "reference") ----
+    if (cur.hasTruth)
+    {
+        drawRobot(cur.truthPos.head<2>(), cur.truthYaw, cv::Scalar(80, 220, 80), std::max(5, int(0.16*ppm)), 2);
+        cv::drawMarker(panel, toPix(cur.truthPos.head<2>()), cv::Scalar(80, 220, 80),
+                       cv::MARKER_TILTED_CROSS, 9, 1, cv::LINE_AA);
+    }
+
     // ---- hypotheses (dim), then the leading estimate (bright) ----
     // Only drawn when the bank is active (>1 component); a lone hypothesis is
     // already shown by the estimate marker below.
@@ -365,13 +433,284 @@ cv::Mat LocalisationViewer::renderTopDownPanel(const std::vector<ViewerFrame> & 
     drawRobot(cur.estPos, cur.estYaw, cv::Scalar(0, 128, 255), std::max(5, int(0.16*ppm)), 2);
 
     // ---- top-down HUD ----
-    hudText(panel, "top-down field", cv::Point(10, 22), 0.45);
+    hudText(panel, "top-down field   [3] 3D view", cv::Point(10, 22), 0.45);
+    int hudY = 44;
+    if (cur.hasTruth)
+    {
+        const double eOurs = (cur.estPos - cur.truthPos.head<2>()).norm();
+        const double eYaw = std::remainder(cur.estYaw - cur.truthYaw, 2.0*M_PI);
+        std::string s = std::format("err vs truth: ours {:.2f} m {:+.1f} deg", eOurs, eYaw*180.0/M_PI);
+        if (cur.hasBaseline)
+        {
+            const double bOurs = (cur.basePos - cur.truthPos.head<2>()).norm();
+            const double bYaw = std::remainder(cur.baseYaw - cur.truthYaw, 2.0*M_PI);
+            s += std::format("  |  baseline {:.2f} m {:+.1f} deg", bOurs, bYaw*180.0/M_PI);
+        }
+        hudText(panel, s, cv::Point(10, hudY), 0.42, cv::Scalar(180, 255, 180));
+        hudY += 22;
+    }
     if (cur.hasError)
+    {
         hudText(panel, std::format("err vs baseline: {:.2f} m, {:.1f} deg", cur.errXY, cur.errYaw*180.0/M_PI),
-                cv::Point(10, 44), 0.42, cv::Scalar(200, 255, 200));
+                cv::Point(10, hudY), 0.42, cv::Scalar(200, 255, 200));
+        hudY += 22;
+    }
     if (cur.hypotheses.size() > 1)
         hudText(panel, std::format("{} hypotheses", cur.hypotheses.size()),
-                cv::Point(10, 66), 0.42, cv::Scalar(180, 220, 255));
+                cv::Point(10, hudY), 0.42, cv::Scalar(180, 220, 255));
+
+    // ---- legend ----
+    {
+        std::vector<LegendEntry> legend;
+        legend.push_back({cv::Scalar(0, 128, 255), "our estimate (trail: blue start -> orange now)"});
+        if (cur.hasTruth)
+            legend.push_back({cv::Scalar(80, 220, 80), "mocap ground truth"});
+        if (cur.hasBaseline)
+            legend.push_back({cv::Scalar(180, 180, 180), "NUbots baseline"});
+        legend.push_back({cv::Scalar(255, 0, 200), "2-sigma position uncertainty", true});
+        if (!cur.associations.empty())
+            legend.push_back({cv::Scalar(0, 200, 255), "landmark residual (ground point -> map)"});
+        drawPanelLegend(panel, legend);
+    }
+    return panel;
+}
+
+// ===========================================================================
+// 3D panel
+// ===========================================================================
+// Perspective wireframe of the scene in {f} under an orbitable camera. Height is
+// a first-class axis here (the top-down view hides it): the estimate trail is
+// drawn at its estimated z, the mocap truth at its measured z, and everything
+// carrying a covariance -- the pose estimate, every hypothesis and every
+// triangulated out-of-field landmark -- gets a 3-sigma ellipsoid (its three
+// principal rings).
+cv::Mat LocalisationViewer::render3DPanel(const std::vector<ViewerFrame> & frames, std::size_t idx, int panelH) const
+{
+    const FieldDimensions & dims = map_.dims;
+    const double border = dims.borderStripMinWidth + 0.3;
+    // Same width as the top-down panel so toggling panes keeps the window size.
+    const double ppm = panelH/(dims.fieldWidth + 2*border);
+    const int panelW = static_cast<int>(std::lround((dims.fieldLength + 2*border)*ppm));
+    cv::Mat panel(panelH, panelW, CV_8UC3, cv::Scalar(26, 26, 30));
+
+    // ---- orbit camera ----
+    const Eigen::Vector3d target(0.0, 0.0, 0.3);
+    const Eigen::Vector3d eye = target + orbitDist_*Eigen::Vector3d(
+        std::cos(orbitEl_)*std::cos(orbitAz_), std::cos(orbitEl_)*std::sin(orbitAz_), std::sin(orbitEl_));
+    const Eigen::Vector3d fwd = (target - eye).normalized();
+    Eigen::Vector3d right = fwd.cross(Eigen::Vector3d::UnitZ());
+    if (right.norm() < 1e-6) right = Eigen::Vector3d::UnitY();
+    right.normalize();
+    const Eigen::Vector3d up = right.cross(fwd);
+    const double focal = panelH/(2.0*std::tan(24.0*M_PI/180.0));   // ~48 deg vertical FOV
+
+    auto project = [&](const Eigen::Vector3d & p, cv::Point2d & out) -> bool {
+        const Eigen::Vector3d d = p - eye;
+        const double zc = d.dot(fwd);
+        if (zc < 0.2) return false;
+        out.x = panelW/2.0 + focal*d.dot(right)/zc;
+        out.y = panelH/2.0 - focal*d.dot(up)/zc;
+        return std::abs(out.x) < 4.0*panelW && std::abs(out.y) < 4.0*panelH;
+    };
+    auto line3 = [&](const Eigen::Vector3d & a, const Eigen::Vector3d & b,
+                     const cv::Scalar & col, int thick = 1) {
+        cv::Point2d pa, pb;
+        if (project(a, pa) && project(b, pb)) cv::line(panel, pa, pb, col, thick, cv::LINE_AA);
+    };
+    auto polyline3 = [&](auto && pointAt, int n, const cv::Scalar & col, int thick = 1, bool closed = true) {
+        cv::Point2d prev; bool havePrev = false;
+        for (int i = 0; i <= (closed ? n : n - 1); ++i)
+        {
+            cv::Point2d p;
+            if (project(pointAt(i % n), p))
+            {
+                if (havePrev) cv::line(panel, prev, p, col, thick, cv::LINE_AA);
+                prev = p; havePrev = true;
+            }
+            else havePrev = false;
+        }
+    };
+    // 3-sigma ellipsoid wireframe: the three principal rings of P. Ellipsoids
+    // larger than maxExtent are skipped: a barely-constrained landmark's ring
+    // would span the whole scene and bury everything legible under it.
+    auto ellipsoid3 = [&](const Eigen::Vector3d & c, const Eigen::Matrix3d & P,
+                          const cv::Scalar & col, int thick = 1, double maxExtent = 1e9) {
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(P);
+        if (es.info() != Eigen::Success) return;
+        const Eigen::Vector3d s = es.eigenvalues().cwiseMax(0.0).cwiseSqrt()*3.0;
+        if (s.maxCoeff() > maxExtent) return;
+        const Eigen::Matrix3d V = es.eigenvectors();
+        const int axPair[3][2] = {{0, 1}, {0, 2}, {1, 2}};
+        for (const auto & pr : axPair)
+        {
+            polyline3([&](int i) -> Eigen::Vector3d {
+                const double a = 2.0*M_PI*i/36.0;
+                return c + std::cos(a)*s(pr[0])*V.col(pr[0]) + std::sin(a)*s(pr[1])*V.col(pr[1]);
+            }, 36, col, thick);
+        }
+    };
+
+    // ---- ground: carpet outline, 1 m grid, field lines, goals ----
+    {
+        const double hx = dims.fieldLength/2 + border;
+        const double hy = dims.fieldWidth/2 + border;
+        const cv::Scalar grid(45, 55, 45);
+        for (double x = std::ceil(-hx); x <= hx; x += 1.0)
+            line3({x, -hy, 0.0}, {x, hy, 0.0}, grid);
+        for (double y = std::ceil(-hy); y <= hy; y += 1.0)
+            line3({-hx, y, 0.0}, {hx, y, 0.0}, grid);
+        const cv::Scalar carpet(40, 90, 40);
+        const Eigen::Vector3d c0(-hx, -hy, 0), c1(hx, -hy, 0), c2(hx, hy, 0), c3(-hx, hy, 0);
+        line3(c0, c1, carpet); line3(c1, c2, carpet); line3(c2, c3, carpet); line3(c3, c0, carpet);
+    }
+    const cv::Scalar white(235, 235, 235);
+    for (const auto & seg : map_.lineSegments())
+        line3({seg.a.x(), seg.a.y(), 0.0}, {seg.b.x(), seg.b.y(), 0.0}, white);
+    for (const auto & c : map_.lineCircles())
+        polyline3([&](int i) -> Eigen::Vector3d {
+            const double a = 2.0*M_PI*i/72.0;
+            return {c.centre.x() + c.radius*std::cos(a), c.centre.y() + c.radius*std::sin(a), 0.0};
+        }, 72, white);
+    // Goals: posts up to the (kid-size) 0.8 m crossbar.
+    constexpr double kGoalHeight = 0.8;
+    const cv::Scalar goalCol(0, 215, 255);
+    for (int sx : {-1, 1})
+    {
+        const double gx = sx*dims.fieldLength/2;
+        for (int sy : {-1, 1})
+        {
+            const double gy = sy*dims.goalWidth/2;
+            line3({gx, gy, 0.0}, {gx, gy, kGoalHeight}, goalCol, 2);
+        }
+        line3({gx, -dims.goalWidth/2, kGoalHeight}, {gx, dims.goalWidth/2, kGoalHeight}, goalCol, 2);
+    }
+
+    if (idx >= frames.size()) return panel;
+    const ViewerFrame & cur = frames[idx];
+
+    // ---- out-of-field landmark map (background structure used for side disambiguation) ----
+    std::size_t nFar = 0;
+    for (const OofLandmarkView & lm : cur.oofLandmarks)
+    {
+        cv::Point2d p;
+        if (!project(lm.pos, p)) continue;
+        if (lm.far)
+        {
+            // Bearing-only: depth is a placeholder, so an ellipsoid would just be
+            // a screen-filling radial cigar. A dot at the assumed range suffices.
+            cv::circle(panel, p, 1, cv::Scalar(60, 110, 140), cv::FILLED, cv::LINE_AA);
+            nFar++;
+        }
+        else
+        {
+            cv::circle(panel, p, 2, cv::Scalar(80, 190, 220), cv::FILLED, cv::LINE_AA);
+            ellipsoid3(lm.pos, lm.cov, cv::Scalar(60, 120, 140), 1, 0.75);
+        }
+    }
+
+    // ---- trails at their estimated / measured heights ----
+    for (std::size_t i = 0; i <= idx; ++i)
+    {
+        cv::Point2d p;
+        if (frames[i].hasTruth && project(frames[i].truthPos, p))
+            cv::circle(panel, p, 1, cv::Scalar(80, 220, 80), cv::FILLED, cv::LINE_AA);
+    }
+    for (std::size_t i = 0; i <= idx; ++i)
+    {
+        cv::Point2d p;
+        if (project(frames[i].estPos3, p))
+        {
+            const double frac = idx > 0 ? static_cast<double>(i)/idx : 0.0;
+            cv::circle(panel, p, 1, cv::Scalar(255*(1 - frac), 128, 255*frac), cv::FILLED, cv::LINE_AA);
+        }
+    }
+
+    // ---- NUbots baseline (2D estimate: shown on the ground) ----
+    if (cur.hasBaseline)
+    {
+        const Eigen::Vector3d b(cur.basePos.x(), cur.basePos.y(), 0.0);
+        polyline3([&](int i) -> Eigen::Vector3d {
+            const double a = 2.0*M_PI*i/24.0;
+            return b + 0.15*Eigen::Vector3d(std::cos(a), std::sin(a), 0.0);
+        }, 24, cv::Scalar(180, 180, 180));
+        line3(b, b + 0.4*Eigen::Vector3d(std::cos(cur.baseYaw), std::sin(cur.baseYaw), 0.0),
+              cv::Scalar(180, 180, 180));
+    }
+
+    // ---- hypotheses (only when the bank is live) ----
+    if (cur.hypotheses.size() > 1)
+    {
+        for (const HypothesisView & h : cur.hypotheses)
+        {
+            const int shade = static_cast<int>(90 + 120*std::clamp(h.weight, 0.0, 1.0));
+            ellipsoid3(h.pos3, h.cov3, cv::Scalar(shade, shade/2, 255 - shade));
+        }
+    }
+
+    // ---- pose estimate: 3-sigma ellipsoid, marker, heading, drop line ----
+    ellipsoid3(cur.estPos3, cur.estCov3, cv::Scalar(255, 0, 200), 1);
+    {
+        cv::Point2d p;
+        if (project(cur.estPos3, p))
+            cv::circle(panel, p, 4, cv::Scalar(0, 128, 255), cv::FILLED, cv::LINE_AA);
+        const Eigen::Vector3d head = cur.estPos3
+            + 0.45*Eigen::Vector3d(std::cos(cur.estYaw), std::sin(cur.estYaw), 0.0);
+        line3(cur.estPos3, head, cv::Scalar(0, 128, 255), 2);
+        line3(cur.estPos3, {cur.estPos3.x(), cur.estPos3.y(), 0.0}, cv::Scalar(0, 90, 180));
+    }
+
+    // ---- mocap truth: marker at its measured height, drop line, heading ----
+    if (cur.hasTruth)
+    {
+        cv::Point2d p;
+        if (project(cur.truthPos, p))
+        {
+            cv::circle(panel, p, 4, cv::Scalar(80, 220, 80), 1, cv::LINE_AA);
+            cv::drawMarker(panel, p, cv::Scalar(80, 220, 80), cv::MARKER_TILTED_CROSS, 8, 1, cv::LINE_AA);
+        }
+        const Eigen::Vector3d head = cur.truthPos
+            + 0.45*Eigen::Vector3d(std::cos(cur.truthYaw), std::sin(cur.truthYaw), 0.0);
+        line3(cur.truthPos, head, cv::Scalar(80, 220, 80), 2);
+        line3(cur.truthPos, {cur.truthPos.x(), cur.truthPos.y(), 0.0}, cv::Scalar(60, 160, 60));
+    }
+
+    // ---- camera optical axis at the estimate ----
+    line3(cur.Tfc.translationVector,
+          cur.Tfc.translationVector + 0.5*(cur.Tfc.rotationMatrix*Eigen::Vector3d::UnitX()),
+          cv::Scalar(0, 200, 255));
+
+    // ---- 3D HUD ----
+    hudText(panel, "3D map (3-sigma ellipsoids)   [3] top-down   drag: orbit   wheel or -/=: zoom",
+            cv::Point(10, 22), 0.45);
+    {
+        std::string s = std::format("z: est {:.2f} m", cur.estPos3.z());
+        if (cur.hasTruth)
+            s += std::format("   truth marker {:.2f} m (markers sit ~6 cm above the torso origin)", cur.truthPos.z());
+        hudText(panel, s, cv::Point(10, 44), 0.42, cv::Scalar(180, 255, 180));
+    }
+    if (!cur.oofLandmarks.empty())
+        hudText(panel, std::format("out-of-field map: {} landmarks ({} bearing-only, drawn without ellipsoids)",
+                                   cur.oofLandmarks.size(), nFar),
+                cv::Point(10, 66), 0.42, cv::Scalar(255, 255, 180));
+
+    // ---- legend ----
+    {
+        std::vector<LegendEntry> legend;
+        legend.push_back({cv::Scalar(0, 128, 255), "our estimate (trail: blue start -> orange now)"});
+        if (cur.hasTruth)
+            legend.push_back({cv::Scalar(80, 220, 80), "mocap ground truth (at marker height)"});
+        if (cur.hasBaseline)
+            legend.push_back({cv::Scalar(180, 180, 180), "NUbots baseline (2D, on ground)"});
+        legend.push_back({cv::Scalar(255, 0, 200), "3-sigma position ellipsoid", true});
+        if (!cur.oofLandmarks.empty())
+        {
+            legend.push_back({cv::Scalar(80, 190, 220), "out-of-field landmark (+ 3-sigma ellipsoid)"});
+            if (nFar > 0)
+                legend.push_back({cv::Scalar(60, 110, 140), "out-of-field bearing-only landmark"});
+        }
+        legend.push_back({cv::Scalar(0, 200, 255), "camera optical axis"});
+        drawPanelLegend(panel, legend);
+    }
     return panel;
 }
 
@@ -379,14 +718,15 @@ cv::Mat LocalisationViewer::renderComposite(const std::vector<ViewerFrame> & fra
 {
     const ViewerFrame & f = frames[idx];
     cv::Mat cam = renderCameraPanel(f, rawFrame, kPanelH);
-    cv::Mat top = renderTopDownPanel(frames, idx, kPanelH);
+    cv::Mat top = show3D_ ? render3DPanel(frames, idx, kPanelH)
+                          : renderTopDownPanel(frames, idx, kPanelH);
 
     cv::Mat body;
     cv::hconcat(cam, top, body);
 
     cv::Mat header(kHeaderH, body.cols, CV_8UC3, cv::Scalar(25, 25, 25));
     hudText(header, std::format("sample {}/{}   t={:.2f}s   |   keys: [space] play/step  [n]/[p] next/prev  "
-                                "[Home]/[End] jump  [s] save  [q] quit",
+                                "[Home]/[End] jump  [3] 2D/3D  [s] save  [q] quit",
                                 idx + 1, frames.size(), f.t),
             cv::Point(10, 24), 0.44);
 
@@ -424,6 +764,8 @@ void LocalisationViewer::exportVideo(const std::vector<ViewerFrame> & frames,
         lastDecoded = videoFrame;
         return raw;
     };
+
+    if (fps <= 0.0) fps = playbackFps(frames);
 
     cv::VideoWriter writer;
     const int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
@@ -474,10 +816,17 @@ void LocalisationViewer::run(const std::vector<ViewerFrame> & frames, int mode, 
                 dcap.set(cv::CAP_PROP_POS_FRAMES, static_cast<double>(frames[idx].videoFrame));
                 dcap.read(raw);
             }
+            const bool keep3D = show3D_;
+            show3D_ = false;
             cv::Mat composite = renderComposite(frames, idx, raw);
             auto p = dir / std::format("viewer_dump_{:03d}.png", static_cast<int>(std::llround(fr*100)));
             cv::imwrite(p.string(), composite);
-            std::println("Dumped {} (frame {}, t={:.2f}s)", p.string(), idx, frames[idx].t);
+            show3D_ = true;
+            cv::Mat composite3d = renderComposite(frames, idx, raw);
+            auto p3 = dir / std::format("viewer_dump_{:03d}_3d.png", static_cast<int>(std::llround(fr*100)));
+            cv::imwrite(p3.string(), composite3d);
+            show3D_ = keep3D;
+            std::println("Dumped {} and {} (frame {}, t={:.2f}s)", p.string(), p3.string(), idx, frames[idx].t);
         }
         return;
     }
@@ -490,7 +839,39 @@ void LocalisationViewer::run(const std::vector<ViewerFrame> & frames, int mode, 
     const std::string win = "RoboCup localisation";
     cv::namedWindow(win, cv::WINDOW_AUTOSIZE);
 
-    std::println("Viewer controls: [space] play/step  [n]/[p] next/prev  [Home]/[End] first/last  [s] save PNG  [q] quit");
+    std::println("Viewer controls: [space] play/step  [n]/[p] next/prev  [Home]/[End] first/last  "
+                 "[3] 2D/3D pane  drag orbits, wheel or -/= zooms (3D)  [s] save PNG  [q] quit");
+
+    // Mouse orbit for the 3D pane: drag rotates, wheel zooms. The callback only
+    // mutates the orbit state; while the 3D pane is up the render loop polls
+    // (short waitKey timeout) so the next iteration picks the new view up.
+    struct MouseState
+    {
+        LocalisationViewer * self;
+        bool dragging = false;
+        cv::Point last;
+    } mouse{this};
+    cv::setMouseCallback(win, [](int event, int x, int y, int flags, void * userdata) {
+        MouseState & m = *static_cast<MouseState *>(userdata);
+        if (event == cv::EVENT_LBUTTONDOWN)
+        {
+            m.dragging = true;
+            m.last = {x, y};
+        }
+        else if (event == cv::EVENT_LBUTTONUP) m.dragging = false;
+        else if (event == cv::EVENT_MOUSEMOVE && m.dragging)
+        {
+            m.self->orbitAz_ -= (x - m.last.x)*0.008;
+            m.self->orbitEl_ = std::clamp(m.self->orbitEl_ + (y - m.last.y)*0.008,
+                                          5.0*M_PI/180.0, 89.0*M_PI/180.0);
+            m.last = {x, y};
+        }
+        else if (event == cv::EVENT_MOUSEWHEEL)
+        {
+            m.self->orbitDist_ = std::clamp(m.self->orbitDist_*(cv::getMouseWheelDelta(flags) > 0 ? 0.9 : 1.1),
+                                            2.0, 40.0);
+        }
+    }, &mouse);
 
     int lastDecoded = -2;
     auto grabFrame = [&](int videoFrame) -> cv::Mat {
@@ -506,6 +887,7 @@ void LocalisationViewer::run(const std::vector<ViewerFrame> & frames, int mode, 
     std::size_t idx = 0;
     bool paused = (mode == 2);   // step mode starts paused; auto-play mode runs
     int snapCount = 0;
+    const int playDelay = std::max(1, static_cast<int>(1000.0/playbackFps(frames)));
 
     while (true)
     {
@@ -513,15 +895,20 @@ void LocalisationViewer::run(const std::vector<ViewerFrame> & frames, int mode, 
         cv::Mat composite = renderComposite(frames, idx, raw);
         cv::imshow(win, composite);
 
-        const int delay = paused ? 0 : std::max(1, static_cast<int>(1000.0/kPlaybackFps));
+        // While the 3D pane is up, poll instead of blocking so mouse orbiting
+        // re-renders; otherwise a pause blocks until a key arrives.
+        const int delay = paused ? (show3D_ ? 30 : 0) : playDelay;
         const int key = cv::waitKey(delay);
         const int k = key & 0xFF;
 
-        if (key < 0)   // timeout while playing: advance, pause at the end
+        if (key < 0)   // timeout
         {
-            if (idx + 1 < frames.size()) ++idx;
-            else paused = true;
-            continue;
+            if (!paused)   // playing: advance, pause at the end
+            {
+                if (idx + 1 < frames.size()) ++idx;
+                else paused = true;
+            }
+            continue;      // paused 3D poll: re-render only (orbit may have moved)
         }
         if (k == 'q' || k == 27) break;                                  // quit
         else if (k == 'n' || k == '.' || k == 83 || k == 3)             // next
@@ -535,6 +922,9 @@ void LocalisationViewer::run(const std::vector<ViewerFrame> & frames, int mode, 
         }
         else if (k == 'h' || k == 'g')  idx = 0;                        // first
         else if (k == 'e')              idx = frames.size() - 1;        // last
+        else if (k == '3')              show3D_ = !show3D_;             // 2D/3D right pane
+        else if (k == '-')              orbitDist_ = std::min(40.0, orbitDist_*1.15);
+        else if (k == '=' || k == '+')  orbitDist_ = std::max(2.0, orbitDist_/1.15);
         else if (k == 's' && !snapshotDir.empty())                      // save composite
         {
             std::filesystem::create_directories(snapshotDir);

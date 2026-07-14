@@ -14,12 +14,13 @@
  * The lens parameters (focal length, centre offset and distortion coefficients)
  * are normalised by the image width, exactly as in the NUbots camera configs
  * (module/input/Camera/data/config/<robot>/Cameras/Left.yaml). The default
- * values are frankie's calibration, which is the robot that captured the
- * recording used here: the ground-truth lens embedded in the recorded
- * CompressedImage messages (projection EQUIDISTANT, focal_length 0.34,
- * centre [0.02072, -0.00116], k [0.38554, 0.14984]) matches frankie's config
- * exactly. Using another unit's calibration (e.g. kevin's) shifts and scales
- * the projection so re-projected detections no longer line up with the frame.
+ * values are sarah's calibration, the robot that captured the data2 ground-truth
+ * recording (sarah shares frankie's centre/k; only the focal length differs,
+ * 0.34691 vs frankie's 0.34). Using another unit's calibration (e.g. kevin's)
+ * shifts and scales the projection so re-projected detections no longer line up
+ * with the frame; when replaying a recording from a different robot, set the
+ * fields from that robot's Left.yaml (or the lens embedded in its
+ * CompressedImage messages).
  */
 #ifndef FISHEYELENS_H
 #define FISHEYELENS_H
@@ -37,8 +38,8 @@ struct FisheyeLens
     double height = 1024.0;     ///< Image height [px]
 
     // All of the following are normalised by the image width, per the NUbots convention.
-    // Values are frankie's Left.yaml calibration (the robot that made the recording).
-    double focalLength = 0.34;                                        ///< Normalised focal length
+    // Values are sarah's Left.yaml calibration (the robot that made the data2 recording).
+    double focalLength = 0.34690945742400775;                         ///< Normalised focal length
     Eigen::Vector2d centre{0.02072339174622414, -0.0011612242293956145}; ///< Normalised optical-centre offset
     Eigen::Vector2d k{0.38553542593448015, 0.1498415334589703};      ///< Radial distortion coefficients [k1, k2]
 
