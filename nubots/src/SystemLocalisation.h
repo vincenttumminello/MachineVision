@@ -42,9 +42,11 @@ struct BodyTwistSample
  * on the camera side of the extrinsic transform by vision measurements:
  *   Tfc = Tfb(x) * Tbc * R(deltaC)
  *
- * Prediction is driven by a buffer of body-fixed twist samples obtained by
- * finite-differencing the odometry stream (Htw), treated as a known input
- * with additive process noise:
+ * Prediction is driven by a buffer of body-fixed twist samples: linear
+ * velocity from finite-differencing the odometry stream (Htw), angular
+ * velocity from the torso gyroscope (bias-calibrated on quiet samples; the
+ * walk-engine odometry attitude slips badly while turning, the gyro does
+ * not). The twist is treated as a known input with additive process noise:
  *
  *   deta/dt = JK(eta) * nu(t) + dw,   ddeltaC/dt = dw_c
  *
@@ -105,12 +107,14 @@ public:
     }
 
     /**
-     * @brief Build a body-twist buffer by finite-differencing the odometry stream.
+     * @brief Build a body-twist buffer from the odometry and gyroscope streams.
      *
      * For consecutive odometry samples, the relative pose
      * DeltaT = Twt(t1)^{-1} * Twt(t2) with Twt = Htw^{-1} yields
-     * vBb = Delta r / dt and omegaBb = log(Delta R) / dt, stamped at the
-     * interval midpoint. Samples spanning gaps larger than maxGap are skipped.
+     * vBb = Delta r / dt, stamped at the interval midpoint; omegaBb is the
+     * interval-mean gyroscope reading minus the quiet-sample gyro bias
+     * (falling back to log(Delta R) / dt when the gyro is not finite).
+     * Samples spanning gaps larger than maxGap are skipped.
      *
      * @param sensors Time-ordered odometry samples (absolute time [s])
      * @param t0 Time origin subtracted from sample times [s]

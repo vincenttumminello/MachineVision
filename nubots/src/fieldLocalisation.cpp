@@ -1168,7 +1168,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     if (captureFrames)
     {
         LocalisationViewer viewer(map, lens, dataDir / "Left.mp4");
-        if (!outputDirectory.empty())
+        if (!outputDirectory.empty() && !std::getenv("NO_MP4"))
         {
             viewer.exportVideo(viewFrames, outputDirectory / "localisation.mp4");
         }

@@ -521,7 +521,27 @@ SideDisambiguator::FrameResult SideDisambiguator::process(double t, const cv::Ma
         {
             flipStreak_--;      // Still in doubt, frame unqualifying: leak, don't reset
         }
-        res.flipRequested = flipStreak_ >= options.flipConsecutive;
+
+        // Blind-own escape (see Options): near-clamp LLR, own essentially
+        // blind, mirror matching real structure. Same leak/reset semantics.
+        if (llr_ <= -options.flipBlindLlr
+            && res.nAssociated <= options.flipBlindOwnMax
+            && res.nAssociatedMirror >= std::max(options.flipBlindMinAssoc,
+                   static_cast<std::size_t>(std::ceil(options.flipDominance*static_cast<double>(res.nAssociated)))))
+        {
+            blindStreak_++;
+        }
+        else if (llr_ > -options.flipThreshold)
+        {
+            blindStreak_ = 0;
+        }
+        else if (blindStreak_ > 0)
+        {
+            blindStreak_--;
+        }
+
+        res.flipRequested = flipStreak_ >= options.flipConsecutive
+                         || blindStreak_ >= options.flipBlindConsecutive;
     }
 
     // Map maintenance. Frozen while the pose is uncertain, the side is in
@@ -631,5 +651,6 @@ void SideDisambiguator::notifyFlipApplied(double t)
 {
     llr_ = -llr_;
     flipStreak_ = 0;
+    blindStreak_ = 0;
     mapFreezeUntil_ = t + options.flipCooldown;
 }

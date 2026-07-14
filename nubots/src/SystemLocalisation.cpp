@@ -129,6 +129,29 @@ std::vector<BodyTwistSample> SystemLocalisation::twistFromOdometry(const std::ve
     }
     twists.reserve(sensors.size() - 1);
 
+    // Gyroscope bias from quiet samples. While the robot stands still the
+    // gyro reads its bias directly (|omega| well below the walking
+    // oscillation), so the mean over quiet samples calibrates it. The data2
+    // recording shows ~0.75 deg/s of uncorrected z-bias, which otherwise
+    // becomes a steady yaw drift the vision must keep fighting.
+    Eigen::Vector3d gyroBias = Eigen::Vector3d::Zero();
+    {
+        Eigen::Vector3d sum = Eigen::Vector3d::Zero();
+        std::size_t n = 0;
+        for (const SensorsSample & s : sensors)
+        {
+            if (s.gyroscope.allFinite() && s.gyroscope.norm() < 0.05)
+            {
+                sum += s.gyroscope;
+                n++;
+            }
+        }
+        if (n >= 100)
+        {
+            gyroBias = sum/static_cast<double>(n);
+        }
+    }
+
     for (std::size_t k = 1; k < sensors.size(); ++k)
     {
         const SensorsSample & a = sensors[k-1];
@@ -158,6 +181,15 @@ std::vector<BodyTwistSample> SystemLocalisation::twistFromOdometry(const std::ve
         s.t = 0.5*(a.t + b.t) - t0;
         s.vBb = dT.translationVector/dt;
         s.omegaBb = aa.angle()*aa.axis()/dt;
+        // The walk-engine odometry attitude slips badly while turning (data2
+        // mocap: ~150 deg of yaw lost by t=40 s on odometry alone), but the
+        // torso-frame gyroscope measures the angular velocity directly and is
+        // immune to foot slip: prefer it whenever the sample carries one.
+        const Eigen::Vector3d gyro = 0.5*(a.gyroscope + b.gyroscope) - gyroBias;
+        if (gyro.allFinite())
+        {
+            s.omegaBb = gyro;
+        }
         if (!s.vBb.allFinite() || !s.omegaBb.allFinite())
         {
             continue;

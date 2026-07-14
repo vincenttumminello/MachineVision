@@ -132,6 +132,21 @@ public:
         double flipCoverage   = 0.5;    ///< ... and the own hypothesis must have at least this fraction of the
                                         ///< mirror's predicted-visible landmarks: when own looks at unmapped
                                         ///< territory the comparison is structurally unfair, so no decision
+
+        // --- blind-own flip escape ---
+        // When the wrong-side pose stares at territory the map never covered,
+        // the coverage condition above can never become fair and the fair path
+        // never fires. The escape accepts much deeper, longer evidence instead:
+        // the LLR must sit near its clamp while the own pose is essentially
+        // blind (at most one, likely aliased, association) and the mirror keeps
+        // matching real structure. On the recorded false-flip episode (own
+        // merely degraded, not mirrored) own retains associations on most
+        // frames, so the blind streak leaks and never accumulates (max 7 vs
+        // threshold 40); on a genuine mirror lock it reaches 40 within ~2 s.
+        double flipBlindLlr   = 35.0;   ///< Blind path needs the LLR at or below the negative of this [nats]
+        std::size_t flipBlindOwnMax = 1;///< ... with at most this many own-side associations
+        std::size_t flipBlindMinAssoc = 2; ///< ... and at least this many mirror-side associations
+        int flipBlindConsecutive = 40;  ///< ... over this many (leaky) scored frames
         double flipCooldown   = 5.0;    ///< Freeze map building for this long after a flip [s], so the
                                         ///< estimator can re-converge before new observations are trusted
     };
@@ -315,6 +330,7 @@ private:
 
     double llr_ = 0.0;          ///< Accumulated own-vs-mirror log-likelihood ratio [nats]
     int flipStreak_ = 0;        ///< Consecutive scored frames at/below the flip threshold
+    int blindStreak_ = 0;       ///< Leaky streak for the blind-own flip escape
     bool doubt_ = false;        ///< Latched after deep doubt; cleared only by positive evidence
     double mapFreezeUntil_ = -std::numeric_limits<double>::infinity();  ///< Post-flip map-building freeze [s]
     Stats stats_;               ///< Map-building funnel diagnostics
