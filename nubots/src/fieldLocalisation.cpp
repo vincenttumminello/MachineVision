@@ -1218,6 +1218,8 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     if (captureFrames)
     {
         LocalisationViewer viewer(map, lens, dataDir / "Left.mp4");
+        // VIEWER_3D=1 opens straight into the 3D pane ('3' still toggles).
+        viewer.setRightPane3D(std::getenv("VIEWER_3D") != nullptr);
         if (!outputDirectory.empty() && !std::getenv("NO_MP4"))
         {
             viewer.exportVideo(viewFrames, outputDirectory / "localisation.mp4");

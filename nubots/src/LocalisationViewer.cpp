@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <deque>
 #include <format>
 #include <print>
+#include <unordered_map>
 #include <Eigen/Eigenvalues>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/highgui.hpp>
@@ -1009,14 +1011,25 @@ void LocalisationViewer::exportVideo(const std::vector<ViewerFrame> & frames,
     if (!haveVideo)
         std::println("Viewer: could not open video {} (camera panel will be blank in the export).", videoPath_.string());
 
-    // Sequential decode: frames are processed in order, so read forward and only
-    // seek when the requested frame is not the next one (matches run()).
-    int lastDecoded = -2;
+    // Sequential decode. Frames are exported in order, but vision samples do not
+    // map one-to-one onto video frames, and seeking re-decodes from the start of
+    // the file (see run()), so every gap would otherwise cost seconds. Walk
+    // forward over the gap instead; only a backwards jump has to seek.
+    int lastDecoded = -1;   ///< The capture will next return frame lastDecoded + 1
     auto grabFrame = [&](int videoFrame) -> cv::Mat {
         cv::Mat raw;
         if (!haveVideo || videoFrame < 0) return raw;
-        if (videoFrame != lastDecoded + 1)
+        if (videoFrame > lastDecoded)
+        {
+            for (int f = lastDecoded + 1; f < videoFrame; ++f)
+            {
+                if (!cap.grab()) break;
+            }
+        }
+        else if (videoFrame != lastDecoded + 1)
+        {
             cap.set(cv::CAP_PROP_POS_FRAMES, static_cast<double>(videoFrame));
+        }
         cap.read(raw);
         lastDecoded = videoFrame;
         return raw;
@@ -1130,14 +1143,59 @@ void LocalisationViewer::run(const std::vector<ViewerFrame> & frames, int mode, 
         }
     }, &mouse);
 
-    int lastDecoded = -2;
+    // Decoded-frame cache. These recordings carry essentially no keyframes, so
+    // cv::CAP_PROP_POS_FRAMES re-decodes from the start of the file every time:
+    // measured, a seek costs ~1.5 ms per frame of target index (4 s at frame
+    // 2680) while a sequential read costs 1.6 ms. Re-grabbing the current frame
+    // on every loop iteration therefore pegged a core whenever the viewer sat
+    // paused. Keeping recently decoded frames makes re-rendering, pausing and
+    // short back-steps free; only a long backwards jump pays the seek.
+    // Small on purpose: with forward jumps now walked rather than sought, the
+    // cache only has to cover re-rendering the current frame and stepping back
+    // over ground just played. Full-resolution frames are ~3.9 MB each and this
+    // process already holds the whole sensor log, so a deep cache would cost far
+    // more memory than the rare backwards jump it would save.
+    constexpr std::size_t kFrameCacheMax = 12;      // ~47 MB at 1280x1024 BGR
+    std::unordered_map<int, cv::Mat> frameCache;
+    std::deque<int> cacheOrder;
+    int lastDecoded = -1;   ///< The capture will next return frame lastDecoded + 1
     auto grabFrame = [&](int videoFrame) -> cv::Mat {
+        if (!haveVideo || videoFrame < 0) return cv::Mat();
+        if (const auto it = frameCache.find(videoFrame); it != frameCache.end())
+        {
+            return it->second;
+        }
         cv::Mat raw;
-        if (!haveVideo || videoFrame < 0) return raw;
-        if (videoFrame != lastDecoded + 1)
-            cap.set(cv::CAP_PROP_POS_FRAMES, static_cast<double>(videoFrame));
+        // Seeking costs ~1.5 ms per frame of TARGET index because it re-decodes
+        // from the start of the file; stepping forward costs ~1.6 ms per frame
+        // ACTUALLY SKIPPED. So any forward jump is cheaper walked than sought --
+        // even the worst case (first frame to last) merely ties. Vision samples
+        // do not map one-to-one onto video frames (some are skipped), so without
+        // this every gap in the recording triggered a full re-decode from frame
+        // zero mid-playback: the pauses that appear "only at some points".
+        // grab() advances without the colour conversion and copy that read() does.
+        if (videoFrame > lastDecoded)
+        {
+            for (int f = lastDecoded + 1; f < videoFrame; ++f)
+            {
+                if (!cap.grab()) break;
+            }
+        }
+        else if (videoFrame != lastDecoded + 1)
+        {
+            cap.set(cv::CAP_PROP_POS_FRAMES, static_cast<double>(videoFrame));   // Backwards: unavoidable
+        }
         cap.read(raw);
         lastDecoded = videoFrame;
+        if (raw.empty()) return raw;
+        // Clone so a cache entry can never alias a buffer the backend reuses.
+        frameCache.emplace(videoFrame, raw.clone());
+        cacheOrder.push_back(videoFrame);
+        if (cacheOrder.size() > kFrameCacheMax)
+        {
+            frameCache.erase(cacheOrder.front());
+            cacheOrder.pop_front();
+        }
         return raw;
     };
 
@@ -1146,11 +1204,28 @@ void LocalisationViewer::run(const std::vector<ViewerFrame> & frames, int mode, 
     int snapCount = 0;
     const int playDelay = std::max(1, static_cast<int>(1000.0/playbackFps(frames)));
 
+    // Re-render only when something the composite depends on actually changed.
+    // Paused-with-3D polls at 30 ms so mouse orbiting stays responsive; without
+    // this it would also re-render (and formerly re-seek) 33 times a second
+    // while the user simply looks at a static frame.
+    cv::Mat composite;
+    struct ViewState
+    {
+        std::size_t idx = static_cast<std::size_t>(-1);
+        bool show3D = false, legend = false;
+        double az = 0.0, el = 0.0, dist = 0.0;
+        auto operator<=>(const ViewState &) const = default;
+    } shown, want;
+
     while (true)
     {
-        cv::Mat raw = grabFrame(frames[idx].videoFrame);
-        cv::Mat composite = renderComposite(frames, idx, raw);
-        cv::imshow(win, composite);
+        want = {idx, show3D_, showLegend_, orbitAz_, orbitEl_, orbitDist_};
+        if (want != shown)
+        {
+            composite = renderComposite(frames, idx, grabFrame(frames[idx].videoFrame));
+            cv::imshow(win, composite);
+            shown = want;
+        }
 
         // While the 3D pane is up, poll instead of blocking so mouse orbiting
         // re-renders; otherwise a pause blocks until a key arrives.
