@@ -101,7 +101,18 @@ public:
         double staticChi2Mean = 9.0;    ///< Reject when the mean normalised squared residual exceeds this
         int obsWindow         = 12;     ///< Bounded per-landmark observation window (re-triangulated each hit)
         int maxMissStreak     = 20;     ///< Prune after this many predicted-visible frames without a hit
-        std::size_t maxLandmarks = 500; ///< Map cap (weakest = fewest hits pruned first)
+        std::size_t maxLandmarks = 500; ///< Map cap (lowest-scoring evicted first, see evictHalfLife)
+        double evictHalfLife  = 20.0;   ///< Staleness that halves a landmark's cap score [s].
+                                        ///< The map sits pinned at maxLandmarks for most of a run, so the
+                                        ///< cap -- not the miss rule -- is the dominant eviction path, and
+                                        ///< ranking on lifetime hits alone let a landmark that earned its
+                                        ///< hits early outrank a fresh one that is matching NOW. Scoring
+                                        ///< hits/(1 + age/halfLife) keeps established landmarks (50 hits
+                                        ///< unseen 100 s still beats 5 hits seen now) while letting truly
+                                        ///< dead ones fall out. Not pure recency on purpose: a landmark
+                                        ///< behind the robot is not failing, and the mirror test needs
+                                        ///< coverage in every direction, so staleness must decay influence
+                                        ///< rather than decide eviction outright.
         double minRange       = 0.8;    ///< Reject triangulations closer than this to the camera [m]
         double maxRange       = 40.0;   ///< Reject triangulations farther than this [m]
         double minHeightOnCarpet = 1.5; ///< Points above the carpet in xy must be at least this high [m] (ceiling)

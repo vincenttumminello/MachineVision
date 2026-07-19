@@ -700,11 +700,16 @@ SideDisambiguator::FrameResult SideDisambiguator::process(double t, const cv::Ma
             }
         }
 
-        // Cap the map, keeping the most-reobserved landmarks.
+        // Cap the map, keeping the landmarks that are earning their place:
+        // re-observations discounted by how long ago they stopped arriving.
         if (landmarks_.size() > options.maxLandmarks)
         {
+            const double halfLife = std::max(options.evictHalfLife, 1e-3);
+            auto capScore = [&](const Landmark & lm) {
+                return lm.hits/(1.0 + std::max(0.0, t - lm.lastSeen)/halfLife);
+            };
             std::sort(landmarks_.begin(), landmarks_.end(),
-                      [](const Landmark & a, const Landmark & b) { return a.hits > b.hits; });
+                      [&](const Landmark & a, const Landmark & b) { return capScore(a) > capScore(b); });
             landmarks_.resize(options.maxLandmarks);
         }
     }
