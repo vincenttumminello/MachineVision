@@ -9,6 +9,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/videoio.hpp>
+#include "SideDisambiguator.h"   // FeatureStatus / LandmarkStatus colour key
 
 namespace
 {
@@ -74,6 +75,19 @@ void hudText(cv::Mat & img, const std::string & s, cv::Point org, double scale =
                   cv::Scalar(0, 0, 0), cv::FILLED);
     cv::putText(img, s, org, cv::FONT_HERSHEY_SIMPLEX, scale, colour, thickness, cv::LINE_AA);
 }
+
+// -------- association colour key (shared by the camera panel and its legend) --------
+// One palette for "what did the estimator do with this observation", used by both
+// landmark streams so the two panels read the same way: green = associated,
+// amber = seen but unclaimed, red = rejected, grey = never in play.
+const cv::Scalar kColAssociated(120, 230, 120);   // green:   matched a map landmark
+const cv::Scalar kColMissed    (60, 190, 255);    // amber:   predicted visible, nothing matched it
+const cv::Scalar kColOutlier   (60, 60, 255);     // red:     gated but rejected on the evidence
+const cv::Scalar kColMirror    (0, 235, 235);     // yellow:  matched only the mirrored pose
+const cv::Scalar kColCandidate (230, 170, 80);    // steel:   growing a candidate track
+const cv::Scalar kColUnmatched (255, 255, 0);     // cyan:    usable background corner, unclaimed
+const cv::Scalar kColInactive  (130, 130, 130);   // grey:    outside the FOV margin / not in play
+const cv::Scalar kColAmbiguous (200, 140, 200);   // mauve:   too smeared to discriminate the mirror
 
 // Compact colour legend drawn in the bottom-left corner of a panel.
 struct LegendEntry
@@ -205,29 +219,98 @@ cv::Mat LocalisationViewer::renderCameraPanel(const ViewerFrame & f, const cv::M
         }
     }
 
-    // ---- out-of-field corner features (side disambiguation) ----
-    for (const OofFeatureView & of : f.oofFeatures)
+    // ---- visibility margin: inside this border a map landmark counts as
+    // "predicted visible" and so is allowed to score and to accrue misses ----
+    if (f.oofVisibleMargin > 0.0 && !f.oofLandmarkProj.empty())
     {
-        const cv::Point2d p = toPanel(of.px);
-        switch (of.status)
+        const int m = static_cast<int>(std::lround(f.oofVisibleMargin*scale));
+        cv::rectangle(panel, cv::Point(m, m), cv::Point(panelW - m, panelH - m),
+                      cv::Scalar(70, 70, 70), 1, cv::LINE_AA);
+    }
+
+    // ---- out-of-field map landmarks predicted at the estimate ----
+    // Squares (vs circles for measured corners), drawn least-to-most important so
+    // the interesting statuses land on top.
+    for (int pass = SideDisambiguator::LANDMARK_EDGE; pass <= SideDisambiguator::LANDMARK_CULLED_OUTLIER; ++pass)
+    {
+        for (const OofLandmarkProjView & lp : f.oofLandmarkProj)
         {
-            case 0:  // On-carpet: rejected, drawn faintly to verify the mask
-                cv::circle(panel, p, 1, cv::Scalar(90, 90, 90), cv::FILLED, cv::LINE_AA);
-                break;
-            case 1:  // Out-of-field: usable background feature (cyan)
-                cv::circle(panel, p, 2, cv::Scalar(255, 255, 0), 1, cv::LINE_AA);
-                break;
-            default: // Associated to an out-of-field map landmark (magenta)
-                cv::circle(panel, p, 3, cv::Scalar(255, 0, 255), 1, cv::LINE_AA);
-                break;
+            if (lp.status != pass) continue;
+            const cv::Point2d p = toPanel(lp.px);
+            int r = 4;
+            cv::Scalar col = kColInactive;
+            switch (lp.status)
+            {
+                case SideDisambiguator::LANDMARK_EDGE:      col = kColInactive;  r = 3; break;
+                case SideDisambiguator::LANDMARK_AMBIGUOUS: col = kColAmbiguous; r = 3; break;
+                case SideDisambiguator::LANDMARK_MISSED:    col = kColMissed;    break;
+                case SideDisambiguator::LANDMARK_ASSOCIATED:col = kColAssociated;break;
+                default:                                    col = kColOutlier;   r = 5; break;
+            }
+            cv::rectangle(panel, p + cv::Point2d(-r, -r), p + cv::Point2d(r, r), col, 1, cv::LINE_AA);
+            if (lp.far)
+            {
+                // Bearing-only: no depth yet, so the prediction is a direction.
+                cv::drawMarker(panel, p, col, cv::MARKER_DIAMOND, 2*r, 1, cv::LINE_AA);
+            }
+            if (lp.status == SideDisambiguator::LANDMARK_ASSOCIATED)
+            {
+                // Link to the corner that claimed it: the segment is the
+                // association residual, drawn at the same scale as the image.
+                cv::line(panel, p, toPanel(lp.matchPx), kColAssociated, 1, cv::LINE_AA);
+            }
+            else if (lp.status == SideDisambiguator::LANDMARK_CULLED_MISSING
+                  || lp.status == SideDisambiguator::LANDMARK_CULLED_OUTLIER)
+            {
+                cv::drawMarker(panel, p, col, cv::MARKER_TILTED_CROSS, 2*r, 1, cv::LINE_AA);
+            }
+        }
+    }
+
+    // ---- out-of-field corner features (side disambiguation) ----
+    for (int pass = SideDisambiguator::FEATURE_ON_CARPET; pass <= SideDisambiguator::FEATURE_ASSOCIATED; ++pass)
+    {
+        for (const OofFeatureView & of : f.oofFeatures)
+        {
+            if (of.status != pass) continue;
+            const cv::Point2d p = toPanel(of.px);
+            switch (of.status)
+            {
+                case SideDisambiguator::FEATURE_ON_CARPET:  // masked out, drawn faintly to verify the mask
+                    cv::circle(panel, p, 1, cv::Scalar(90, 90, 90), cv::FILLED, cv::LINE_AA);
+                    break;
+                case SideDisambiguator::FEATURE_UNMATCHED:
+                    cv::circle(panel, p, 2, kColUnmatched, 1, cv::LINE_AA);
+                    break;
+                case SideDisambiguator::FEATURE_CANDIDATE:
+                    cv::circle(panel, p, 2, kColCandidate, 1, cv::LINE_AA);
+                    break;
+                case SideDisambiguator::FEATURE_OUTLIER:
+                    cv::drawMarker(panel, p, kColOutlier, cv::MARKER_TILTED_CROSS, 7, 1, cv::LINE_AA);
+                    break;
+                case SideDisambiguator::FEATURE_MIRROR:
+                    cv::circle(panel, p, 3, kColMirror, 1, cv::LINE_AA);
+                    cv::circle(panel, p, 1, kColMirror, cv::FILLED, cv::LINE_AA);
+                    break;
+                default:    // FEATURE_ASSOCIATED
+                    // Small: the landmark box and the link line drawn above
+                    // already carry this match, so the dot only has to mark
+                    // where the corner actually was.
+                    cv::circle(panel, p, 2, kColAssociated, cv::FILLED, cv::LINE_AA);
+                    break;
+            }
         }
     }
 
     // ---- YOLO detections (curved fisheye boxes) ----
+    // The box keeps its class colour (that is how you read what was detected);
+    // the association outcome is carried by the measurement dot and the label,
+    // which share the palette with the out-of-field landmarks above.
     for (const DetectionView & d : f.detections)
     {
         const cv::Scalar col = classColour(d.name);
-        const int thick = d.used ? 2 : 1;
+        const bool associated = d.status == DetectionStatus::ASSOCIATED;
+        const int thick = associated ? 2 : 1;
         // Curved edges: interpolate rays between adjacent corners (TL-TR-BR-BL)
         // and project each sub-point, so the box hugs the fisheye distortion.
         cv::Point2d prev; bool havePrev = false;
@@ -245,19 +328,39 @@ cv::Mat LocalisationViewer::renderCameraPanel(const ViewerFrame & f, const cv::M
                 prev = p; havePrev = true;
             }
         }
-        // Label at the top-left corner.
+        // Label at the top-left corner, suffixed and tinted by the outcome.
+        cv::Scalar statusCol = kColInactive;
+        std::string suffix;
+        switch (d.status)
+        {
+            case DetectionStatus::ASSOCIATED:
+                statusCol = kColAssociated;
+                break;
+            case DetectionStatus::UNASSOCIATED:
+                statusCol = kColOutlier;
+                suffix = " (unassociated)";
+                break;
+            case DetectionStatus::LOW_CONFIDENCE:
+                statusCol = kColMissed;
+                suffix = " (low conf)";
+                break;
+            default:    // UNUSED_CLASS
+                suffix = " (not a landmark)";
+                break;
+        }
         cv::Point2d tl;
         if (projectPanel(d.corners.col(0).normalized(), tl))
         {
-            std::string lbl = std::format("{} {:.0f}%", d.name, d.confidence*100.0);
-            if (!d.used) lbl += " (unused)";
-            hudText(panel, lbl, cv::Point(static_cast<int>(tl.x), static_cast<int>(tl.y) - 4), 0.36, col);
+            const std::string lbl = std::format("{} {:.0f}%{}", d.name, d.confidence*100.0, suffix);
+            hudText(panel, lbl, cv::Point(static_cast<int>(tl.x), static_cast<int>(tl.y) - 4), 0.36,
+                    d.status == DetectionStatus::UNUSED_CLASS ? col : statusCol);
         }
-        // Measurement point (what the estimator actually uses).
+        // Measurement point (what the estimator would use), coloured by outcome.
         Eigen::Vector3d mray; cv::Point2d mp;
-        if (d.used && measurementRay(d, mray) && projectPanel(mray, mp))
+        if (d.status != DetectionStatus::UNUSED_CLASS && measurementRay(d, mray) && projectPanel(mray, mp))
         {
-            cv::circle(panel, mp, 3, col, cv::FILLED, cv::LINE_AA);
+            if (associated) cv::circle(panel, mp, 4, statusCol, cv::FILLED, cv::LINE_AA);
+            else            cv::circle(panel, mp, 4, statusCol, 1, cv::LINE_AA);
         }
     }
 
@@ -294,23 +397,99 @@ cv::Mat LocalisationViewer::renderCameraPanel(const ViewerFrame & f, const cv::M
     }
 
     // ---- camera HUD ----
+    auto countFeatures = [&](int status) {
+        return std::count_if(f.oofFeatures.begin(), f.oofFeatures.end(),
+                             [&](const OofFeatureView & of) { return of.status == status; });
+    };
+    auto countLandmarks = [&](int status) {
+        return std::count_if(f.oofLandmarkProj.begin(), f.oofLandmarkProj.end(),
+                             [&](const OofLandmarkProjView & lp) { return lp.status == status; });
+    };
+
     hudText(panel, std::format("camera  t={:.2f}s  video frame {}", f.t, f.videoFrame), cv::Point(10, 22), 0.45);
-    hudText(panel, std::format("detections {}  associated {}/{}", f.detections.size(), f.nAssoc, f.nCand),
-            cv::Point(10, 44), 0.42, cv::Scalar(200, 255, 200));
+    {
+        const auto nUnassoc = std::count_if(f.detections.begin(), f.detections.end(),
+            [](const DetectionView & d) { return d.status == DetectionStatus::UNASSOCIATED; });
+        hudText(panel, std::format("YOLO {} detections: {} associated, {} unassociated (of {} usable)",
+                                   f.detections.size(), f.nAssoc, nUnassoc, f.nCand),
+                cv::Point(10, 44), 0.42, cv::Scalar(200, 255, 200));
+    }
+    int hudY = 66;
     if (!f.oofFeatures.empty())
     {
-        const auto nOut = std::count_if(f.oofFeatures.begin(), f.oofFeatures.end(),
-                                        [](const OofFeatureView & of) { return of.status >= 1; });
-        const auto nAssoc = std::count_if(f.oofFeatures.begin(), f.oofFeatures.end(),
-                                          [](const OofFeatureView & of) { return of.status >= 2; });
-        hudText(panel, std::format("out-of-field corners {}/{}  associated {}", nOut, f.oofFeatures.size(), nAssoc),
-                cv::Point(10, 66), 0.42, cv::Scalar(255, 255, 180));
+        hudText(panel, std::format("oof corners {}: {} assoc, {} mirror, {} rejected, {} track, {} free (of {} total)",
+                                   f.oofFeatures.size() - countFeatures(SideDisambiguator::FEATURE_ON_CARPET),
+                                   countFeatures(SideDisambiguator::FEATURE_ASSOCIATED),
+                                   countFeatures(SideDisambiguator::FEATURE_MIRROR),
+                                   countFeatures(SideDisambiguator::FEATURE_OUTLIER),
+                                   countFeatures(SideDisambiguator::FEATURE_CANDIDATE),
+                                   countFeatures(SideDisambiguator::FEATURE_UNMATCHED),
+                                   f.oofFeatures.size()),
+                cv::Point(10, hudY), 0.42, cv::Scalar(255, 255, 180));
+        hudY += 22;
+    }
+    if (!f.oofLandmarkProj.empty())
+    {
+        hudText(panel, std::format("oof landmarks in image {}: {} assoc, {} missed, {} ambiguous, {} at edge",
+                                   f.oofLandmarkProj.size(),
+                                   countLandmarks(SideDisambiguator::LANDMARK_ASSOCIATED),
+                                   countLandmarks(SideDisambiguator::LANDMARK_MISSED),
+                                   countLandmarks(SideDisambiguator::LANDMARK_AMBIGUOUS),
+                                   countLandmarks(SideDisambiguator::LANDMARK_EDGE)),
+                cv::Point(10, hudY), 0.42, cv::Scalar(255, 255, 180));
+        hudY += 22;
     }
     if (f.hasSide)
     {
         hudText(panel, std::format("side llr {:+.1f} nats  oof map {} lm{}",
                                    f.sideLlr, f.nOofLandmarks, f.sideFrozen ? "  [map frozen]" : ""),
-                cv::Point(10, 88), 0.42, cv::Scalar(255, 220, 255));
+                cv::Point(10, hudY), 0.42, cv::Scalar(255, 220, 255));
+    }
+
+    // ---- colour key ----
+    // Only the statuses actually present this frame, so the key stays short
+    // enough to sit over the image without burying it.
+    if (showLegend_)
+    {
+        std::vector<LegendEntry> legend;
+        auto haveDetection = [&](DetectionStatus s) {
+            return std::any_of(f.detections.begin(), f.detections.end(),
+                               [&](const DetectionView & d) { return d.status == s; });
+        };
+        if (haveDetection(DetectionStatus::ASSOCIATED))
+            legend.push_back({kColAssociated, "YOLO: associated to a map landmark"});
+        if (haveDetection(DetectionStatus::UNASSOCIATED))
+            legend.push_back({kColOutlier, "YOLO: usable but unassociated (gated out)"});
+        if (haveDetection(DetectionStatus::LOW_CONFIDENCE))
+            legend.push_back({kColMissed, "YOLO: below the confidence threshold"});
+        if (haveDetection(DetectionStatus::UNUSED_CLASS))
+            legend.push_back({kColInactive, "YOLO: not a mapped landmark class"});
+
+        if (countFeatures(SideDisambiguator::FEATURE_ASSOCIATED) > 0)
+            legend.push_back({kColAssociated, "corner: associated (o)"});
+        if (countFeatures(SideDisambiguator::FEATURE_MIRROR) > 0)
+            legend.push_back({kColMirror, "corner: matches the MIRROR pose only"});
+        if (countFeatures(SideDisambiguator::FEATURE_OUTLIER) > 0)
+            legend.push_back({kColOutlier, "corner: gated but rejected as an outlier (x)"});
+        if (countFeatures(SideDisambiguator::FEATURE_CANDIDATE) > 0)
+            legend.push_back({kColCandidate, "corner: growing a candidate track"});
+        if (countFeatures(SideDisambiguator::FEATURE_UNMATCHED) > 0)
+            legend.push_back({kColUnmatched, "corner: out-of-field, unclaimed"});
+
+        // Map landmarks are the [] glyphs; the thin rectangle is the border
+        // inside which one counts as predicted-visible ("in FOV").
+        if (countLandmarks(SideDisambiguator::LANDMARK_ASSOCIATED) > 0)
+            legend.push_back({kColAssociated, "landmark []: associated (line = residual)"});
+        if (countLandmarks(SideDisambiguator::LANDMARK_MISSED) > 0)
+            legend.push_back({kColMissed, "landmark []: in FOV, nothing matched it"});
+        if (countLandmarks(SideDisambiguator::LANDMARK_AMBIGUOUS) > 0)
+            legend.push_back({kColAmbiguous, "landmark []: too smeared to discriminate"});
+        if (countLandmarks(SideDisambiguator::LANDMARK_EDGE) > 0)
+            legend.push_back({kColInactive, "landmark []: outside the FOV margin (thin rect)"});
+        if (countLandmarks(SideDisambiguator::LANDMARK_CULLED_OUTLIER) > 0
+            || countLandmarks(SideDisambiguator::LANDMARK_CULLED_MISSING) > 0)
+            legend.push_back({kColOutlier, "landmark []: culled this frame as an outlier (x)"});
+        if (!legend.empty()) drawPanelLegend(panel, legend);
     }
     return panel;
 }
@@ -460,6 +639,7 @@ cv::Mat LocalisationViewer::renderTopDownPanel(const std::vector<ViewerFrame> & 
                 cv::Point(10, hudY), 0.42, cv::Scalar(180, 220, 255));
 
     // ---- legend ----
+    if (showLegend_)
     {
         std::vector<LegendEntry> legend;
         legend.push_back({cv::Scalar(0, 128, 255), "our estimate (trail: blue start -> orange now)"});
@@ -694,6 +874,7 @@ cv::Mat LocalisationViewer::render3DPanel(const std::vector<ViewerFrame> & frame
                 cv::Point(10, 66), 0.42, cv::Scalar(255, 255, 180));
 
     // ---- legend ----
+    if (showLegend_)
     {
         std::vector<LegendEntry> legend;
         legend.push_back({cv::Scalar(0, 128, 255), "our estimate (trail: blue start -> orange now)"});
@@ -726,7 +907,7 @@ cv::Mat LocalisationViewer::renderComposite(const std::vector<ViewerFrame> & fra
 
     cv::Mat header(kHeaderH, body.cols, CV_8UC3, cv::Scalar(25, 25, 25));
     hudText(header, std::format("sample {}/{}   t={:.2f}s   |   keys: [space] play/step  [n]/[p] next/prev  "
-                                "[Home]/[End] jump  [3] 2D/3D  [s] save  [q] quit",
+                                "[Home]/[End] jump  [3] 2D/3D  [k] key  [s] save  [q] quit",
                                 idx + 1, frames.size(), f.t),
             cv::Point(10, 24), 0.44);
 
@@ -840,7 +1021,7 @@ void LocalisationViewer::run(const std::vector<ViewerFrame> & frames, int mode, 
     cv::namedWindow(win, cv::WINDOW_AUTOSIZE);
 
     std::println("Viewer controls: [space] play/step  [n]/[p] next/prev  [Home]/[End] first/last  "
-                 "[3] 2D/3D pane  drag orbits, wheel or -/= zooms (3D)  [s] save PNG  [q] quit");
+                 "[3] 2D/3D pane  [k] colour key  drag orbits, wheel or -/= zooms (3D)  [s] save PNG  [q] quit");
 
     // Mouse orbit for the 3D pane: drag rotates, wheel zooms. The callback only
     // mutates the orbit state; while the 3D pane is up the render loop polls
@@ -923,6 +1104,7 @@ void LocalisationViewer::run(const std::vector<ViewerFrame> & frames, int mode, 
         else if (k == 'h' || k == 'g')  idx = 0;                        // first
         else if (k == 'e')              idx = frames.size() - 1;        // last
         else if (k == '3')              show3D_ = !show3D_;             // 2D/3D right pane
+        else if (k == 'k')              showLegend_ = !showLegend_;     // colour key on/off
         else if (k == '-')              orbitDist_ = std::min(40.0, orbitDist_*1.15);
         else if (k == '=' || k == '+')  orbitDist_ = std::max(2.0, orbitDist_/1.15);
         else if (k == 's' && !snapshotDir.empty())                      // save composite

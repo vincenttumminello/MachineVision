@@ -92,6 +92,22 @@ public:
     std::size_t numCandidates() const { return candidates_.size(); }
     const Eigen::Matrix<double, 3, Eigen::Dynamic> & measuredRays() const { return uMeas_; }
     const Eigen::Matrix<double, 3, Eigen::Dynamic> & associatedLandmarks() const { return rLFf_; }
+    const Options & options() const { return options_; }
+
+    /**
+     * @brief What the final association pass did with one usable detection.
+     *
+     * Only detections of a mapped class that cleared the confidence threshold
+     * appear here; everything else never reached association at all.
+     */
+    struct DetectionOutcome
+    {
+        std::size_t detection;      ///< Index into the vision sample's detection list
+        bool associated = false;    ///< Matched a map landmark within the gate and won the assignment
+    };
+
+    /// @brief Association outcome of every usable detection (for the visualiser).
+    std::vector<DetectionOutcome> detectionOutcomes() const;
 
 protected:
     /**
@@ -116,6 +132,7 @@ protected:
     {
         Eigen::Vector3d ray;
         LandmarkType type;
+        std::size_t detection;      ///< Index into the vision sample's detection list (for display)
     };
 
     /**
@@ -130,6 +147,7 @@ protected:
     Eigen::Matrix<double, 3, Eigen::Dynamic> uMeas_;    ///< Measured unit rays in {c} (associated only)
     Eigen::Matrix<double, 3, Eigen::Dynamic> rLFf_;     ///< Associated landmark positions in {f}
     std::vector<std::pair<std::size_t, std::size_t>> assocKeys_;  ///< Last association (candidate, landmark)
+    std::vector<std::size_t> assocCand_;                ///< Candidate index behind each column of uMeas_
     Options options_;
     int maxAssociationIterations_ = 1;                  ///< Maximum association/optimisation passes
 };

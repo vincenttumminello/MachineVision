@@ -4,7 +4,12 @@
  *
  * Left panel: the source camera frame with YOLO detections, field-line points,
  * associated map landmarks and the predicted horizon re-projected onto the
- * fisheye image (NUbots-exact projection). Right panel (toggled with '3'):
+ * fisheye image (NUbots-exact projection). Data association is the thing this
+ * panel exists to debug, so both landmark streams are colour-keyed by what the
+ * estimator did with them: every YOLO detection reads as associated, gated out,
+ * below confidence or not-a-landmark-class, and every out-of-field corner and
+ * map landmark reads as in-FOV, associated, missed or rejected. The key itself
+ * is drawn bottom-left ('k' hides it). Right panel (toggled with '3'):
  * either a top-down field view with the estimated pose, every live hypothesis
  * and its weight, the posterior covariance, the NUbots baseline, the mocap
  * ground truth and the on-ground landmark residuals; or an orbitable 3D view
@@ -29,13 +34,23 @@
 #include "FisheyeLens.h"
 #include "Pose.hpp"
 
+/// @brief What the landmark measurement did with a YOLO detection.
+enum class DetectionStatus
+{
+    UNUSED_CLASS = 0,   ///< Not a mapped landmark class (ball, robot): never a measurement
+    LOW_CONFIDENCE,     ///< Mapped class, but below the measurement confidence threshold
+    UNASSOCIATED,       ///< Usable detection that no map landmark claimed: outside the association
+                        ///< gate, or beaten to its landmark by a closer detection
+    ASSOCIATED          ///< Associated to a map landmark and used in the update
+};
+
 /// @brief A single YOLO detection for display (raw unit-ray corners).
 struct DetectionView
 {
     std::string name;                        ///< YOLO class name
     double confidence = 0.0;
     Eigen::Matrix<double, 3, 4> corners;     ///< Unit rays in {c}: TL, TR, BR, BL
-    bool used = false;                        ///< True if the estimator uses this class as a landmark
+    DetectionStatus status = DetectionStatus::UNUSED_CLASS;
 };
 
 /// @brief One accepted detection-to-landmark association.
@@ -50,7 +65,16 @@ struct AssociationView
 struct OofFeatureView
 {
     Eigen::Vector2d px = Eigen::Vector2d::Zero();   ///< Pixel position (full lens resolution)
-    int status = 0;   ///< 0: on-carpet (rejected), 1: out-of-field, 2: associated to a map landmark
+    int status = 0;   ///< SideDisambiguator::FeatureStatus
+};
+
+/// @brief One out-of-field map landmark projected into the camera panel.
+struct OofLandmarkProjView
+{
+    Eigen::Vector2d px = Eigen::Vector2d::Zero();       ///< Predicted pixel position at the estimate
+    Eigen::Vector2d matchPx = Eigen::Vector2d::Zero();  ///< Matched corner's pixel (associated only)
+    int status = 0;   ///< SideDisambiguator::LandmarkStatus
+    bool far = false; ///< Bearing-only landmark
 };
 
 /// @brief One pose hypothesis for the top-down panel.
@@ -89,6 +113,7 @@ struct ViewerFrame
     std::vector<DetectionView> detections;
     std::vector<AssociationView> associations;
     std::vector<OofFeatureView> oofFeatures;   ///< Out-of-field corner features (may be empty)
+    std::vector<OofLandmarkProjView> oofLandmarkProj;  ///< Out-of-field landmarks projected into the camera panel
     std::vector<OofLandmarkView> oofLandmarks; ///< Out-of-field map landmarks (3D panel; may be empty)
     Eigen::Matrix<double, 3, Eigen::Dynamic> lineRays;  ///< Field-line rays in {c} (may be empty)
 
@@ -104,6 +129,7 @@ struct ViewerFrame
     double sideLlr = 0.0;               ///< Accumulated own-vs-mirror evidence [nats]
     std::size_t nOofLandmarks = 0;      ///< Out-of-field map size
     bool sideFrozen = false;            ///< Map building frozen (pose/side in doubt)
+    double oofVisibleMargin = 0.0;      ///< Border inside which a landmark counts as predicted-visible [px]
     bool hasError = false;
     double errXY = 0.0;
     double errYaw = 0.0;
@@ -151,6 +177,9 @@ public:
     /// @brief Select the right-hand pane: false = top-down (default), true = 3D map.
     void setRightPane3D(bool on) { show3D_ = on; }
 
+    /// @brief Show the per-panel colour keys ('k' in the interactive loop).
+    void setShowLegend(bool on) { showLegend_ = on; }
+
 private:
     cv::Mat renderCameraPanel(const ViewerFrame & f, const cv::Mat & rawFrame, int panelH) const;
     cv::Mat renderTopDownPanel(const std::vector<ViewerFrame> & frames, std::size_t idx, int panelH) const;
@@ -163,6 +192,7 @@ private:
     // Right-pane mode and 3D orbit state (adjusted from the interactive loop /
     // mouse callback while rendering stays logically const).
     bool show3D_ = false;
+    bool showLegend_ = true;                ///< Draw the per-panel colour keys
     double orbitAz_ = -135.0*M_PI/180.0;    ///< Azimuth about field z [rad]
     double orbitEl_ = 35.0*M_PI/180.0;      ///< Elevation above the ground plane [rad]
     double orbitDist_ = 11.0;               ///< Camera distance from the target [m]

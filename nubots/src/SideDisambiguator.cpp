@@ -145,11 +145,11 @@ bool SideDisambiguator::fitFar(const std::vector<Landmark::Obs> & obs,
 std::vector<SideDisambiguator::Association> SideDisambiguator::associate(
     const std::vector<OutOfFieldFeature> & features, const Pose<double> & Tfc,
     double posStd, double yawStd,
-    double & score, std::size_t & nPredictedVisible, std::vector<std::size_t> & visibleMiss) const
+    double & score, std::vector<Prediction> & predictions, std::vector<char> & featureOutlier) const
 {
     score = 0.0;
-    nPredictedVisible = 0;
-    visibleMiss.clear();
+    predictions.clear();
+    featureOutlier.assign(features.size(), 0);
 
     const Eigen::Matrix3d Rcf = Tfc.rotationMatrix.transpose();
     const Eigen::Vector3d rCFf = Tfc.translationVector;
@@ -159,18 +159,19 @@ std::vector<SideDisambiguator::Association> SideDisambiguator::associate(
     const Eigen::Matrix3d Pcam = Eigen::Matrix3d::Identity()*effPosStd*effPosStd;
 
     // Predict every landmark into this camera and precompute its predictive
-    // density in the ray tangent plane.
+    // density in the ray tangent plane. Predictions that project into the image
+    // are all reported (the visualiser draws them); the ambiguous ones simply
+    // take no part in matching or scoring.
     struct Predicted
     {
-        std::size_t idx;                    ///< Index into landmarks_
         Eigen::Vector3d uFf;                ///< Predicted unit ray in {f}
         Eigen::Matrix<double, 3, 2> T;      ///< Tangent basis at the predicted ray
         Eigen::Matrix2d Sinv;               ///< Inverse innovation covariance
         double halfLogDet2piS;              ///< 0.5*log det(2 pi S)
-        bool wellInside;                    ///< Predicted comfortably inside the image
     };
-    std::vector<Predicted> predicted;
+    std::vector<Predicted> predicted;       ///< Parallel to predictions
     predicted.reserve(landmarks_.size());
+    predictions.reserve(landmarks_.size());
     for (std::size_t j = 0; j < landmarks_.size(); ++j)
     {
         const Landmark & lm = landmarks_[j];
@@ -185,11 +186,8 @@ std::vector<SideDisambiguator::Association> SideDisambiguator::associate(
         if (!lens_.inImage(px)) continue;
 
         Predicted pr;
-        pr.idx = j;
         pr.uFf = uFf;
         pr.T = tangentBasis(uFf);
-        const double m = options.visibleMargin;
-        pr.wellInside = px.x() >= m && px.x() < lens_.width - m && px.y() >= m && px.y() < lens_.height - m;
 
         // Innovation covariance in the tangent plane: bearing noise + landmark
         // and camera position uncertainty projected across the range + camera
@@ -202,19 +200,22 @@ std::vector<SideDisambiguator::Association> SideDisambiguator::associate(
         // A bearing-only landmark viewed far from its anchor smears into a long
         // thin acceptance corridor (its radial depth variance leaks into the
         // tangent plane). Such a prediction cannot discriminate anything at
-        // this baseline: skip the landmark entirely rather than let corridor
-        // matches alias, and don't count it as predicted-visible either.
+        // this baseline: exclude the landmark from matching rather than let
+        // corridor matches alias, and don't count it as predicted-visible either.
         const double trS = S.trace();
         const double dS = std::sqrt(std::max(0.25*trS*trS - S.determinant(), 0.0));
-        if (0.5*trS + dS > options.maxTangentSigma*options.maxTangentSigma)
-        {
-            continue;
-        }
-        const double detS = S.determinant();
+
+        Prediction out;
+        out.landmark = j;
+        out.px = px;
+        const double m = options.visibleMargin;
+        out.wellInside = px.x() >= m && px.x() < lens_.width - m && px.y() >= m && px.y() < lens_.height - m;
+        out.ambiguous = 0.5*trS + dS > options.maxTangentSigma*options.maxTangentSigma;
+
         pr.Sinv = S.inverse();
-        pr.halfLogDet2piS = 0.5*std::log(detS) + std::log(2.0*M_PI);
+        pr.halfLogDet2piS = 0.5*std::log(S.determinant()) + std::log(2.0*M_PI);
         predicted.push_back(pr);
-        if (pr.wellInside) nPredictedVisible++;
+        predictions.push_back(out);
     }
 
     // Surprisal of every gated (feature, landmark) pair. The clutter hypothesis
@@ -229,11 +230,17 @@ std::vector<SideDisambiguator::Association> SideDisambiguator::associate(
         const Eigen::Vector3d uMeasF = Tfc.rotationMatrix*features[i].uPCc;
         for (std::size_t k = 0; k < predicted.size(); ++k)
         {
+            if (predictions[k].ambiguous) continue;
             const Predicted & pr = predicted[k];
             if (uMeasF.dot(pr.uFf) < cosPreGate) continue;
-            const int dist = static_cast<int>(cv::norm(landmarks_[pr.idx].descriptor,
+            const int dist = static_cast<int>(cv::norm(landmarks_[predictions[k].landmark].descriptor,
                                                        features[i].descriptor, cv::NORM_HAMMING));
             if (dist > options.maxDescriptorDistance) continue;
+            // Past both gates this corner is a plausible sighting of this
+            // landmark; if it still ends the frame unassociated it was rejected
+            // on the evidence, which is worth telling the visualiser apart from
+            // a corner nothing ever proposed a match for.
+            featureOutlier[i] = 1;
             const Eigen::Vector2d e = pr.T.transpose()*(uMeasF - pr.uFf);
             const double s = 0.5*e.dot(pr.Sinv*e) + pr.halfLogDet2piS;
             if (s < -logClutter)
@@ -246,33 +253,28 @@ std::vector<SideDisambiguator::Association> SideDisambiguator::associate(
     // Greedy one-to-one assignment by ascending surprisal (SNN).
     std::sort(pairs.begin(), pairs.end(), [](const Pair & a, const Pair & b) { return a.surprisal < b.surprisal; });
     std::vector<bool> featTaken(features.size(), false);
-    std::vector<bool> predTaken(predicted.size(), false);
     std::vector<Association> assoc;
     for (const Pair & pq : pairs)
     {
-        if (featTaken[pq.f] || predTaken[pq.p]) continue;
+        if (featTaken[pq.f] || predictions[pq.p].associated) continue;
         featTaken[pq.f] = true;
-        predTaken[pq.p] = true;
-        assoc.push_back({pq.f, predicted[pq.p].idx, pq.surprisal});
+        featureOutlier[pq.f] = 0;
+        predictions[pq.p].associated = true;
+        predictions[pq.p].feature = pq.f;
+        assoc.push_back({pq.f, predictions[pq.p].landmark, pq.surprisal});
         // Robust evidence: log ratio of the inlier predictive density to the
         // clutter density (positive by the acceptance gate above).
         score += -pq.surprisal - logClutter;
-    }
-
-    for (std::size_t k = 0; k < predicted.size(); ++k)
-    {
-        if (predicted[k].wellInside && !predTaken[k])
-        {
-            visibleMiss.push_back(predicted[k].idx);
-        }
     }
     return assoc;
 }
 
 void SideDisambiguator::updateCandidates(const std::vector<OutOfFieldFeature> & features,
                                          const std::vector<bool> & featureUsed,
-                                         const Pose<double> & Tfc, double t)
+                                         const Pose<double> & Tfc, double t,
+                                         std::vector<char> & featureGrewTrack)
 {
+    featureGrewTrack.assign(features.size(), 0);
     const Eigen::Vector3d rCFf = Tfc.translationVector;
     const double cosGate = std::cos(options.candGateAngle);
 
@@ -304,6 +306,7 @@ void SideDisambiguator::updateCandidates(const std::vector<OutOfFieldFeature> & 
         if (featMatched[pq.f] || candMatched[pq.c]) continue;
         featMatched[pq.f] = true;
         candMatched[pq.c] = true;
+        featureGrewTrack[pq.f] = 1;
 
         Candidate & cand = candidates_[pq.c];
         const Eigen::Vector3d uMeasF = Tfc.rotationMatrix*features[pq.f].uPCc;
@@ -453,30 +456,85 @@ SideDisambiguator::FrameResult SideDisambiguator::process(double t, const cv::Ma
     res.features = detector_.detect(gray, Tfc);
     const std::vector<OutOfFieldFeature> & features = res.features;
     res.nFeatures = features.size();
-    res.featureStatus.assign(features.size(), 0);
+    res.featureStatus.assign(features.size(), FEATURE_ON_CARPET);
     for (std::size_t i = 0; i < features.size(); ++i)
     {
         if (features[i].outOfField)
         {
-            res.featureStatus[i] = 1;
+            res.featureStatus[i] = FEATURE_UNMATCHED;
             res.nOutOfField++;
         }
     }
 
     // Associate the same corners against the map under both side hypotheses.
-    std::size_t visOwn = 0, visMirror = 0;
-    std::vector<std::size_t> missOwn, missMirror;
+    std::vector<Prediction> predOwn, predMirror;
+    std::vector<char> outlierOwn, outlierMirror;
     std::vector<Association> assocOwn = associate(features, Tfc, posStd, yawStd,
-                                                  res.scoreOwn, visOwn, missOwn);
+                                                  res.scoreOwn, predOwn, outlierOwn);
     std::vector<Association> assocMirror = associate(features, TfcMirror, posStd, yawStd,
-                                                     res.scoreMirror, visMirror, missMirror);
+                                                     res.scoreMirror, predMirror, outlierMirror);
+
+    // Landmarks predicted comfortably inside the image (and able to discriminate)
+    // are what makes a frame worth scoring; the unassociated ones feed the
+    // miss-streak pruning below.
+    std::vector<std::size_t> missOwn;
+    std::size_t visOwn = 0, visMirror = 0;
+    for (const Prediction & p : predOwn)
+    {
+        if (p.ambiguous || !p.wellInside) continue;
+        visOwn++;
+        if (!p.associated) missOwn.push_back(p.landmark);
+    }
+    for (const Prediction & p : predMirror)
+    {
+        if (!p.ambiguous && p.wellInside) visMirror++;
+    }
     res.nAssociated = assocOwn.size();
     res.nAssociatedMirror = assocMirror.size();
     res.nVisibleOwn = visOwn;
     res.nVisibleMirror = visMirror;
+
+    // Per-corner status for the visualiser, in order of increasing precedence:
+    // a corner rejected under one pose but associated under the other reads as
+    // associated. Mirror-only matches are exactly the wrong-side evidence the
+    // LLR accumulates, so they get their own colour rather than hiding.
+    for (std::size_t i = 0; i < features.size(); ++i)
+    {
+        if (features[i].outOfField && (outlierOwn[i] || outlierMirror[i]))
+        {
+            res.featureStatus[i] = FEATURE_OUTLIER;
+        }
+    }
+    for (const Association & a : assocMirror)
+    {
+        res.featureStatus[a.feature] = FEATURE_MIRROR;
+    }
     for (const Association & a : assocOwn)
     {
-        res.featureStatus[a.feature] = 2;
+        res.featureStatus[a.feature] = FEATURE_ASSOCIATED;
+    }
+    res.nOutlier = static_cast<std::size_t>(std::count(res.featureStatus.begin(), res.featureStatus.end(),
+                                                       static_cast<int>(FEATURE_OUTLIER)));
+
+    // Projected map landmarks for the visualiser. Statuses are as they stand
+    // after association; the maintenance pass below upgrades any that it culls.
+    std::vector<int> viewOfLandmark(landmarks_.size(), -1);
+    res.landmarkViews.reserve(predOwn.size());
+    for (const Prediction & p : predOwn)
+    {
+        LandmarkView lv;
+        lv.px = p.px;
+        lv.far = landmarks_[p.landmark].far;
+        if (p.associated)
+        {
+            lv.status = LANDMARK_ASSOCIATED;
+            lv.matchPx = features[p.feature].px;
+        }
+        else if (p.ambiguous)  lv.status = LANDMARK_AMBIGUOUS;
+        else if (p.wellInside) lv.status = LANDMARK_MISSED;
+        else                   lv.status = LANDMARK_EDGE;
+        viewOfLandmark[p.landmark] = static_cast<int>(res.landmarkViews.size());
+        res.landmarkViews.push_back(lv);
     }
 
     // Accumulate the side evidence whenever the map could have discriminated
@@ -554,6 +612,10 @@ SideDisambiguator::FrameResult SideDisambiguator::process(double t, const cv::Ma
     {
         std::vector<bool> landmarkDead(landmarks_.size(), false);
         std::vector<bool> featureUsed(features.size(), false);
+        // Flag a culled landmark in its view, if it has one this frame.
+        auto markCulled = [&](std::size_t idx, int status) {
+            if (viewOfLandmark[idx] >= 0) res.landmarkViews[viewOfLandmark[idx]].status = status;
+        };
 
         // Hits: extend the observation window and re-triangulate. A landmark
         // that stops fitting a static point (someone who stood still and then
@@ -602,12 +664,14 @@ SideDisambiguator::FrameResult SideDisambiguator::process(double t, const cv::Ma
                 else
                 {
                     landmarkDead[a.landmark] = true;
+                    markCulled(a.landmark, LANDMARK_CULLED_OUTLIER);
                     stats_.landmarkCulledChi2++;
                 }
             }
             else
             {
                 landmarkDead[a.landmark] = true;
+                markCulled(a.landmark, LANDMARK_CULLED_OUTLIER);
                 stats_.landmarkCulledChi2++;
             }
         }
@@ -618,6 +682,7 @@ SideDisambiguator::FrameResult SideDisambiguator::process(double t, const cv::Ma
             if (++landmarks_[idx].missStreak > options.maxMissStreak)
             {
                 landmarkDead[idx] = true;
+                markCulled(idx, LANDMARK_CULLED_MISSING);
                 stats_.landmarkCulledMiss++;
             }
         }
@@ -631,7 +696,15 @@ SideDisambiguator::FrameResult SideDisambiguator::process(double t, const cv::Ma
         }
         landmarks_.resize(w);
 
-        updateCandidates(features, featureUsed, Tfc, t);
+        std::vector<char> grewTrack;
+        updateCandidates(features, featureUsed, Tfc, t, grewTrack);
+        for (std::size_t i = 0; i < features.size(); ++i)
+        {
+            if (grewTrack[i] && res.featureStatus[i] < FEATURE_CANDIDATE)
+            {
+                res.featureStatus[i] = FEATURE_CANDIDATE;
+            }
+        }
 
         // Cap the map, keeping the most-reobserved landmarks.
         if (landmarks_.size() > options.maxLandmarks)

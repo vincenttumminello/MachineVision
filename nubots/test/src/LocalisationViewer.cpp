@@ -6,6 +6,7 @@
 #include "../../src/FisheyeLens.h"
 #include "../../src/LocalisationViewer.h"
 #include "../../src/Pose.hpp"
+#include "../../src/SideDisambiguator.h"
 
 // Build one plausible frame: robot 1 m behind centre facing +x, camera level,
 // seeing a +x goal post and a field-line point.
@@ -33,9 +34,18 @@ static ViewerFrame makeFrame(const FieldMap & map)
     const Eigen::Vector3d post = map.landmarks(LandmarkType::GOAL_POST).front();
     const Eigen::Vector3d ray = (Rcf*(post - rCFf)).normalized();
     DetectionView d;
-    d.name = "goal post"; d.confidence = 0.9; d.used = true;
+    d.name = "goal post"; d.confidence = 0.9; d.status = DetectionStatus::ASSOCIATED;
     d.corners << ray, ray, ray, ray;
     vf.detections.push_back(d);
+
+    // A second detection the estimator could not associate, so the camera panel
+    // exercises both branches of the association colour key.
+    DetectionView unassoc;
+    unassoc.name = "L-intersection"; unassoc.confidence = 0.8;
+    unassoc.status = DetectionStatus::UNASSOCIATED;
+    const Eigen::Vector3d stray = Eigen::Vector3d(3.0, 1.0, -0.5).normalized();
+    unassoc.corners << stray, stray, stray, stray;
+    vf.detections.push_back(unassoc);
 
     AssociationView a;
     a.measRay = ray; a.landmark = post;
@@ -66,6 +76,19 @@ static ViewerFrame makeFrame(const FieldMap & map)
                                Eigen::Matrix3d::Identity()*0.01, false});
     vf.oofLandmarks.push_back({Eigen::Vector3d(-7.0, -3.0, 2.0),
                                Eigen::Matrix3d::Identity()*4.0, true});
+
+    // Out-of-field corners and projected map landmarks, one per status, so the
+    // camera panel's association colour key is exercised end to end.
+    vf.oofVisibleMargin = 30.0;
+    for (int s = SideDisambiguator::FEATURE_ON_CARPET; s <= SideDisambiguator::FEATURE_ASSOCIATED; ++s)
+    {
+        vf.oofFeatures.push_back({Eigen::Vector2d(200.0 + 40.0*s, 300.0), s});
+    }
+    for (int s = SideDisambiguator::LANDMARK_EDGE; s <= SideDisambiguator::LANDMARK_CULLED_OUTLIER; ++s)
+    {
+        vf.oofLandmarkProj.push_back({Eigen::Vector2d(200.0 + 40.0*s, 380.0),
+                                      Eigen::Vector2d(210.0 + 40.0*s, 300.0), s, s % 2 == 0});
+    }
     return vf;
 }
 

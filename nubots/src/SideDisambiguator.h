@@ -175,6 +175,47 @@ public:
     };
 
     /**
+     * @brief What happened to one detected corner this frame (visualiser colour key).
+     *
+     * Values are ordered by precedence: a corner that qualifies for several is
+     * reported as the highest one.
+     */
+    enum FeatureStatus
+    {
+        FEATURE_ON_CARPET = 0,  ///< Masked out by the carpet classification: not a background feature
+        FEATURE_UNMATCHED,      ///< Out-of-field, but nothing in the map or candidate pool claimed it
+        FEATURE_CANDIDATE,      ///< Grew an existing candidate track (not a landmark yet)
+        FEATURE_OUTLIER,        ///< Gated to a landmark but rejected: clutter explains it better, or
+                                ///< it lost the one-to-one assignment to a closer corner
+        FEATURE_MIRROR,         ///< Associated only under the mirrored pose (wrong-side evidence)
+        FEATURE_ASSOCIATED      ///< Associated to a map landmark at the current pose
+    };
+
+    /**
+     * @brief What happened to one map landmark predicted into the current camera.
+     */
+    enum LandmarkStatus
+    {
+        LANDMARK_EDGE = 0,      ///< Projects into the image but within visibleMargin of the border,
+                                ///< so it is not counted as predicted-visible
+        LANDMARK_AMBIGUOUS,     ///< Predicted bearing too smeared to discriminate the mirror
+                                ///< (maxTangentSigma): excluded from matching and from scoring
+        LANDMARK_MISSED,        ///< Predicted well inside the image, no corner associated with it
+        LANDMARK_ASSOCIATED,    ///< Associated to a corner this frame
+        LANDMARK_CULLED_MISSING,///< Culled this frame: maxMissStreak predicted-visible frames without a hit
+        LANDMARK_CULLED_OUTLIER ///< Culled this frame: its window stopped fitting one static point (mover)
+    };
+
+    /// @brief A map landmark projected into the camera image, with its per-frame status.
+    struct LandmarkView
+    {
+        Eigen::Vector2d px = Eigen::Vector2d::Zero();       ///< Predicted pixel position at the current pose
+        Eigen::Vector2d matchPx = Eigen::Vector2d::Zero();  ///< Pixel of the matched corner (ASSOCIATED only)
+        int status = LANDMARK_EDGE;     ///< LandmarkStatus
+        bool far = false;               ///< Bearing-only landmark (no reliable depth)
+    };
+
+    /**
      * @brief Per-frame result: association counts, side scores and the decision state.
      */
     struct FrameResult
@@ -183,6 +224,7 @@ public:
         std::size_t nOutOfField = 0;    ///< ... classified out-of-field
         std::size_t nAssociated = 0;    ///< ... associated to map landmarks at the current pose
         std::size_t nAssociatedMirror = 0; ///< ... associated at the mirrored pose
+        std::size_t nOutlier = 0;       ///< ... gated to a landmark but rejected (under either pose)
         std::size_t nVisibleOwn = 0;    ///< Landmarks predicted well inside the image at the current pose
         std::size_t nVisibleMirror = 0; ///< ... at the mirrored pose
         std::size_t nLandmarks = 0;     ///< Live map landmarks
@@ -193,7 +235,8 @@ public:
         bool mapFrozen = false;         ///< Map building was frozen this frame
         bool flipRequested = false;     ///< The evidence says the filter is on the wrong side
         std::vector<OutOfFieldFeature> features;    ///< The detected corners (for display)
-        std::vector<int> featureStatus; ///< Per detected corner: 0 on-carpet, 1 out-of-field, 2 associated
+        std::vector<int> featureStatus; ///< Per detected corner: a FeatureStatus
+        std::vector<LandmarkView> landmarkViews;    ///< Map landmarks projected into the image at the current pose
     };
 
     /**
@@ -273,6 +316,18 @@ private:
         double surprisal;       ///< Negative log predictive density [nats]
     };
 
+    /// @brief One landmark predicted into a camera, and what became of it.
+    struct Prediction
+    {
+        std::size_t landmark;   ///< Index into landmarks_
+        Eigen::Vector2d px;     ///< Predicted pixel position
+        bool wellInside;        ///< Predicted at least visibleMargin inside the image border
+        bool ambiguous;         ///< Predicted bearing too smeared to discriminate (maxTangentSigma):
+                                ///< excluded from matching, from scoring and from the miss count
+        bool associated = false;///< Claimed by a corner in the one-to-one assignment
+        std::size_t feature = 0;///< The claiming corner (associated only)
+    };
+
     /**
      * @brief SNN association of out-of-field features against the map at a pose.
      * @param features Detected features (only out-of-field ones participate)
@@ -280,13 +335,15 @@ private:
      * @param posStd Horizontal position std [m] (inflates the predictive covariance)
      * @param yawStd Yaw std [rad] (inflates the predictive covariance)
      * @param score Output: robust side score, sum of log(inlier/clutter) density ratios
-     * @param nPredictedVisible Output: landmarks predicted well inside the image
-     * @param visibleMiss Output: indices of landmarks predicted visible but unassociated
+     * @param predictions Output: every landmark that projects into the image, with its outcome
+     * @param featureOutlier Output (per feature): the corner was gated to at least one landmark
+     *                       but ended up unassociated -- rejected as clutter or beaten in the
+     *                       one-to-one assignment
      */
     std::vector<Association> associate(const std::vector<OutOfFieldFeature> & features,
                                        const Pose<double> & Tfc, double posStd, double yawStd,
-                                       double & score, std::size_t & nPredictedVisible,
-                                       std::vector<std::size_t> & visibleMiss) const;
+                                       double & score, std::vector<Prediction> & predictions,
+                                       std::vector<char> & featureOutlier) const;
 
     /// @brief Why a triangulation attempt was rejected (or OK).
     enum class TriResult { OK, GEOMETRY, RANGE, CHI2 };
@@ -315,10 +372,14 @@ private:
      */
     bool fitFar(const std::vector<Landmark::Obs> & obs, Eigen::Vector3d & rPFf, Eigen::Matrix3d & P) const;
 
-    /// @brief Grow candidate tracks with unmatched features; promote mature ones.
+    /**
+     * @brief Grow candidate tracks with unmatched features; promote mature ones.
+     * @param featureGrewTrack Output (per feature): the corner extended an existing candidate track
+     */
     void updateCandidates(const std::vector<OutOfFieldFeature> & features,
                           const std::vector<bool> & featureUsed,
-                          const Pose<double> & Tfc, double t);
+                          const Pose<double> & Tfc, double t,
+                          std::vector<char> & featureGrewTrack);
 
     const FisheyeLens & lens_;
     OutOfFieldDetector detector_;

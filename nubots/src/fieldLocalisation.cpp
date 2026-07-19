@@ -856,9 +856,11 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
 
             if (nOofFrames % 100 == 0 || side.llr < 0.0)
             {
-                std::println("  side t={:6.1f}s: {} landmarks, {} candidates, assoc {}/{} visible {}/{} own/mirror, llr {:+.1f}{}",
+                std::println("  side t={:6.1f}s: {} landmarks, {} candidates, assoc {}/{} visible {}/{} own/mirror, "
+                             "{} corners rejected, llr {:+.1f}{}",
                              t, side.nLandmarks, side.nCandidates, side.nAssociated, side.nAssociatedMirror,
-                             side.nVisibleOwn, side.nVisibleMirror, side.llr, side.mapFrozen ? " [frozen]" : "");
+                             side.nVisibleOwn, side.nVisibleMirror, side.nOutlier, side.llr,
+                             side.mapFrozen ? " [frozen]" : "");
             }
 
             if (side.flipRequested)
@@ -919,18 +921,35 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                 }
             }
 
-            // Raw YOLO detections (boxes), flagged by whether the estimator uses the class.
+            // Raw YOLO detections (boxes), each flagged with what the landmark
+            // measurement did with it: associated, gated out, dropped for low
+            // confidence, or never a landmark class at all.
             auto usedClass = [](const std::string & n) {
                 return n == "L-intersection" || n == "T-intersection" || n == "X-intersection" || n == "goal post";
             };
-            for (const Detection & det : v.detections)
+            std::vector<DetectionStatus> detStatus(v.detections.size(), DetectionStatus::UNUSED_CLASS);
+            for (std::size_t i = 0; i < v.detections.size(); ++i)
             {
-                if (!det.corners.allFinite()) continue;
+                if (usedClass(v.detections[i].name))
+                {
+                    detStatus[i] = DetectionStatus::LOW_CONFIDENCE;
+                }
+            }
+            for (const auto & o : meas.detectionOutcomes())
+            {
+                // Every detection that reached association cleared the class and
+                // confidence filters, so it is at worst UNASSOCIATED.
+                detStatus[o.detection] = o.associated ? DetectionStatus::ASSOCIATED
+                                                      : DetectionStatus::UNASSOCIATED;
+            }
+            for (std::size_t i = 0; i < v.detections.size(); ++i)
+            {
+                if (!v.detections[i].corners.allFinite()) continue;
                 DetectionView dv;
-                dv.name = det.name;
-                dv.confidence = det.confidence;
-                dv.corners = det.corners;
-                dv.used = usedClass(det.name);
+                dv.name = v.detections[i].name;
+                dv.confidence = v.detections[i].confidence;
+                dv.corners = v.detections[i].corners;
+                dv.status = detStatus[i];
                 vf.detections.push_back(std::move(dv));
             }
 
@@ -952,10 +971,18 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                 {
                     vf.oofFeatures.push_back({side.features[i].px, side.featureStatus[i]});
                 }
+                // Map landmarks projected into this camera, with what became of
+                // each (in FOV / associated / missed / culled as an outlier).
+                vf.oofLandmarkProj.reserve(side.landmarkViews.size());
+                for (const SideDisambiguator::LandmarkView & lv : side.landmarkViews)
+                {
+                    vf.oofLandmarkProj.push_back({lv.px, lv.matchPx, lv.status, lv.far});
+                }
                 vf.hasSide = true;
                 vf.sideLlr = side.llr;
                 vf.nOofLandmarks = side.nLandmarks;
                 vf.sideFrozen = side.mapFrozen;
+                vf.oofVisibleMargin = sideDis.options.visibleMargin;
 
                 // Snapshot of the out-of-field landmark map for the 3D panel.
                 vf.oofLandmarks.reserve(sideDis.landmarks().size());

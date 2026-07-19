@@ -200,6 +200,32 @@ so a wrong-side excursion can never poison the map. Two flip paths exist:
 Verified by injected kidnaps (`KIDNAP_T=<s>`): detection + flip in ~7–15 s,
 with re-convergence to <0.15 m within a second of the flip.
 
+Note the out-of-field map is *not* part of the filter state — it is a
+side-channel owned by `SideDisambiguator`, and its only coupling back to the
+estimator is the discrete 180° flip. Outlier rejection therefore happens at
+association and map-maintenance time rather than in a measurement update.
+
+## Reading the camera panel
+
+Data association is what the camera panel exists to debug, so both landmark
+streams are colour-keyed by what the estimator did with each observation
+(key drawn bottom-left; `k` hides it):
+
+| Colour | Meaning |
+| --- | --- |
+| green | associated — YOLO detection, out-of-field corner (`o`) or map landmark (`[]`, with a line to its corner showing the residual) |
+| amber | seen but unclaimed — landmark predicted in FOV that nothing matched, or a YOLO detection below the confidence threshold |
+| red | rejected — corner gated to a landmark but beaten by clutter or by a closer corner (`x`), landmark culled this frame, or a usable YOLO detection outside the association gate |
+| yellow | corner that matches the **mirrored** pose only: the wrong-side evidence the LLR accumulates |
+| blue / cyan | corner growing a candidate track / out-of-field and unclaimed |
+| mauve | landmark whose predicted bearing is too smeared to discriminate the mirror (`maxTangentSigma`) — excluded from matching *and* from scoring |
+| grey | not in play: outside the FOV margin, or a YOLO class that is not a mapped landmark |
+
+YOLO boxes keep their per-class colour so the class stays readable; the
+status rides on the measurement dot, the label and the line thickness. The
+thin rectangle inset from the border is `visibleMargin`: a landmark counts as
+predicted-visible (and so may score and accrue misses) only inside it.
+
 ## Evaluation and ground truth
 
 `data2/` carries OptiTrack mocap of the robot (~120 Hz) alongside the sensor
