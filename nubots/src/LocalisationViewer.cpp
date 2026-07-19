@@ -785,15 +785,19 @@ cv::Mat LocalisationViewer::render3DPanel(const std::vector<ViewerFrame> & frame
 
     // ---- out-of-field landmark map (background structure used for side disambiguation) ----
     // Depth is what this view exists to show, so it must not imply precision the
-    // map does not have. Most landmarks are bearing-only: fitFar() parks them at
-    // an assumed range along the measured bearing with a 3-sigma radial spread of
-    // half that range again, so they genuinely do lie on a shell around whichever
-    // camera position anchored them. Drawing a full ellipsoid for those fills the
-    // screen; drawing nothing (the previous behaviour) hid the fact entirely.
-    // Instead, anything whose 3-sigma ellipsoid is longer than kEllipsoidMax in
-    // its dominant direction is drawn as that principal axis alone -- an "the
-    // landmark is somewhere along here" bar -- and only genuinely localised
+    // map does not have: a landmark whose 3-sigma ellipsoid is longer than
+    // kEllipsoidMax in its dominant direction gets that principal axis alone --
+    // an "it is somewhere along here" bar -- and only genuinely localised
     // landmarks get the full three-ring ellipsoid.
+    //
+    // Bearing-only landmarks are deliberately excluded from that. Their radial
+    // spread is not an estimate of anything: fitFar() parks them at a fixed
+    // assumedRange and hardcodes the radial sigma at half of it, so the bar
+    // would be the same length for every one of them and would draw a fan of
+    // hundreds of identical rays through the scene -- visual noise dressed up as
+    // a measurement. The HUD line and the run summary state the assumed range
+    // and the split instead, which carries the same information without
+    // swamping the map.
     constexpr double kEllipsoidMax = 1.5;   ///< Longest 3-sigma semi-axis still drawn as an ellipsoid [m]
     const Eigen::Vector3d camPos = cur.Tfc.translationVector;
     std::size_t nFar = 0, nBar = 0;
@@ -818,18 +822,17 @@ cv::Mat LocalisationViewer::render3DPanel(const std::vector<ViewerFrame> & frame
             {
                 ellipsoid3(lm.pos, lm.cov, col, 1);
             }
-            else if (lm.status == SideDisambiguator::LANDMARK_ASSOCIATED)
+            else if (!lm.far && lm.status == SideDisambiguator::LANDMARK_ASSOCIATED)
             {
-                // Bars only for the landmarks carrying evidence this frame. Every
-                // poorly-constrained landmark drawn at once (the honest picture,
-                // but hundreds of overlapping rays) buries the scene; the ones
-                // actually being matched make the same point legibly, and the HUD
-                // reports the aggregate.
+                // Triangulated but loosely constrained, and carrying evidence this
+                // frame: here the elongation is a real measurement outcome worth
+                // seeing. Restricting to associated landmarks keeps the count low
+                // enough to read.
                 //
                 // The bar is the dominant 3-sigma axis, clipped to a plausible
-                // range from the camera: unclipped, the radial interval on a 6 m
-                // landmark reaches behind the camera -- a real artefact of putting
-                // a symmetric Gaussian on a strictly positive depth.
+                // range from the camera: unclipped, the radial interval on a
+                // nearby landmark reaches behind the camera -- a real artefact of
+                // putting a symmetric Gaussian on a strictly positive depth.
                 const Eigen::Vector3d axis = es.eigenvectors().col(2)*ext;
                 auto clip = [&](const Eigen::Vector3d & q) -> Eigen::Vector3d {
                     const Eigen::Vector3d rel = q - camPos;
@@ -928,8 +931,9 @@ cv::Mat LocalisationViewer::render3DPanel(const std::vector<ViewerFrame> & frame
         hudText(panel, std::format("out-of-field map: {} landmarks, {} bearing-only (position is an ASSUMED "
                                    "range, not a triangulation)", cur.oofLandmarks.size(), nFar),
                 cv::Point(10, 66), 0.42, cv::Scalar(255, 255, 180));
-        hudText(panel, std::format("{} associated landmarks show a bar = 3-sigma along the dominant (usually "
-                                   "depth) axis; ellipsoid only where 3-sigma < {:.1f} m", nBar, kEllipsoidMax),
+        hudText(panel, std::format("bearing-only depth is drawn as a dot only (the spread is assumed, not "
+                                   "measured); {} triangulated show a 3-sigma bar, ellipsoid below {:.1f} m",
+                                   nBar, kEllipsoidMax),
                 cv::Point(10, 88), 0.42, cv::Scalar(255, 255, 180));
     }
 

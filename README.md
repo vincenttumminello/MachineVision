@@ -261,12 +261,16 @@ actually detected. Neither endpoint is ground truth, and the gap mixes three
 error sources — landmark position error (large; see the depth note above),
 pose error, and corner noise.
 
-The 3D pane (`3`) uses the same colour key for the map, and shows depth
-honestly: a landmark whose 3σ ellipsoid is compact (< 1.5 m) gets the full
-three-ring wireframe, while the poorly-constrained majority get a **bar along
-the dominant 3σ axis** — "somewhere along here". Bars are drawn only for
-landmarks associated in the current frame, because drawing all several hundred
-at once is accurate but unreadable.
+The 3D pane (`3`) uses the same colour key for the map. A triangulated
+landmark whose 3σ ellipsoid is compact (< 1.5 m) gets the full three-ring
+wireframe; a looser one, if associated in the current frame, gets a **bar
+along the dominant 3σ axis** — "somewhere along here".
+
+Bearing-only landmarks get a dot and nothing else. Their radial spread is not
+an estimate: `fitFar()` fixes the range at `assumedRange` and the radial sigma
+at half of it, so every bar would be identical in length and the pane would
+fill with hundreds of interchangeable rays — noise dressed up as measurement.
+The HUD line and the `map depth:` summary carry that information instead.
 
 ## Evaluation and ground truth
 
