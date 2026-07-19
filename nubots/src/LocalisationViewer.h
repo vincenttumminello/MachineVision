@@ -93,7 +93,9 @@ struct OofLandmarkView
 {
     Eigen::Vector3d pos = Eigen::Vector3d::Zero();  ///< Position in {f}
     Eigen::Matrix3d cov = Eigen::Matrix3d::Identity();///< Position covariance in {f}
-    bool far = false;                                ///< Bearing-only (huge radial variance)
+    bool far = false;                                ///< Bearing-only: the position is an assumed range
+                                                     ///< along the measured bearing, not a triangulation
+    int status = 0;                                  ///< SideDisambiguator::LandmarkStatus this frame
 };
 
 /// @brief Everything needed to render both panels for one processed frame.

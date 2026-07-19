@@ -14,8 +14,8 @@
 namespace
 {
 
-constexpr int    kPanelH   = 760;    ///< Panel height [px]
-constexpr int    kHeaderH  = 36;     ///< Header strip height [px]
+constexpr int    kPanelH   = 760*1.25;    ///< Panel height [px]
+constexpr int    kHeaderH  = 36*1.25;     ///< Header strip height [px]
 constexpr double kHalfFov  = 75.0*M_PI/180.0;  ///< Half field-of-view for the top-down wedge
 
 // True capture rate, derived from the recorded frame times. Container fps metadata
@@ -88,6 +88,23 @@ const cv::Scalar kColCandidate (230, 170, 80);    // steel:   growing a candidat
 const cv::Scalar kColUnmatched (255, 255, 0);     // cyan:    usable background corner, unclaimed
 const cv::Scalar kColInactive  (130, 130, 130);   // grey:    outside the FOV margin / not in play
 const cv::Scalar kColAmbiguous (200, 140, 200);   // mauve:   too smeared to discriminate the mirror
+const cv::Scalar kColOffView   (85, 80, 75);      // dim:     mapped but not in view at this pose
+
+// Status -> colour for an out-of-field map landmark, shared by both panels so
+// a landmark reads the same in the camera view and in the 3D map.
+cv::Scalar landmarkStatusColour(int status)
+{
+    switch (status)
+    {
+        case SideDisambiguator::LANDMARK_ASSOCIATED:     return kColAssociated;
+        case SideDisambiguator::LANDMARK_MISSED:         return kColMissed;
+        case SideDisambiguator::LANDMARK_AMBIGUOUS:      return kColAmbiguous;
+        case SideDisambiguator::LANDMARK_EDGE:           return kColInactive;
+        case SideDisambiguator::LANDMARK_CULLED_MISSING:
+        case SideDisambiguator::LANDMARK_CULLED_OUTLIER: return kColOutlier;
+        default:                                         return kColOffView;
+    }
+}
 
 // Compact colour legend drawn in the bottom-left corner of a panel.
 struct LegendEntry
@@ -237,16 +254,10 @@ cv::Mat LocalisationViewer::renderCameraPanel(const ViewerFrame & f, const cv::M
         {
             if (lp.status != pass) continue;
             const cv::Point2d p = toPanel(lp.px);
-            int r = 4;
-            cv::Scalar col = kColInactive;
-            switch (lp.status)
-            {
-                case SideDisambiguator::LANDMARK_EDGE:      col = kColInactive;  r = 3; break;
-                case SideDisambiguator::LANDMARK_AMBIGUOUS: col = kColAmbiguous; r = 3; break;
-                case SideDisambiguator::LANDMARK_MISSED:    col = kColMissed;    break;
-                case SideDisambiguator::LANDMARK_ASSOCIATED:col = kColAssociated;break;
-                default:                                    col = kColOutlier;   r = 5; break;
-            }
+            const cv::Scalar col = landmarkStatusColour(lp.status);
+            const int r = lp.status == SideDisambiguator::LANDMARK_EDGE
+                       || lp.status == SideDisambiguator::LANDMARK_AMBIGUOUS ? 3
+                        : lp.status >= SideDisambiguator::LANDMARK_CULLED_MISSING ? 5 : 4;
             cv::rectangle(panel, p + cv::Point2d(-r, -r), p + cv::Point2d(r, r), col, 1, cv::LINE_AA);
             if (lp.far)
             {
@@ -255,8 +266,12 @@ cv::Mat LocalisationViewer::renderCameraPanel(const ViewerFrame & f, const cv::M
             }
             if (lp.status == SideDisambiguator::LANDMARK_ASSOCIATED)
             {
-                // Link to the corner that claimed it: the segment is the
-                // association residual, drawn at the same scale as the image.
+                // Link to the corner that claimed it. This is an INNOVATION, not a
+                // frame-to-frame motion: the box is where the stored landmark
+                // reprojects through the current pose estimate, the circle is where
+                // the corner was actually detected. It therefore mixes landmark
+                // position error (large -- most landmarks have no triangulated
+                // depth), pose error and corner noise, and is not ground truth.
                 cv::line(panel, p, toPanel(lp.matchPx), kColAssociated, 1, cv::LINE_AA);
             }
             else if (lp.status == SideDisambiguator::LANDMARK_CULLED_MISSING
@@ -479,7 +494,7 @@ cv::Mat LocalisationViewer::renderCameraPanel(const ViewerFrame & f, const cv::M
         // Map landmarks are the [] glyphs; the thin rectangle is the border
         // inside which one counts as predicted-visible ("in FOV").
         if (countLandmarks(SideDisambiguator::LANDMARK_ASSOCIATED) > 0)
-            legend.push_back({kColAssociated, "landmark []: associated (line = residual)"});
+            legend.push_back({kColAssociated, "landmark []: associated; line = innovation ([] predicted -> o detected)"});
         if (countLandmarks(SideDisambiguator::LANDMARK_MISSED) > 0)
             legend.push_back({kColMissed, "landmark []: in FOV, nothing matched it"});
         if (countLandmarks(SideDisambiguator::LANDMARK_AMBIGUOUS) > 0)
@@ -769,22 +784,62 @@ cv::Mat LocalisationViewer::render3DPanel(const std::vector<ViewerFrame> & frame
     const ViewerFrame & cur = frames[idx];
 
     // ---- out-of-field landmark map (background structure used for side disambiguation) ----
-    std::size_t nFar = 0;
-    for (const OofLandmarkView & lm : cur.oofLandmarks)
+    // Depth is what this view exists to show, so it must not imply precision the
+    // map does not have. Most landmarks are bearing-only: fitFar() parks them at
+    // an assumed range along the measured bearing with a 3-sigma radial spread of
+    // half that range again, so they genuinely do lie on a shell around whichever
+    // camera position anchored them. Drawing a full ellipsoid for those fills the
+    // screen; drawing nothing (the previous behaviour) hid the fact entirely.
+    // Instead, anything whose 3-sigma ellipsoid is longer than kEllipsoidMax in
+    // its dominant direction is drawn as that principal axis alone -- an "the
+    // landmark is somewhere along here" bar -- and only genuinely localised
+    // landmarks get the full three-ring ellipsoid.
+    constexpr double kEllipsoidMax = 1.5;   ///< Longest 3-sigma semi-axis still drawn as an ellipsoid [m]
+    const Eigen::Vector3d camPos = cur.Tfc.translationVector;
+    std::size_t nFar = 0, nBar = 0;
+    // Dim off-view landmarks first so the ones in play sit on top.
+    for (int pass = 0; pass < 2; ++pass)
     {
-        cv::Point2d p;
-        if (!project(lm.pos, p)) continue;
-        if (lm.far)
+        for (const OofLandmarkView & lm : cur.oofLandmarks)
         {
-            // Bearing-only: depth is a placeholder, so an ellipsoid would just be
-            // a screen-filling radial cigar. A dot at the assumed range suffices.
-            cv::circle(panel, p, 1, cv::Scalar(60, 110, 140), cv::FILLED, cv::LINE_AA);
-            nFar++;
-        }
-        else
-        {
-            cv::circle(panel, p, 2, cv::Scalar(80, 190, 220), cv::FILLED, cv::LINE_AA);
-            ellipsoid3(lm.pos, lm.cov, cv::Scalar(60, 120, 140), 1, 0.75);
+            const bool inPlay = lm.status != SideDisambiguator::LANDMARK_NOT_IN_VIEW;
+            if (inPlay != (pass == 1)) continue;   // Each landmark is visited exactly once across the passes
+            if (lm.far) nFar++;
+
+            const cv::Scalar col = landmarkStatusColour(lm.status);
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(lm.cov);
+            if (es.info() != Eigen::Success) continue;
+            const double ext = 3.0*std::sqrt(std::max(0.0, es.eigenvalues()(2)));
+
+            cv::Point2d p;
+            if (project(lm.pos, p)) cv::circle(panel, p, inPlay ? 2 : 1, col, cv::FILLED, cv::LINE_AA);
+
+            if (ext <= kEllipsoidMax)
+            {
+                ellipsoid3(lm.pos, lm.cov, col, 1);
+            }
+            else if (lm.status == SideDisambiguator::LANDMARK_ASSOCIATED)
+            {
+                // Bars only for the landmarks carrying evidence this frame. Every
+                // poorly-constrained landmark drawn at once (the honest picture,
+                // but hundreds of overlapping rays) buries the scene; the ones
+                // actually being matched make the same point legibly, and the HUD
+                // reports the aggregate.
+                //
+                // The bar is the dominant 3-sigma axis, clipped to a plausible
+                // range from the camera: unclipped, the radial interval on a 6 m
+                // landmark reaches behind the camera -- a real artefact of putting
+                // a symmetric Gaussian on a strictly positive depth.
+                const Eigen::Vector3d axis = es.eigenvectors().col(2)*ext;
+                auto clip = [&](const Eigen::Vector3d & q) -> Eigen::Vector3d {
+                    const Eigen::Vector3d rel = q - camPos;
+                    const double r = rel.norm();
+                    if (r < 1e-6) return q;
+                    return camPos + rel*(std::clamp(r, 0.5, 25.0)/r);
+                };
+                line3(clip(lm.pos - axis), clip(lm.pos + axis), col, 1);
+                nBar++;
+            }
         }
     }
 
@@ -869,9 +924,14 @@ cv::Mat LocalisationViewer::render3DPanel(const std::vector<ViewerFrame> & frame
         hudText(panel, s, cv::Point(10, 44), 0.42, cv::Scalar(180, 255, 180));
     }
     if (!cur.oofLandmarks.empty())
-        hudText(panel, std::format("out-of-field map: {} landmarks ({} bearing-only, drawn without ellipsoids)",
-                                   cur.oofLandmarks.size(), nFar),
+    {
+        hudText(panel, std::format("out-of-field map: {} landmarks, {} bearing-only (position is an ASSUMED "
+                                   "range, not a triangulation)", cur.oofLandmarks.size(), nFar),
                 cv::Point(10, 66), 0.42, cv::Scalar(255, 255, 180));
+        hudText(panel, std::format("{} associated landmarks show a bar = 3-sigma along the dominant (usually "
+                                   "depth) axis; ellipsoid only where 3-sigma < {:.1f} m", nBar, kEllipsoidMax),
+                cv::Point(10, 88), 0.42, cv::Scalar(255, 255, 180));
+    }
 
     // ---- legend ----
     if (showLegend_)
@@ -885,9 +945,21 @@ cv::Mat LocalisationViewer::render3DPanel(const std::vector<ViewerFrame> & frame
         legend.push_back({cv::Scalar(255, 0, 200), "3-sigma position ellipsoid", true});
         if (!cur.oofLandmarks.empty())
         {
-            legend.push_back({cv::Scalar(80, 190, 220), "out-of-field landmark (+ 3-sigma ellipsoid)"});
-            if (nFar > 0)
-                legend.push_back({cv::Scalar(60, 110, 140), "out-of-field bearing-only landmark"});
+            // Same association key as the camera panel, so a landmark reads the
+            // same colour in both views.
+            auto haveStatus = [&](int s) {
+                return std::any_of(cur.oofLandmarks.begin(), cur.oofLandmarks.end(),
+                                   [&](const OofLandmarkView & lm) { return lm.status == s; });
+            };
+            if (haveStatus(SideDisambiguator::LANDMARK_ASSOCIATED))
+                legend.push_back({kColAssociated, "oof landmark: associated this frame"});
+            if (haveStatus(SideDisambiguator::LANDMARK_MISSED))
+                legend.push_back({kColMissed, "oof landmark: in FOV, nothing matched it"});
+            if (haveStatus(SideDisambiguator::LANDMARK_AMBIGUOUS))
+                legend.push_back({kColAmbiguous, "oof landmark: too smeared to discriminate"});
+            if (haveStatus(SideDisambiguator::LANDMARK_EDGE))
+                legend.push_back({kColInactive, "oof landmark: at the FOV margin"});
+            legend.push_back({kColOffView, "oof landmark: mapped, not in view here"});
         }
         legend.push_back({cv::Scalar(0, 200, 255), "camera optical axis"});
         drawPanelLegend(panel, legend);

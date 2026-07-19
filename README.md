@@ -153,10 +153,18 @@ optional Gaussian-mixture hypothesis bank):
 - **Field landmarks** (`MeasurementFieldLandmarks`): YOLO detections arrive
   as calibrated unit rays in the camera frame (the fisheye model is already
   applied upstream), classes = goal posts and L/T/X line intersections.
-  Rays are gated (20°) and nearest-neighbour associated against the known
-  field map at the prior mean; the likelihood is a robust inlier-Gaussian +
-  uniform-clutter mixture on the unit sphere (σ = 0.25 rad, inlier weight
-  0.7), so gross mis-detections are absorbed rather than fought.
+  Rays are pre-gated (20°) and associated against the known field map at the
+  prior mean by **surprisal nearest neighbour**: pairs are ranked and accepted
+  by surprisal in the tangent plane of the predicted bearing, relative to the
+  clutter crossover, rather than by raw angle. The likelihood is a robust
+  inlier-Gaussian + uniform-clutter mixture on the unit sphere (σ = 0.25 rad),
+  so gross mis-detections are absorbed rather than fought.
+  The inlier weight is **per-detection, taken from the YOLO confidence**
+  (w ≈ confidence, capped at 0.95): confidence is a statement about whether the
+  box is a true positive, which is what the mixture weight means — inflating σ
+  instead would claim the landmark is certainly real but poorly measured. As
+  w → 0 the term flattens towards clutter, contributing to neither the gradient
+  nor the Hessian, so weak detections cannot sharpen the posterior.
 - **Gravity** (`MeasurementGravity`): accelerometer direction observes roll
   and pitch.
 - **Kinematic height** (`MeasurementKinematicHeight`): torso height from the
@@ -205,6 +213,26 @@ side-channel owned by `SideDisambiguator`, and its only coupling back to the
 estimator is the discrete 180° flip. Outlier rejection therefore happens at
 association and map-maintenance time rather than in a measurement update.
 
+**The map has almost no depth, by construction.** Background structure rarely
+accrues parallax above pose jitter, so the overwhelming majority of promotions
+are *bearing-only*: `fitFar()` parks them at `assumedRange` (6 m) along the
+measured bearing with a 3σ radial spread of 9 m. On `data2` that is ~4300
+bearing-only against ~30 triangulated. Two consequences worth knowing before
+reading the 3D view or trying to reuse the map:
+
+- Bearing-only landmarks lie on a **shell** around whichever camera position
+  anchored them. That is the dominant feature of the 3D map and is expected,
+  not a rendering bug — the run summary prints the split so it is not a
+  surprise.
+- The map can answer *"am I mirrored?"* — a binary question with a 180° margin
+  that survives gross depth error — but not *"where exactly am I?"*. Feeding
+  these landmarks in as position measurements would be wrong twice over: the
+  assumed range biases the predicted bearing as soon as the camera translates,
+  and the positions are themselves a function of past pose estimates, so
+  treating them as independent evidence double-counts information and collapses
+  the covariance. Using them metrically means putting them **in** the state with
+  their pose cross-covariances, i.e. actual SLAM.
+
 ## Reading the camera panel
 
 Data association is what the camera panel exists to debug, so both landmark
@@ -225,6 +253,20 @@ YOLO boxes keep their per-class colour so the class stays readable; the
 status rides on the measurement dot, the label and the line thickness. The
 thin rectangle inset from the border is `visibleMargin`: a landmark counts as
 predicted-visible (and so may score and accrue misses) only inside it.
+
+The line joining an associated landmark to its corner is an **innovation, not
+a frame-to-frame motion**: the box is where the stored landmark reprojects
+through the *current pose estimate*, the circle is where the corner was
+actually detected. Neither endpoint is ground truth, and the gap mixes three
+error sources — landmark position error (large; see the depth note above),
+pose error, and corner noise.
+
+The 3D pane (`3`) uses the same colour key for the map, and shows depth
+honestly: a landmark whose 3σ ellipsoid is compact (< 1.5 m) gets the full
+three-ring wireframe, while the poorly-constrained majority get a **bar along
+the dominant 3σ axis** — "somewhere along here". Bars are drawn only for
+landmarks associated in the current frame, because drawing all several hundred
+at once is accurate but unreadable.
 
 ## Evaluation and ground truth
 

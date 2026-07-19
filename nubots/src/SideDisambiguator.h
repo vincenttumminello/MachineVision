@@ -163,6 +163,8 @@ public:
         int hits = 0;                   ///< Number of associated observations
         int missStreak = 0;             ///< Consecutive predicted-visible frames without association
         double lastSeen = 0.0;          ///< Time of the last associated observation [s]
+        int lastStatus = 0;             ///< LandmarkStatus this frame (travels with the landmark, so it
+                                        ///< stays correct across map compaction; for the 3D view)
 
         /// @brief One observation used for (re-)triangulation.
         struct Obs
@@ -196,7 +198,8 @@ public:
      */
     enum LandmarkStatus
     {
-        LANDMARK_EDGE = 0,      ///< Projects into the image but within visibleMargin of the border,
+        LANDMARK_NOT_IN_VIEW = 0,///< Does not project into the image at the current pose
+        LANDMARK_EDGE,          ///< Projects into the image but within visibleMargin of the border,
                                 ///< so it is not counted as predicted-visible
         LANDMARK_AMBIGUOUS,     ///< Predicted bearing too smeared to discriminate the mirror
                                 ///< (maxTangentSigma): excluded from matching and from scoring

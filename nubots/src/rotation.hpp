@@ -2,6 +2,7 @@
 #define ROTATION_HPP
 
 #include <Eigen/Core>
+#include <Eigen/Geometry>   // tangentBasis uses cross products
 
 template <typename Scalar>
 Eigen::Matrix3<Scalar> rotx(const Scalar & x)
@@ -115,6 +116,31 @@ Eigen::Matrix3<typename Derived::Scalar> hatSO3(const Eigen::MatrixBase<Derived>
             u3,   0, -u1,
            -u2,  u1,   0;
     return S;
+}
+
+/**
+ * @brief Orthonormal basis of the plane normal to a unit vector.
+ *
+ * The two columns span the tangent plane at u, which is where bearing
+ * residuals and their covariances live: a unit ray has only two degrees of
+ * freedom, so association surprisals are evaluated there rather than in the
+ * rank-deficient 3D chordal space.
+ *
+ * @param u Unit vector
+ * @return 3x2 matrix whose columns are orthonormal and perpendicular to u
+ */
+inline Eigen::Matrix<double, 3, 2> tangentBasis(const Eigen::Vector3d & u)
+{
+    Eigen::Vector3d t1 = u.cross(Eigen::Vector3d::UnitZ());
+    if (t1.squaredNorm() < 1e-8)
+    {
+        t1 = u.cross(Eigen::Vector3d::UnitX());
+    }
+    t1.normalize();
+    Eigen::Matrix<double, 3, 2> T;
+    T.col(0) = t1;
+    T.col(1) = u.cross(t1).normalized();
+    return T;
 }
 
 #endif

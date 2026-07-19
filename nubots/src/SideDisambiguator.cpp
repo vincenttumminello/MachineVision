@@ -8,6 +8,7 @@
 #include <Eigen/Eigenvalues>
 #include <opencv2/core.hpp>
 #include "SideDisambiguator.h"
+#include "rotation.hpp"
 
 SideDisambiguator::SideDisambiguator(const FisheyeLens & lens, const FieldDimensions & dims, const Options & opts)
     : options(opts)
@@ -20,21 +21,6 @@ SideDisambiguator::SideDisambiguator(const FisheyeLens & lens, const FieldDimens
 SideDisambiguator::SideDisambiguator(const FisheyeLens & lens, const FieldDimensions & dims)
     : SideDisambiguator(lens, dims, Options{})
 {}
-
-// Orthonormal tangent basis of a unit vector (columns span the plane normal to u).
-static Eigen::Matrix<double, 3, 2> tangentBasis(const Eigen::Vector3d & u)
-{
-    Eigen::Vector3d t1 = u.cross(Eigen::Vector3d::UnitZ());
-    if (t1.squaredNorm() < 1e-8)
-    {
-        t1 = u.cross(Eigen::Vector3d::UnitX());
-    }
-    t1.normalize();
-    Eigen::Matrix<double, 3, 2> T;
-    T.col(0) = t1;
-    T.col(1) = u.cross(t1).normalized();
-    return T;
-}
 
 bool SideDisambiguator::isBackgroundPoint(const Eigen::Vector3d & rPFf) const
 {
@@ -518,6 +504,13 @@ SideDisambiguator::FrameResult SideDisambiguator::process(double t, const cv::Ma
 
     // Projected map landmarks for the visualiser. Statuses are as they stand
     // after association; the maintenance pass below upgrades any that it culls.
+    // The status is also stamped on the landmark itself so the 3D view can
+    // colour the whole map: stored there it survives the compaction below,
+    // which a landmarks_-indexed side table would not.
+    for (Landmark & lm : landmarks_)
+    {
+        lm.lastStatus = LANDMARK_NOT_IN_VIEW;
+    }
     std::vector<int> viewOfLandmark(landmarks_.size(), -1);
     res.landmarkViews.reserve(predOwn.size());
     for (const Prediction & p : predOwn)
@@ -533,6 +526,7 @@ SideDisambiguator::FrameResult SideDisambiguator::process(double t, const cv::Ma
         else if (p.ambiguous)  lv.status = LANDMARK_AMBIGUOUS;
         else if (p.wellInside) lv.status = LANDMARK_MISSED;
         else                   lv.status = LANDMARK_EDGE;
+        landmarks_[p.landmark].lastStatus = lv.status;
         viewOfLandmark[p.landmark] = static_cast<int>(res.landmarkViews.size());
         res.landmarkViews.push_back(lv);
     }

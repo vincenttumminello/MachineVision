@@ -4,6 +4,7 @@
 #include <limits>
 #include <vector>
 #include <Eigen/Core>
+#include <Eigen/LU>
 #include <autodiff/forward/dual.hpp>
 #include <autodiff/forward/dual/eigen.hpp>
 #include "FieldMap.h"
@@ -35,11 +36,15 @@ MeasurementFieldLandmarks::MeasurementFieldLandmarks(double time, const VisionSa
         LandmarkType type;
         if (detectionRay(det, ray, type))
         {
-            candidates_.push_back({ray, type, i});
+            // Confidence sets how much of this detection's likelihood is the
+            // inlier Gaussian rather than flat clutter (see Options).
+            const double w = std::clamp(options_.inlierProbability*det.confidence/options_.confidenceReference,
+                                        1e-3, options_.maxInlierProbability);
+            candidates_.push_back({ray, type, i, w});
         }
     }
 
-    assocKeys_ = associate(system.density.mean());
+    assocKeys_ = associate(system.density.mean(), system.density.cov());
 }
 
 MeasurementFieldLandmarks::MeasurementFieldLandmarks(double time, const VisionSample & sample, const Pose<double> & Tbc,
@@ -82,10 +87,12 @@ bool MeasurementFieldLandmarks::detectionRay(const Detection & det, Eigen::Vecto
     return true;
 }
 
-std::vector<std::pair<std::size_t, std::size_t>> MeasurementFieldLandmarks::associate(const Eigen::VectorXd & x)
+std::vector<std::pair<std::size_t, std::size_t>> MeasurementFieldLandmarks::associate(const Eigen::VectorXd & x,
+                                                                                      const Eigen::MatrixXd & P)
 {
     std::vector<std::pair<std::size_t, std::size_t>> keys;
     assocCand_.clear();
+    inlierWeight_.clear();
     if (candidates_.empty())
     {
         uMeas_.resize(3, 0);
@@ -96,15 +103,24 @@ std::vector<std::pair<std::size_t, std::size_t>> MeasurementFieldLandmarks::asso
     // Predicted ray for every mapped landmark at the given state (incl. camera mount bias)
     Pose<double> Tbias(SystemLocalisation::cameraBiasRotation<double>(x), Eigen::Vector3d::Zero());
     Pose<double> Tfc = SystemLocalisation::fieldPose<double>(x)*Tbc_*Tbias;
-    const Eigen::Matrix3d Rcf = Tfc.rotationMatrix.transpose();
+    const Eigen::Matrix3d Rfc = Tfc.rotationMatrix;
     const Eigen::Vector3d rCFf = Tfc.translationVector;
 
-    // Greedy nearest-angle assignment per landmark type with gating:
-    // enumerate all (detection, landmark) pairs of matching type, sort by angle,
-    // then assign smallest-angle pairs first, each detection/landmark at most once.
+    // Pose uncertainty inflating each predicted bearing. Bearings are compared in
+    // {f}: the tangent-plane geometry and the yaw term are both natural there.
+    const Eigen::Matrix3d Ppos = P.topLeftCorner<3, 3>();
+    const double yawVar = P(5, 5);
+    const double sigma2 = options_.sigmaAngular*options_.sigmaAngular;
+    const double cosGate = std::cos(options_.gateAngle);
+
+    // SNN: enumerate all (detection, landmark) pairs of matching type inside the
+    // geometric pre-gate, score each by its surprisal relative to the clutter
+    // crossover, then assign best-scoring pairs first, each detection/landmark at
+    // most once. A negative score means the inlier component explains the pair
+    // better than clutter does.
     struct CandidatePair
     {
-        double angle;
+        double score;
         std::size_t det;
         LandmarkType type;
         std::size_t lm;
@@ -112,23 +128,45 @@ std::vector<std::pair<std::size_t, std::size_t>> MeasurementFieldLandmarks::asso
     std::vector<CandidatePair> pairs;
     for (std::size_t i = 0; i < candidates_.size(); ++i)
     {
+        const Eigen::Vector3d uMeasF = Rfc*candidates_[i].ray;
+        // Crossover surprisal: w N(e; S) > (1 - w)/(4 pi). A weak detection has to
+        // fit much better before it is worth associating at all, and ranks below a
+        // confident one at equal residual, which is what stops the stealing.
+        const double w = candidates_[i].inlierWeight;
+        const double crossover = std::log(w) - std::log(1.0 - w) + std::log(4.0*M_PI);
+
         const std::vector<Eigen::Vector3d> & lms = map_.landmarks(candidates_[i].type);
         for (std::size_t j = 0; j < lms.size(); ++j)
         {
-            Eigen::Vector3d uPred = Rcf*(lms[j] - rCFf);
-            double n = uPred.norm();
-            if (n < 1e-9)
+            const Eigen::Vector3d rel = lms[j] - rCFf;
+            const double range = rel.norm();
+            if (range < 1e-9)
             {
                 continue;
             }
-            double angle = std::acos(std::clamp(candidates_[i].ray.dot(uPred)/n, -1.0, 1.0));
-            if (angle <= options_.gateAngle)
+            const Eigen::Vector3d uPredF = rel/range;
+            if (uMeasF.dot(uPredF) < cosGate)
             {
-                pairs.push_back({angle, i, candidates_[i].type, j});
+                continue;   // Cheap geometric pre-gate: caps how far an association can reach
+            }
+
+            // Innovation covariance in the tangent plane: bearing noise + camera
+            // position uncertainty across the range + yaw uncertainty.
+            const Eigen::Matrix<double, 3, 2> T = tangentBasis(uPredF);
+            const Eigen::Vector2d a = T.transpose()*Eigen::Vector3d::UnitZ().cross(uPredF);
+            const Eigen::Matrix2d S = Eigen::Matrix2d::Identity()*sigma2
+                                    + T.transpose()*Ppos*T/(range*range)
+                                    + yawVar*a*a.transpose();
+            const Eigen::Vector2d e = T.transpose()*(uMeasF - uPredF);
+            const double surprisal = 0.5*e.dot(S.inverse()*e) + 0.5*std::log(S.determinant()) + std::log(2.0*M_PI);
+            const double score = surprisal - crossover;
+            if (score < 0.0)
+            {
+                pairs.push_back({score, i, candidates_[i].type, j});
             }
         }
     }
-    std::sort(pairs.begin(), pairs.end(), [](const CandidatePair & a, const CandidatePair & b) { return a.angle < b.angle; });
+    std::sort(pairs.begin(), pairs.end(), [](const CandidatePair & a, const CandidatePair & b) { return a.score < b.score; });
 
     std::vector<bool> detUsed(candidates_.size(), false);
     // Landmark usage tracked per type via flat key: type-major index
@@ -157,12 +195,14 @@ std::vector<std::pair<std::size_t, std::size_t>> MeasurementFieldLandmarks::asso
     uMeas_.resize(3, static_cast<Eigen::Index>(chosen.size()));
     rLFf_.resize(3, static_cast<Eigen::Index>(chosen.size()));
     assocCand_.reserve(chosen.size());
+    inlierWeight_.reserve(chosen.size());
     for (std::size_t k = 0; k < chosen.size(); ++k)
     {
         const CandidatePair & p = *chosen[k];
         uMeas_.col(static_cast<Eigen::Index>(k)) = candidates_[p.det].ray;
         rLFf_.col(static_cast<Eigen::Index>(k)) = map_.landmarks(p.type)[p.lm];
         assocCand_.push_back(p.det);
+        inlierWeight_.push_back(candidates_[p.det].inlierWeight);
         keys.emplace_back(p.det, lmKey(p.type, p.lm));
     }
     std::sort(keys.begin(), keys.end());
@@ -253,7 +293,7 @@ void MeasurementFieldLandmarks::update(SystemBase & system_)
             break;      // Iteration budget exhausted
         }
 
-        std::vector<std::pair<std::size_t, std::size_t>> newKeys = associate(system.density.mean());
+        std::vector<std::pair<std::size_t, std::size_t>> newKeys = associate(system.density.mean(), system.density.cov());
         if (newKeys == assocKeys_)
         {
             break;      // Association converged (associate() rebuilt the same set)

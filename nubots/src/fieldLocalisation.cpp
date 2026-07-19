@@ -988,7 +988,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                 vf.oofLandmarks.reserve(sideDis.landmarks().size());
                 for (const SideDisambiguator::Landmark & lm : sideDis.landmarks())
                 {
-                    vf.oofLandmarks.push_back({lm.rPFf, lm.P, lm.far});
+                    vf.oofLandmarks.push_back({lm.rPFf, lm.P, lm.far, lm.lastStatus});
                 }
             }
 
@@ -1066,6 +1066,29 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                      ss.promoteAttempts, ss.parallaxWait, ss.triFailGeometry, ss.triFailRange, ss.triFailChi2,
                      ss.backgroundFail, ss.farSpreadFail, ss.promoted, ss.promotedFar, ss.upgraded,
                      ss.landmarkCulledChi2, ss.landmarkCulledMiss);
+        // Depth quality of the surviving map. Bearing-only landmarks carry no
+        // triangulated depth at all -- they sit at the assumed range along their
+        // bearing -- so they cluster on a shell around whichever camera position
+        // anchored them. Worth stating plainly: it is the dominant visual feature
+        // of the 3D map and looks like a bug if you do not know to expect it.
+        {
+            std::vector<double> extFar, extPoint;
+            for (const SideDisambiguator::Landmark & lm : sideDis.landmarks())
+            {
+                Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(lm.P);
+                const double ext = 3.0*std::sqrt(std::max(0.0, es.eigenvalues()(2)));
+                (lm.far ? extFar : extPoint).push_back(ext);
+            }
+            auto median = [](std::vector<double> & v) {
+                if (v.empty()) return std::numeric_limits<double>::quiet_NaN();
+                std::sort(v.begin(), v.end());
+                return v[v.size()/2];
+            };
+            std::println("  map depth: {} bearing-only at the assumed {:.1f} m (median 3-sigma {:.1f} m along the "
+                         "unobserved depth axis), {} triangulated (median 3-sigma {:.1f} m)",
+                         extFar.size(), sideDis.options.assumedRange, median(extFar),
+                         extPoint.size(), median(extPoint));
+        }
     }
     if (nResid > 0)
     {

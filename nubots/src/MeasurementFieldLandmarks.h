@@ -24,13 +24,14 @@
  *  - goal posts: ray to the bottom-centre of the bounding box (post base on the ground).
  *
  * Detections are associated to mapped landmarks of the same class by greedy
- * nearest-angle assignment against rays predicted at the prior mean, gated by
- * a maximum angular residual.
+ * surprisal-nearest-neighbour (SNN) assignment against rays predicted at the
+ * prior mean, inside a geometric pre-gate (see associate()).
  *
  * The likelihood for each associated pair is an isotropic Gaussian on the
  * chordal residual e = u_meas - u_pred, which agrees with an angular error
- * Gaussian to second order:
- *   log p = sum_j [ -log(2 pi sigma^2) - ||e_j||^2 / (2 sigma^2) ]
+ * Gaussian to second order, mixed with uniform clutter over the sphere at a
+ * per-detection weight w_j taken from the YOLO confidence:
+ *   log p = sum_j log[ w_j N(e_j; sigma^2 I) + (1 - w_j)/(4 pi) ]
  *
  * The MAP update through Measurement::update yields the Laplace-approximation
  * posterior (mean and sqrt information) in the usual way.
@@ -50,8 +51,22 @@ public:
     {
         double sigmaAngular         = 0.25;             ///< Inlier ray angular noise std dev [rad] (total per-frame error incl. systematic)
         double gateAngle            = 0.35;             ///< Max association residual angle [rad] (~20 deg)
-        double minConfidence        = 0.5;              ///< Minimum detection confidence
-        double inlierProbability    = 0.7;              ///< Mixture weight of the inlier component
+        double minConfidence        = 0.5;             ///< Reject detections below this confidence outright
+        double inlierProbability    = 0.7;              ///< Inlier mixture weight at confidenceReference
+
+        // YOLO confidence is (roughly) the probability that a box is a true
+        // positive, which is exactly what the inlier weight of the robust
+        // mixture means -- so confidence scales that weight rather than the
+        // noise sigma. Downweighting via sigma would claim the landmark is
+        // certainly real but poorly measured; the actual failure mode of a
+        // weak detection is that it is not a landmark at all. As w -> 0 the
+        // per-detection likelihood tends to the flat clutter term, which
+        // contributes almost nothing to the gradient AND almost nothing to the
+        // Hessian, so a weak detection cannot sharpen the posterior: admitting
+        // them is safe against overconfidence in a way that simply lowering
+        // minConfidence under a fixed weight would not be.
+        double confidenceReference  = 0.7;              ///< Confidence that maps to inlierProbability
+        double maxInlierProbability = 0.95;             ///< Cap: no detection is ever treated as certain
     };
 
     /**
@@ -92,7 +107,6 @@ public:
     std::size_t numCandidates() const { return candidates_.size(); }
     const Eigen::Matrix<double, 3, Eigen::Dynamic> & measuredRays() const { return uMeas_; }
     const Eigen::Matrix<double, 3, Eigen::Dynamic> & associatedLandmarks() const { return rLFf_; }
-    const Options & options() const { return options_; }
 
     /**
      * @brief What the final association pass did with one usable detection.
@@ -133,19 +147,35 @@ protected:
         Eigen::Vector3d ray;
         LandmarkType type;
         std::size_t detection;      ///< Index into the vision sample's detection list (for display)
+        double inlierWeight;        ///< Mixture inlier weight implied by this detection's confidence
     };
 
     /**
      * @brief (Re)build the associated pairs from the stored candidates at the given state.
+     *
+     * Surprisal nearest neighbour (SNN): pairs are ranked by how much better the
+     * inlier component explains them than the uniform clutter component, i.e. by
+     * the surprisal (negative log predictive density, evaluated in the tangent
+     * plane of the predicted bearing) minus the clutter-crossover surprisal.
+     * Ranking on raw angle instead would ignore two things that matter here: a
+     * near landmark's predicted bearing is far more sensitive to pose error than
+     * a distant one's, and a weak detection is far more likely to be spurious --
+     * so a plain nearest-angle winner can be a low-confidence box that steals a
+     * landmark from a confident detection and leaves it unassociated.
+     *
+     * @param x State to predict the landmarks at
+     * @param P State covariance, inflating each predicted bearing by the pose uncertainty
      * @return Association keys (candidate index, landmark index) for change detection
      */
-    std::vector<std::pair<std::size_t, std::size_t>> associate(const Eigen::VectorXd & x);
+    std::vector<std::pair<std::size_t, std::size_t>> associate(const Eigen::VectorXd & x,
+                                                               const Eigen::MatrixXd & P);
 
     const FieldMap & map_;                              ///< Field landmark map
     std::vector<CandidateDetection> candidates_;        ///< Usable detections (rays in {c})
     Pose<double> Tbc_;                                  ///< Camera pose w.r.t. torso at capture time
     Eigen::Matrix<double, 3, Eigen::Dynamic> uMeas_;    ///< Measured unit rays in {c} (associated only)
     Eigen::Matrix<double, 3, Eigen::Dynamic> rLFf_;     ///< Associated landmark positions in {f}
+    std::vector<double> inlierWeight_;                  ///< Per-column mixture inlier weight (from confidence)
     std::vector<std::pair<std::size_t, std::size_t>> assocKeys_;  ///< Last association (candidate, landmark)
     std::vector<std::size_t> assocCand_;                ///< Candidate index behind each column of uMeas_
     Options options_;
@@ -189,16 +219,18 @@ Scalar MeasurementFieldLandmarks::logLikelihoodImpl(const Eigen::VectorX<Scalar>
     const double sigma2 = options_.sigmaAngular*options_.sigmaAngular;
     const double logNormConst = -std::log(2.0*M_PI*sigma2);   // 2 effective DOF per ray
 
-    // Robust mixture: inlier Gaussian on the chordal residual + uniform clutter
-    // over the unit sphere (density 1/(4 pi) per steradian).
-    const double logInlierWeight = std::log(options_.inlierProbability);
-    const double logClutter = std::log(1.0 - options_.inlierProbability) - std::log(4.0*M_PI);
-
     using std::exp, std::log;
 
     Scalar logLik = Scalar(0);
     for (Eigen::Index j = 0; j < n; ++j)
     {
+        // Robust mixture: inlier Gaussian on the chordal residual + uniform
+        // clutter over the unit sphere (density 1/(4 pi) per steradian). The
+        // inlier weight is per-detection, set from the YOLO confidence.
+        const double w = inlierWeight_[static_cast<std::size_t>(j)];
+        const double logInlierWeight = std::log(w);
+        const double logClutter = std::log(1.0 - w) - std::log(4.0*M_PI);
+
         Eigen::Vector3<Scalar> e = uMeas_.col(j).cast<Scalar>() - uPred.col(j);
         Scalar a = Scalar(logInlierWeight + logNormConst) - Scalar(0.5)*e.squaredNorm()/Scalar(sigma2);
         Scalar b = Scalar(logClutter);
