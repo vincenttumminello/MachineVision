@@ -185,6 +185,24 @@ public:
     void spawnMirror();
 
     /**
+     * @brief Fold one frame of out-of-field side evidence into the mixture weights.
+     *
+     * On-field landmarks cannot separate the two symmetric hypotheses (they fit
+     * their respective mirror-partner landmarks equally well), so the mixture
+     * would sit at 50/50 forever on landmark evidence alone. The asymmetric
+     * background scenery is what breaks it: @p logRatio is the per-frame
+     * log-likelihood ratio favouring the representative pose over its 180 deg
+     * mirror (SideDisambiguator's clamped own-minus-mirror score). It is added to
+     * the representative component's log-weight, so a sustained positive ratio
+     * collapses the mirror and a negative one hands leadership to it.
+     *
+     * No-op unless at least two hypotheses are live (nothing to disambiguate).
+     *
+     * @param logRatio Log-likelihood ratio own-vs-mirror for this frame [nats]
+     */
+    void addSideLogEvidence(double logRatio);
+
+    /**
      * @brief Process an event across every active hypothesis.
      *
      * For each component the shared system clock is rewound and the event is
@@ -234,6 +252,7 @@ protected:
 
     std::vector<GaussianInfo<double>> components_;   ///< Mixture components (empty => single-hypothesis)
     std::vector<double> logWeights_;                 ///< Unnormalised log weights per component
+    Eigen::VectorXd lastRepMean_;                    ///< Outgoing representative mean (setRepresentative hysteresis)
 
     void normaliseWeights();        ///< Renormalise logWeights_ (subtract log-sum-exp)
     void mergeComponents();         ///< Merge components within the merge gate (keep-best)

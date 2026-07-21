@@ -233,6 +233,38 @@ reading the 3D view or trying to reuse the map:
   the covariance. Using them metrically means putting them **in** the state with
   their pose cross-covariances, i.e. actual SLAM.
 
+## Hypothesis bank (`SystemLocalisation`, off by default)
+
+The disambiguator resolves the symmetry by a hard flip on a single Gaussian.
+The alternative — a **weighted Gaussian mixture** carrying both the pose and
+its 180° mirror (B-Human style) — also exists, behind `useHypothesisBank`.
+The two are different answers to the *same* question and do not stack; the bank
+is the substrate you would enable *instead of* the hard flip, and when it is on
+the flip path is replaced by weight updates.
+
+The key fact the design turns on: **on-field landmarks cannot separate the two
+hypotheses.** Re-associated at its own pose, the mirror fits the mirror-partner
+landmarks exactly as well as the true pose fits the originals, so the mixture
+sits at a genuine 50/50 on landmark evidence alone (the earlier code only
+collapsed it because association was shared from the representative — a bug the
+mixture path now avoids by re-associating per component). What breaks the tie is
+the **asymmetric out-of-field map**: each frame the disambiguator's clamped
+own-minus-mirror score is folded into the weights (`addSideLogEvidence`), which
+collapses the mirror once the background map favours one side, and a mid-game
+kidnap re-seeds it (`spawnMirror`) for the weights to re-resolve. Output
+stability at the 50/50 point comes from hysteresis in `setRepresentative` (the
+reported pose does not flicker between a side and its mirror on numerical
+noise).
+
+Default **off**: initialisation already fixes the side from the known start
+half (see above), so on the recorded data the bank only adds a brief
+two-component window (~15 s until the map prunes the mirror) before collapsing
+to the single-hypothesis path, at identical accuracy (0.107 m / 5.4°). It is
+the mechanism to enable for a robot that can start on an unknown side, or be
+displaced without a GameController signal — the case none of the recorded runs
+exercise, so the resolution path is verified by unit tests and an injected
+`KIDNAP_T` rather than by a natural mid-game flip.
+
 ## Reading the camera panel
 
 Data association is what the camera panel exists to debug, so both landmark

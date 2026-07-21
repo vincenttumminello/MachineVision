@@ -82,7 +82,7 @@ SCENARIO("SystemLocalisation mirror transform")
     }
 }
 
-SCENARIO("Hypothesis bank resolves the field-symmetry ambiguity")
+SCENARIO("Hypothesis bank + out-of-field evidence resolve the field symmetry")
 {
     GIVEN("A robot behind the centre looking towards the +x goal with a mirror hypothesis")
     {
@@ -90,6 +90,7 @@ SCENARIO("Hypothesis bank resolves the field-symmetry ambiguity")
 
         Eigen::VectorXd etaTrue = Eigen::VectorXd::Zero(SystemLocalisation::nx);
         etaTrue.head<6>() << -1.0, 0.2, 0.45, 0.0, 0.0, 0.1;
+        const Eigen::VectorXd etaMirror = SystemLocalisation::mirrorState(etaTrue);
 
         Pose<double> Tbc;
         Tbc.translationVector = Eigen::Vector3d(0.05, 0, 0.1);
@@ -115,41 +116,84 @@ SCENARIO("Hypothesis bank resolves the field-symmetry ambiguity")
         auto p0 = GaussianInfo<double>::fromSqrtMoment(etaTrue, S0);
         SystemLocalisation system(p0, twists);
 
+        MeasurementFieldLandmarks::Options options;
+        options.sigmaAngular = 0.02;
+
         WHEN("two mirror hypotheses are seeded and a landmark measurement is applied")
         {
             system.initialiseHypotheses();
             REQUIRE(system.numHypotheses() == 2);
 
-            // Equal weights before any evidence
-            auto w0 = system.hypothesisWeights();
-            REQUIRE(w0.size() == 2);
-            CHECK(w0[0] == doctest::Approx(0.5).epsilon(0.05));
-            CHECK(w0[1] == doctest::Approx(0.5).epsilon(0.05));
-
-            MeasurementFieldLandmarks::Options options;
-            options.sigmaAngular = 0.02;
             MeasurementFieldLandmarks meas(0.0, sample, Tbc, map, system, options);
             system.process(meas);
 
-            THEN("the true hypothesis dominates and the belief tracks the true pose")
+            THEN("on-field landmarks leave the two hypotheses equally weighted")
             {
-                // The mirror is either pruned outright or left with negligible weight
-                CHECK(system.numHypotheses() <= 2);
+                // The field is symmetric: re-associated at its own pose the mirror
+                // fits the mirror-partner landmarks exactly as well as the true pose
+                // fits the originals. Landmark evidence therefore CANNOT separate
+                // them -- the belief must stay a genuine two-mode 50/50 mixture.
+                REQUIRE(system.numHypotheses() == 2);
                 auto w = system.hypothesisWeights();
-                double wMax = *std::max_element(w.begin(), w.end());
-                CHECK(wMax > 0.9);
+                CHECK(w[0] == doctest::Approx(0.5).epsilon(0.05));
+                CHECK(w[1] == doctest::Approx(0.5).epsilon(0.05));
 
-                // Representative density (max-weight component) is the true pose
+                // Both the true pose and its mirror are present among the components
+                const auto & comps = system.hypotheses();
+                double dTrue = std::min((comps[0].mean() - etaTrue).head<2>().norm(),
+                                        (comps[1].mean() - etaTrue).head<2>().norm());
+                double dMirror = std::min((comps[0].mean() - etaMirror).head<2>().norm(),
+                                          (comps[1].mean() - etaMirror).head<2>().norm());
+                CHECK(dTrue < 0.15);
+                CHECK(dMirror < 0.15);
+            }
+        }
+
+        WHEN("out-of-field evidence favouring the representative is then folded in")
+        {
+            system.initialiseHypotheses();
+            MeasurementFieldLandmarks meas(0.0, sample, Tbc, map, system, options);
+            system.process(meas);
+            REQUIRE(system.numHypotheses() == 2);
+
+            // The representative is the true pose (equal weights => the first
+            // component, which initialiseHypotheses seeds as the current density).
+            REQUIRE((system.density.mean() - etaTrue).head<2>().norm() < 0.15);
+
+            // A few frames of decisive own-over-mirror background evidence.
+            for (int k = 0; k < 5; ++k) system.addSideLogEvidence(1.5);
+
+            THEN("the true hypothesis dominates and the mirror is pruned")
+            {
+                auto w = system.hypothesisWeights();
+                CHECK(*std::max_element(w.begin(), w.end()) > 0.9);
                 Eigen::VectorXd mu = system.density.mean();
                 CHECK((mu.head<2>() - etaTrue.head<2>()).norm() < 0.15);
                 CHECK(std::abs(std::remainder(mu(5) - etaTrue(5), 2.0*M_PI)) < 0.15);
             }
         }
 
+        WHEN("out-of-field evidence contradicts the representative")
+        {
+            system.initialiseHypotheses();
+            MeasurementFieldLandmarks meas(0.0, sample, Tbc, map, system, options);
+            system.process(meas);
+            REQUIRE((system.density.mean() - etaTrue).head<2>().norm() < 0.15);
+
+            // Decisive evidence AGAINST the current representative hands leadership
+            // to the mirror pose -- the smooth, weight-driven equivalent of a flip.
+            system.addSideLogEvidence(-8.0);
+
+            THEN("leadership passes to the mirror pose")
+            {
+                Eigen::VectorXd mu = system.density.mean();
+                CHECK((mu.head<2>() - etaMirror.head<2>()).norm() < 0.15);
+                CHECK(std::abs(std::remainder(mu(5) - etaMirror(5), 2.0*M_PI)) < 0.15);
+            }
+        }
+
         WHEN("no hypotheses are active")
         {
-            MeasurementFieldLandmarks::Options options;
-            options.sigmaAngular = 0.02;
             MeasurementFieldLandmarks meas(0.0, sample, Tbc, map, system, options);
 
             THEN("system.process matches a direct single-Gaussian update")

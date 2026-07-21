@@ -541,6 +541,7 @@ SideDisambiguator::FrameResult SideDisambiguator::process(double t, const cv::Ma
     {
         const double delta = std::clamp(res.scoreOwn - res.scoreMirror,
                                         -options.deltaClamp, options.deltaClamp);
+        res.sideDelta = delta;
         llr_ = std::clamp(options.forgetting*llr_ + delta, -options.llrClamp, options.llrClamp);
     }
     res.llr = llr_;

@@ -559,10 +559,19 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     system.resetTo(p0, tInit);
 
     // Multi-hypothesis field-symmetry handling. When enabled the belief is a
-    // Gaussian mixture seeded with the initial pose and its 180 deg mirror; the
-    // wrong mirror is down-weighted by the asymmetric landmark evidence and
-    // pruned. Default off preserves the single-hypothesis shipping behaviour
-    // (initialised here from a known-good baseline, so no ambiguity to resolve).
+    // Gaussian mixture seeded with the initial pose and its 180 deg mirror.
+    // On-field landmarks cannot separate the two (each fits its own mirror-
+    // partner landmarks equally well), so the pair sits at 50/50 until the
+    // asymmetric out-of-field evidence, folded into the weights each frame
+    // (SideDisambiguator -> addSideLogEvidence), collapses the mirror; a
+    // mid-game kidnap re-seeds it (spawnMirror) for the weights to re-resolve.
+    //
+    // Default OFF: this pipeline initialises from the known start half, so the
+    // side is already certain and the bank only adds an early two-component
+    // window before it prunes back to the single-hypothesis path (identical
+    // final accuracy on the recorded data). It is the mechanism to enable for a
+    // robot that can start on an unknown side or be displaced without a
+    // GameController signal.
     constexpr bool useHypothesisBank = false;
     if (useHypothesisBank)
     {
@@ -644,6 +653,8 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     Pose<double> statTbc;
     Eigen::VectorXd statMean;
     bool haveStat = false;
+
+    double lastRespawnT = -std::numeric_limits<double>::infinity();  ///< Bank-mode mirror re-seed cooldown
 
     for (const VisionSample & v : log.vision)
     {
@@ -863,10 +874,36 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                              side.mapFrozen ? " [frozen]" : "");
             }
 
-            if (side.flipRequested)
+            if (useHypothesisBank)
             {
-                // The background evidence says we are on the wrong side: mirror
-                // the filter belief and tell the disambiguator the flip happened.
+                // Bank mode: the background evidence is the ONLY thing that can
+                // separate the two symmetric hypotheses (landmarks leave them at
+                // 50/50), so fold each frame's own-vs-mirror log-ratio into the
+                // mixture weights. A sustained lead collapses the mirror; the
+                // representative switching sides IS the correction, done smoothly
+                // by the weights rather than by a discontinuous state flip.
+                system.addSideLogEvidence(side.sideDelta);
+
+                // If the mirror has already been pruned and the disambiguator is
+                // now sure the lone belief is wrong (mid-game kidnap), re-seed the
+                // alternative so the weights have something to switch to. A
+                // cooldown stops repeated spawns while flipRequested stays latched
+                // (the LLR takes a few seconds to climb back after the switch).
+                if (side.flipRequested && system.numHypotheses() == 1
+                    && t - lastRespawnT > sideDis.options.flipCooldown)
+                {
+                    system.spawnMirror();
+                    lastRespawnT = t;
+                    nSideFlips++;
+                    std::println("SIDE RESPAWN at t={:.2f} s (llr={:+.1f}): re-seeded the mirror hypothesis "
+                                 "for the weights to resolve", t, side.llr);
+                }
+            }
+            else if (side.flipRequested)
+            {
+                // Single-hypothesis mode: the background evidence says we are on
+                // the wrong side, so mirror the belief and tell the disambiguator
+                // the flip happened.
                 system.resetTo(SystemLocalisation::mirrorDensity(system.density), t);
                 sideDis.notifyFlipApplied(t);
                 nSideFlips++;
