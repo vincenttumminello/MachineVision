@@ -99,6 +99,16 @@ Eigen::VectorXd SystemLocalisation::input(double t, const Eigen::VectorXd & x) c
     const BodyTwistSample & s = *std::prev(it);
     u.head<3>() = s.vBb;
     u.tail<3>() = s.omegaBb;
+    if (disturbed_)
+    {
+        // vBb is a finite difference of walk-engine odometry, which keeps
+        // describing the gait it thinks it is executing while the robot is on the
+        // ground; worse, twistFromOdometry drops intervals longer than maxGap, so
+        // the zero-order hold above would carry the last pre-fall velocity across
+        // a sensor stall. Neither is information. omegaBb comes from the
+        // gyroscope, which measures the topple honestly, so it is kept.
+        u.head<3>().setZero();
+    }
     return u;
 }
 
@@ -106,9 +116,21 @@ GaussianInfo<double> SystemLocalisation::processNoiseDensity(double dt) const
 {
     // dw ~ N^{-1}(0, LambdaQ/dt), i.e., cov(dw) = Q*dt
     Eigen::VectorXd sigma(nx);
-    sigma << params.sigmaPosXY, params.sigmaPosXY, params.sigmaPosZ,
-             params.sigmaAtt, params.sigmaAtt, params.sigmaYaw,
-             params.sigmaCamBias, params.sigmaCamBias;
+    if (disturbed_)
+    {
+        // The camera mount bias is a property of the kinematic chain, not of the
+        // posture, so it keeps its ordinary (deliberately tiny) PSD: a fall is no
+        // reason to let the extrinsic calibration wander.
+        sigma << params.sigmaPosXYDisturbed, params.sigmaPosXYDisturbed, params.sigmaPosZDisturbed,
+                 params.sigmaAttDisturbed, params.sigmaAttDisturbed, params.sigmaYawDisturbed,
+                 params.sigmaCamBias, params.sigmaCamBias;
+    }
+    else
+    {
+        sigma << params.sigmaPosXY, params.sigmaPosXY, params.sigmaPosZ,
+                 params.sigmaAtt, params.sigmaAtt, params.sigmaYaw,
+                 params.sigmaCamBias, params.sigmaCamBias;
+    }
 
     Eigen::MatrixXd XiQ = Eigen::MatrixXd::Zero(nx, nx);
     XiQ.diagonal() = (sigma*std::sqrt(dt)).cwiseInverse();
@@ -211,6 +233,56 @@ void SystemLocalisation::resetTo(const GaussianInfo<double> & newDensity, double
     components_.clear();
     logWeights_.clear();
     lastRepMean_ = Eigen::VectorXd();
+}
+
+void SystemLocalisation::inflateCovariance(const Eigen::VectorXd & extraVar)
+{
+    assert(extraVar.size() == nx);
+    assert((extraVar.array() >= 0.0).all());
+
+    auto inflate = [&](const GaussianInfo<double> & g)
+    {
+        Eigen::MatrixXd P = g.cov();
+        P.diagonal() += extraVar;
+        // Symmetrise before the Cholesky in fromMoment, matching mirrorDensity.
+        P = 0.5*(P + P.transpose()).eval();
+        return GaussianInfo<double>::fromMoment(g.mean(), P);
+    };
+
+    if (components_.empty())
+    {
+        density = inflate(density);
+        return;
+    }
+    for (GaussianInfo<double> & c : components_)
+    {
+        c = inflate(c);
+    }
+    // With the bank live, `density` is a copy of the representative component
+    // rather than state in its own right, so it is refreshed from the inflated
+    // components instead of being inflated separately. Inflation does not move
+    // any mean, so the representative does not change.
+    setRepresentative();
+}
+
+void SystemLocalisation::predictAll(double time)
+{
+    if (components_.empty())
+    {
+        predict(time);
+        return;
+    }
+    // Rewind the shared clock per component so each predicts over the identical
+    // interval, exactly as process() does.
+    const double t0 = time_;
+    for (std::size_t i = 0; i < components_.size(); ++i)
+    {
+        time_ = t0;
+        density = components_[i];
+        predict(time);
+        components_[i] = density;
+    }
+    setRepresentative();
 }
 
 GaussianInfo<double> SystemLocalisation::positionDensity() const

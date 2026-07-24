@@ -342,6 +342,41 @@ SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesyst
             sample.velocityTarget = parseVec3(data["velocityTarget"]);
             walk.push_back(std::move(sample));
         }
+        else if (type.size() >= 10 && type.substr(type.size() - 10) == ".Stability")
+        {
+            // Posture / fallen flags. Matched on the type suffix rather than the
+            // full name because the message has moved namespace between NUbots
+            // revisions, and a log that silently lost its stability stream would
+            // send the localiser down the derived-detector path without warning.
+            //
+            // The payload is a bare enum, which the JSON dump renders either as a
+            // plain string or as an object wrapping it; both spellings are accepted
+            // so the reader does not depend on which dumper produced the log.
+            int64_t timestampUs = 0;
+            bool haveTimestamp = docResult["timestamp"].get_int64().get(timestampUs) == simdjson::SUCCESS;
+
+            StabilitySample sample;
+            sample.t = haveTimestamp ? static_cast<double>(timestampUs) * 1e-6 : NaN;
+
+            std::string_view state = getStringTolerant(docResult["data"]);
+            if (state.empty())
+            {
+                simdjson::ondemand::object data;
+                if (docResult["data"].get_object().get(data) == simdjson::SUCCESS)
+                {
+                    state = getStringTolerant(data["state"]);
+                    if (state.empty())
+                    {
+                        state = getStringTolerant(data["value"]);
+                    }
+                }
+            }
+            if (!state.empty())
+            {
+                sample.state = std::string(state);
+                stability.push_back(std::move(sample));
+            }
+        }
         else if (type == "message.localisation.Field")
         {
             int64_t timestampUs = 0;
@@ -531,6 +566,7 @@ SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesyst
     std::stable_sort(sensors.begin(), sensors.end(), byTime);
     std::stable_sort(vision.begin(), vision.end(), byTime);
     std::stable_sort(walk.begin(), walk.end(), byTime);
+    std::stable_sort(stability.begin(), stability.end(), byTime);
     std::stable_sort(fieldBaseline.begin(), fieldBaseline.end(), byTime);
     std::stable_sort(linePoints.begin(), linePoints.end(), byTime);
     std::stable_sort(mocap.begin(), mocap.end(), byTime);

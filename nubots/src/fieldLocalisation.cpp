@@ -16,6 +16,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/videoio.hpp>
+#include "FallDetector.h"
 #include "FieldMap.h"
 #include "fieldLocalisation.h"
 #include "FisheyeLens.h"
@@ -342,8 +343,15 @@ private:
 // the robot always starts in its own half, so ownHalfXSign (the sign of field-x
 // for the starting half, from the GameController team side in deployment) selects
 // between the global maximum and its mirror.
+//
+// This is start-of-game initialisation only, and must stay that way. The
+// ownHalfXSign prior is true exactly once -- at kick-off -- so re-running this
+// mid-game (say, to recover from a fall) would force a correctly localised robot
+// standing in the opponent half back across the halfway line. Recovery from a
+// fall is handled instead by widening the belief around the pose already held.
 static bool solveInitialPose(const SensorLog & log, const FieldMap & map,
                              const std::vector<BodyTwistSample> & twists, double t0, double ownHalfXSign,
+                             const FallDetector & falls,
                              Eigen::VectorXd & eta0Out, double & tInitOut, std::size_t & visIdxOut)
 {
     const FieldDimensions & dims = map.dims;
@@ -358,6 +366,10 @@ static bool solveInitialPose(const SensorLog & log, const FieldMap & map,
         const VisionSample & v = log.vision[vi];
         if (v.detections.empty()) continue;
         if (!v.Hcw.rotationMatrix.allFinite() || !v.Hcw.translationVector.allFinite()) continue;
+        // roll, pitch and torso height below are taken from the kinematic chain and
+        // held fixed while (x, y, yaw) are searched, so a frame captured mid-topple
+        // would anchor the whole solve to an attitude that is about to be wrong.
+        if (falls.at(v.t - t0) != Posture::UPRIGHT) continue;
 
         std::size_t k = nearestIndex(log.sensors, v.t, [](const SensorsSample & s) { return s.t; });
         if (std::abs(log.sensors[k].t - v.t) > 0.1) continue;
@@ -452,6 +464,29 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     std::vector<BodyTwistSample> twists = SystemLocalisation::twistFromOdometry(log.sensors, t0);
     std::println("Derived {} body twist samples from odometry", twists.size());
 
+    // Posture timeline. The robot's own stability flags are authoritative when the
+    // log carries them; otherwise the tilt of the smoothed accelerometer stands in.
+    const FallDetector falls(log.sensors, log.stability, t0);
+    std::println("Posture: from {} -- {} non-upright window(s)",
+                 falls.usingFlags() ? "the robot's stability flags"
+                                    : "the accelerometer (log has no stability stream)",
+                 falls.intervals().size());
+    for (const FallDetector::Interval & iv : falls.intervals())
+    {
+        std::println("  not upright t={:.2f}..{:.2f} s ({:.2f} s)", iv.start, iv.end, iv.end - iv.start);
+    }
+    if (!falls.unrecognisedStates().empty())
+    {
+        // Silently mapping an unknown name to "upright" would disable every fall
+        // protection in the filter, so it is surfaced rather than swallowed.
+        std::print("  WARNING: unrecognised stability state(s) treated as upright:");
+        for (const std::string & s : falls.unrecognisedStates())
+        {
+            std::print(" {}", s);
+        }
+        std::println("");
+    }
+
     // Motion-capture ground truth (evaluation only; see mocaptruth above).
     const std::vector<TruthSample> truth = buildTruth(log.mocap, t0);
     if (!truth.empty())
@@ -493,6 +528,27 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         std::println("Simulated kidnap armed: state will be mirrored at t={:.1f} s", kidnapT);
     }
     bool kidnapDone = false;
+
+    // Simulated fall for verification: FALL_T=<seconds> FALL_DURATION=<seconds>
+    // forces the posture to FALLEN over that window. Neither recording contains a
+    // real fall (the torso never leaves 0.43-0.44 m and tilt peaks at 34 deg), so
+    // this is the only way to exercise the suppression, prediction-only coast,
+    // inflation and recovery path on real data. Note what it does and does not
+    // show: the robot really is upright throughout, so this demonstrates that the
+    // filter survives and reconverges after a blind window, not that the posture
+    // detector fires on a genuine topple.
+    double fallT = std::numeric_limits<double>::quiet_NaN();
+    double fallDuration = 3.0;
+    if (const char * fallEnv = std::getenv("FALL_T"))
+    {
+        fallT = std::atof(fallEnv);
+        if (const char * durEnv = std::getenv("FALL_DURATION"))
+        {
+            fallDuration = std::atof(durEnv);
+        }
+        std::println("Simulated fall armed: posture forced to fallen over t={:.1f}..{:.1f} s",
+                     fallT, fallT + fallDuration);
+    }
     cv::VideoCapture videoCap;
     if (useOutOfField)
     {
@@ -536,7 +592,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     double tInit = 0.0;
     std::size_t initVisIdx = 0;
     auto ticInit = std::chrono::steady_clock::now();
-    bool solved = solveInitialPose(log, map, twists, t0, ownHalfXSign, eta0, tInit, initVisIdx);
+    bool solved = solveInitialPose(log, map, twists, t0, ownHalfXSign, falls, eta0, tInit, initVisIdx);
     double initMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ticInit).count();
     std::println("Initial global grid solve took {:.1f} ms", initMs);
     if (!solved)
@@ -656,19 +712,102 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
 
     double lastRespawnT = -std::numeric_limits<double>::infinity();  ///< Bank-mode mirror re-seed cooldown
 
+    // Belief handed back on recovery from a fall (see the recovery block below).
+    // The position figure is deliberately at SideDisambiguator's maxPosStd so that
+    // recovering also freezes background-map building; the yaw figure is what a
+    // getup can plausibly reorient the robot by without the gyroscope catching it.
+    const double recoveryPosStd = 0.50;                 ///< [m]
+    const double recoveryYawStd = 60.0*M_PI/180.0;      ///< [rad]
+
+    Posture prevPosture = Posture::UPRIGHT;
+    double fallStartT = std::numeric_limits<double>::quiet_NaN();
+    std::size_t nFalls = 0, nFallenFrames = 0;
+
     for (const VisionSample & v : log.vision)
     {
         const double t = v.t - t0;
-        if (t < tInit || v.detections.empty())
+        if (t < tInit)
         {
             nSkipped++;
             continue;
         }
-        if (!v.Hcw.rotationMatrix.allFinite() || !v.Hcw.translationVector.allFinite())
+
+        // Posture gate. Upright is an assumption of every measurement model in this
+        // filter -- gravity assumes the accelerometer reads gravity, kinematic
+        // height assumes the support leg reaches the ground, the landmark model
+        // assumes predicted bearings land within a 0.35 rad gate, and the side
+        // disambiguator assumes the pose it triangulates background corners from is
+        // roughly right. A fall breaks all four simultaneously, and nothing
+        // downstream is robust to it: the accelerometer reads 0 in free fall and
+        // 20-40 m/s^2 on impact against a 1 m/s^2 noise model, which is a 10-30
+        // sigma pull on roll and pitch, and a handful of landmarks that happen to
+        // line up under the wrong attitude will shrink the covariance around a pose
+        // that is simply wrong. So while the robot is not upright the belief is
+        // predicted and nothing else.
+        Posture posture = falls.at(t);
+        if (std::isfinite(fallT) && t >= fallT && t < fallT + fallDuration)
         {
+            posture = Posture::FALLEN;      // Simulated fall (see FALL_T above)
+        }
+        const bool upright = posture == Posture::UPRIGHT;
+        system.setDisturbed(!upright);
+
+        // Prediction used to happen only inside Event::process, so a frame that
+        // produced no usable measurement advanced neither the state nor the clock.
+        // A face-down fall produces exactly that (no detections at all), and the
+        // filter would emerge from it holding its pre-fall mean at its pre-fall
+        // covariance -- confidently wrong rather than honestly uncertain.
+        const bool poseFinite = v.Hcw.rotationMatrix.allFinite() && v.Hcw.translationVector.allFinite();
+        if (!upright || v.detections.empty() || !poseFinite)
+        {
+            system.predictAll(t);
             nSkipped++;
+            if (!upright)
+            {
+                if (prevPosture == Posture::UPRIGHT)
+                {
+                    fallStartT = t;
+                    std::println("NOT UPRIGHT at t={:.2f} s ({}): suppressing gravity, kinematic-height, "
+                                 "landmark and out-of-field updates until recovery", t, to_string(posture));
+                }
+                nFallenFrames++;
+            }
+            prevPosture = posture;
             continue;
         }
+
+        // Recovery from a fall. The mean is kept: a fall and getup move the torso
+        // well under a metre, so the pre-fall position is still the best estimate
+        // available, and re-solving the pose globally would be worse -- the
+        // start-of-game grid search resolves field symmetry from the known starting
+        // half, a prior that is simply false once play is under way. What a fall
+        // actually destroys is confidence, above all in yaw, so that is what is
+        // given back. The inflated position std also exceeds SideDisambiguator's
+        // maxPosStd, which freezes background-map building until the filter has
+        // reconverged, so no landmarks are triangulated from the recovering pose.
+        if (prevPosture != Posture::UPRIGHT)
+        {
+            Eigen::VectorXd extraVar = Eigen::VectorXd::Zero(SystemLocalisation::nx);
+            extraVar(0) = extraVar(1) = recoveryPosStd*recoveryPosStd;
+            extraVar(5) = recoveryYawStd*recoveryYawStd;
+            system.inflateCovariance(extraVar);
+
+            // A fall is also a chance to have been turned around without the
+            // landmarks noticing, and they can never notice: the two symmetric
+            // field poses fit each other's landmarks identically. Re-seed the
+            // mirror so the out-of-field evidence has something to switch to.
+            if (useHypothesisBank && system.numHypotheses() == 1)
+            {
+                system.spawnMirror();
+                lastRespawnT = t;
+            }
+            std::println("RECOVERED at t={:.2f} s after {:.2f} s not upright: inflated to "
+                         "sigma_xy {:.2f} m, sigma_yaw {:.1f} deg ({} hypotheses)",
+                         t, t - fallStartT, std::sqrt(system.density.cov()(0, 0)),
+                         std::sqrt(system.density.cov()(5, 5))*180.0/M_PI, system.numHypotheses());
+            nFalls++;
+        }
+        prevPosture = posture;
 
         // Camera pose w.r.t. torso from the kinematic chain (odometry cancels):
         // Tbc = Htw * Hcw^{-1}
@@ -1055,7 +1194,9 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
 
     // Summary
     std::println("");
-    std::println("Processed {} vision updates ({} skipped)", nUpdates, nSkipped);
+    std::println("Processed {} vision updates ({} skipped, of which {} while not upright)",
+                 nUpdates, nSkipped, nFallenFrames);
+    std::println("Falls recovered from: {}", nFalls);
     {
         Eigen::VectorXd xFinal = system.density.mean();
         std::println("Final camera mount bias estimate: roll {:.2f} deg, pitch {:.2f} deg",

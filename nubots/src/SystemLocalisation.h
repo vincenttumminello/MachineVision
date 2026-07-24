@@ -66,6 +66,20 @@ public:
         double sigmaAtt    = 0.05;  ///< Roll/pitch process noise PSD [rad/sqrt(s)]
         double sigmaYaw    = 0.05;  ///< Yaw process noise PSD [rad/sqrt(s)]
         double sigmaCamBias = 3e-4; ///< Camera mount bias process noise PSD [rad/sqrt(s)] (kept small so bias cannot wander while stationary)
+
+        // While the robot is not upright the process model is not merely noisier,
+        // it is wrong: the twist input's linear velocity comes from walk-engine
+        // odometry, which reports the gait it believes it is executing rather than
+        // the metre the torso travels while toppling and being levered back up.
+        // The attitude channel is in better shape (the gyroscope measures the
+        // tumble directly) but integrates through impact transients. These PSDs
+        // are what the belief decays towards over a fall instead: a 2 s fall grows
+        // the horizontal position std by ~0.57 m and the yaw std by ~0.85 rad,
+        // enough to reopen the landmark association gates on recovery.
+        double sigmaPosXYDisturbed = 0.40;  ///< Horizontal position process noise PSD while not upright [m/sqrt(s)]
+        double sigmaPosZDisturbed  = 0.30;  ///< Vertical position process noise PSD while not upright [m/sqrt(s)]
+        double sigmaAttDisturbed   = 0.60;  ///< Roll/pitch process noise PSD while not upright [rad/sqrt(s)]
+        double sigmaYawDisturbed   = 0.60;  ///< Yaw process noise PSD while not upright [rad/sqrt(s)]
     };
 
     static constexpr Eigen::Index nx = 8;   ///< State dimension
@@ -131,6 +145,51 @@ public:
      * @param time New system time [s]
      */
     void resetTo(const GaussianInfo<double> & density, double time);
+
+    /**
+     * @brief Declare whether the robot is currently upright.
+     *
+     * Two things change while disturbed. The process noise switches to the
+     * `*Disturbed` PSDs, so the belief decays honestly across a fall instead of
+     * coasting at walking-grade confidence. And the twist input's linear velocity
+     * is zeroed: it is derived by differencing walk-engine odometry, which during
+     * a fall describes a gait that is not happening. The gyroscope-derived angular
+     * velocity is kept, because it measures the topple for real.
+     *
+     * This is a mode, not an event: the caller sets it every frame from the
+     * posture and it stays in force until changed.
+     */
+    void setDisturbed(bool disturbed) { disturbed_ = disturbed; }
+
+    /**
+     * @brief Whether the robot is currently flagged as not upright.
+     */
+    bool disturbed() const { return disturbed_; }
+
+    /**
+     * @brief Add variance to the belief without moving its mean.
+     *
+     * Used on recovery from a fall. The pre-fall mean is still the best estimate
+     * available -- a fall and getup translate the torso well under a metre, far
+     * less than a global relocalisation would risk getting wrong -- but the
+     * confidence attached to it is not survivable, particularly in yaw. Applies
+     * to every live hypothesis as well as to the representative density.
+     *
+     * @param extraVar Variance to add per state element (length nx, non-negative)
+     */
+    void inflateCovariance(const Eigen::VectorXd & extraVar);
+
+    /**
+     * @brief Advance the belief to @p time with no measurement.
+     *
+     * Prediction otherwise only ever happens inside Event::process, so a frame
+     * that yields no usable measurement used to advance neither the state nor the
+     * clock. That is exactly what a fall produces (the camera is in the carpet and
+     * YOLO returns nothing), and it left the filter holding its pre-fall mean at
+     * its pre-fall covariance across the whole event. Predicts every hypothesis
+     * when the bank is active.
+     */
+    void predictAll(double time);
 
     Parameters params;
 
@@ -249,6 +308,7 @@ public:
 
 protected:
     const std::vector<BodyTwistSample> * twistBuffer_;  ///< Non-owning; ZOH input lookup
+    bool disturbed_ = false;                            ///< Robot is not upright (see setDisturbed)
 
     std::vector<GaussianInfo<double>> components_;   ///< Mixture components (empty => single-hypothesis)
     std::vector<double> logWeights_;                 ///< Unnormalised log weights per component

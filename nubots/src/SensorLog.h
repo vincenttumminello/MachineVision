@@ -7,13 +7,14 @@
  * @code
  * {"type": "<message type>", "timestamp": <int, microseconds since epoch>, "data": {...}}
  * @endcode
- * Only six message types are of interest for state estimation and are parsed here:
+ * Only seven message types are of interest for state estimation and are parsed here:
  *   - message.input.Sensors
  *   - message.vision.BoundingBoxes
  *   - message.behaviour.state.WalkState
  *   - message.localisation.Field
  *   - message.vision.FieldLines
  *   - message.input.MotionCapture (OptiTrack ground truth; evaluation only)
+ *   - any type ending in ".Stability" (posture / fallen flags; optional)
  *
  * @see SensorLog
  */
@@ -70,6 +71,20 @@ struct WalkStateSample
 };
 
 /**
+ * @brief A single stability-state sample (NUbots' fallen / getting-up flags).
+ *
+ * NUbots publishes the posture of the robot as a bare enum message; the state
+ * name is kept as the raw string rather than a parsed enum so that a log
+ * recorded against a different revision of the enum still loads. FallDetector
+ * is what interprets the names.
+ */
+struct StabilitySample
+{
+    double t;                ///< message time [s since epoch]
+    std::string state;       ///< raw state name, e.g. "STANDING", "FALLING", "FALLEN"
+};
+
+/**
  * @brief A single message.localisation.Field sample (NUbots' own NLopt-based estimate, for comparison)
  */
 struct FieldBaselineSample
@@ -109,10 +124,10 @@ struct LinePointsSample
 /**
  * @brief Parses a recorded NUbots sensor log (NDJSON) and aligns vision samples to video frames.
  *
- * Only six message types are parsed (message.input.Sensors, message.vision.BoundingBoxes,
+ * Only seven message types are parsed (message.input.Sensors, message.vision.BoundingBoxes,
  * message.behaviour.state.WalkState, message.localisation.Field, message.vision.FieldLines,
- * message.input.MotionCapture); all other message types are skipped cheaply. Each resulting
- * stream is time-ordered.
+ * message.input.MotionCapture, and any ".Stability" type); all other message types are skipped
+ * cheaply. Each resulting stream is time-ordered.
  */
 class SensorLog
 {
@@ -128,6 +143,7 @@ public:
     std::vector<SensorsSample> sensors;              ///< time-ordered
     std::vector<VisionSample> vision;                ///< time-ordered
     std::vector<WalkStateSample> walk;                ///< time-ordered
+    std::vector<StabilitySample> stability;          ///< time-ordered (empty if the log has no stability stream)
     std::vector<FieldBaselineSample> fieldBaseline;  ///< time-ordered
     std::vector<LinePointsSample> linePoints;        ///< time-ordered
     std::vector<MocapSample> mocap;                  ///< time-ordered (empty if the log has no mocap)

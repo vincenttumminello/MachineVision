@@ -173,6 +173,72 @@ optional Gaussian-mixture hypothesis bank):
   per-frame errors are strongly correlated and multi-line capture degraded
   accuracy on the recorded data.
 
+## Falls (`FallDetector`, posture gate)
+
+Every measurement model above is an upright-robot model. Gravity assumes the
+accelerometer reads gravity; kinematic height assumes the support leg reaches the
+ground; the landmark model assumes predicted bearings land inside a 0.35 rad
+gate; the side disambiguator assumes the pose it triangulates background corners
+from is roughly right. A fall breaks all four at once, and none of them degrade
+gracefully — the accelerometer reads ≈0 in free fall and 20–40 m/s² on impact
+against a 1 m/s² noise model (a 10–30σ pull on roll and pitch), and a handful of
+landmarks that happen to line up under the wrong attitude will happily *shrink*
+the covariance around a pose that is simply wrong.
+
+`FallDetector` builds a posture timeline for the log, preferring the robot's own
+stability flags (`SensorLog::stability`, parsed from any `*.Stability` message)
+and falling back to the tilt of the smoothed accelerometer when the log has none.
+Smoothing is essential: ordinary walking spikes the *raw* accelerometer past 90°
+of apparent tilt for single samples, so nothing instantaneous is usable. The
+kinematic chain is deliberately not trusted for this — in both recordings it
+reports a near-upright torso at 0.44 m even through a 34° lean.
+
+While the posture is anything other than upright:
+
+- The belief is **predicted and nothing else** — no gravity, kinematic-height,
+  landmark or out-of-field update is applied.
+- **Prediction still runs.** It previously only ever happened inside
+  `Event::process`, so a frame with no detections advanced neither the state nor
+  the clock. A face-down fall produces exactly that, and the filter would emerge
+  holding its pre-fall mean at its pre-fall covariance — confidently wrong rather
+  than honestly uncertain. `SystemLocalisation::predictAll` fixes that, for every
+  hypothesis when the bank is live.
+- The **twist input's linear velocity is zeroed** (`setDisturbed`). It is a finite
+  difference of walk-engine odometry, which keeps describing the gait it believes
+  it is executing while the robot is on the ground; the zero-order hold would
+  otherwise carry the last pre-fall velocity across the whole event. The
+  gyroscope-derived angular rate is kept, because it measures the topple for real.
+- Process noise switches to the `*Disturbed` PSDs, so the belief decays honestly
+  (≈0.40 m/√s in position, 0.60 rad/√s in yaw) rather than coasting.
+
+On recovery the **mean is kept** and only the covariance is widened (+0.50 m in
+position, +60° in yaw). A fall and getup translate the torso well under a metre,
+so the pre-fall position remains the best estimate available. Re-running the
+initial grid solve would be actively worse: it resolves field symmetry from the
+known starting half, a prior that is true exactly once, at kick-off — mid-game it
+would drag a correctly localised robot standing in the opponent half back across
+the halfway line. The inflated position std also exceeds `SideDisambiguator`'s
+`maxPosStd`, which freezes background-map building until the filter reconverges,
+so no landmarks are triangulated from the recovering pose. With the bank live, the
+mirror is re-seeded, since a fall is also an opportunity to have been turned around
+without the landmarks being able to notice.
+
+Separately, `TKfromThetaTemplated` now saturates `|cos(pitch)|` at 1e-3. The
+roll-pitch-yaw rate transform is singular at pitch = ±90°, which a forward or
+backward fall passes straight through; unguarded, the infinite Jacobian propagates
+into the predicted covariance and hands the Newton update a NaN prior, poisoning
+the filter for the rest of the run rather than just for the fall. The clamp never
+binds below 89.94° of pitch, so upright behaviour is bit-for-bit unchanged.
+
+**Neither recording contains a fall** — the torso never leaves 0.43–0.44 m and
+tilt peaks at 34°. `FALL_T=<s> FALL_DURATION=<s>` forces the posture to fallen over
+a window so the suppress → coast → inflate → recover path can be exercised on real
+data. A 3 s injected fall at t = 40 s on `data2` recovers to σ_xy 0.86 m / σ_yaw
+84.5° and reconverges to 0.108 m / 5.40° RMSE against mocap, versus 0.107 m / 5.41°
+undisturbed. Note what that does and does not show: the robot really is upright
+throughout, so it demonstrates the filter survives and reconverges after a blind
+window, not that the detector fires on a genuine topple.
+
 ## Side disambiguation (`SideDisambiguator`, `OutOfFieldFeatures`)
 
 The field is symmetric under 180° rotation, so on-field evidence can never
