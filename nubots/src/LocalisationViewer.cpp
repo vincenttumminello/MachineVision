@@ -6,6 +6,7 @@
 #include <deque>
 #include <format>
 #include <print>
+#include <system_error>
 #include <unordered_map>
 #include <Eigen/Eigenvalues>
 #include <opencv2/imgproc.hpp>
@@ -1042,24 +1043,49 @@ void LocalisationViewer::exportVideo(const std::vector<ViewerFrame> & frames,
 
     if (fps <= 0.0) fps = playbackFps(frames);
 
+    // Codec: H.264 first, MPEG-4 Part 2 only as a fallback.
+    //
+    // These composites are large (about 2.4 Mpx) and the replay now covers every
+    // frame of the recording, so the file is long as well as wide. Under 'mp4v'
+    // that came to 394 MB for one data3_webots run -- roughly 30 Mbit/s, and
+    // unplayable on a desktop without the patent-encumbered mpeg4 decoder, which
+    // a stock Fedora does not ship. Measured by transcoding real composite
+    // frames, H.264 is 4.3x smaller for identical input (120 -> 28 KB per frame)
+    // and is the one codec every player, browser and phone handles. 'mp4v' stays
+    // as the fallback for an OpenCV built without libx264.
+    const cv::Size frameSize = renderComposite(frames, 0, grabFrame(frames[0].videoFrame)).size();
+    // That probe advanced the capture, so restart the sequential walk.
+    lastDecoded = -1;
+    if (haveVideo) cap.set(cv::CAP_PROP_POS_FRAMES, 0.0);
+
     cv::VideoWriter writer;
-    const int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
+    const char * codecName = nullptr;
+    for (const auto & [name, cc] : {std::pair<const char *, int>{"H.264", cv::VideoWriter::fourcc('a', 'v', 'c', '1')},
+                                    {"MPEG-4 Part 2", cv::VideoWriter::fourcc('m', 'p', '4', 'v')}})
+    {
+        if (writer.open(outPath.string(), cc, fps, frameSize))
+        {
+            codecName = name;
+            break;
+        }
+        std::println("Viewer: no {} encoder available, falling back", name);
+    }
+    if (!writer.isOpened())
+    {
+        std::println("Viewer: failed to open VideoWriter for {}", outPath.string());
+        return;
+    }
+
     for (std::size_t i = 0; i < frames.size(); ++i)
     {
-        cv::Mat raw = grabFrame(frames[i].videoFrame);
-        cv::Mat composite = renderComposite(frames, i, raw);
-        if (!writer.isOpened())
-        {
-            if (!writer.open(outPath.string(), fourcc, fps, composite.size()))
-            {
-                std::println("Viewer: failed to open VideoWriter for {}", outPath.string());
-                return;
-            }
-        }
-        writer.write(composite);
+        writer.write(renderComposite(frames, i, grabFrame(frames[i].videoFrame)));
     }
     writer.release();
-    std::println("Exported {} ({} frames at {:.0f} fps)", outPath.string(), frames.size(), fps);
+
+    std::error_code ec;
+    const auto bytes = std::filesystem::file_size(outPath, ec);
+    std::println("Exported {} ({} frames at {:.0f} fps, {}, {:.1f} MB)", outPath.string(),
+                 frames.size(), fps, codecName, ec ? 0.0 : static_cast<double>(bytes)/1048576.0);
 }
 
 // ===========================================================================
