@@ -18,7 +18,11 @@ namespace
 
 constexpr int    kPanelH   = 760*1.25;    ///< Panel height [px]
 constexpr int    kHeaderH  = 36*1.25;     ///< Header strip height [px]
-constexpr double kHalfFov  = 75.0*M_PI/180.0;  ///< Half field-of-view for the top-down wedge
+// The viewing wedge's half-angle comes from the lens (CameraLens::horizontalHalfFov),
+// not from a constant: it was hardcoded at 75 deg, which drew the same wedge for
+// every calibration -- 12 deg narrow for the NUbots fisheye and 30 deg too wide
+// for the webots pinhole, in both cases claiming a field of view the camera does
+// not have.
 
 // True capture rate, derived from the recorded frame times. Container fps metadata
 // is unreliable for these recordings (e.g. a 10 fps capture whose mp4 claims 25),
@@ -567,7 +571,8 @@ cv::Mat LocalisationViewer::renderTopDownPanel(const std::vector<ViewerFrame> & 
         const Eigen::Vector2d o = cur.estPos;
         for (double s : {-1.0, 1.0})
         {
-            const Eigen::Vector2d dir(std::cos(az + s*kHalfFov), std::sin(az + s*kHalfFov));
+            const double halfFov = lens_.horizontalHalfFov();
+            const Eigen::Vector2d dir(std::cos(az + s*halfFov), std::sin(az + s*halfFov));
             cv::line(panel, toPix(o), toPix(Eigen::Vector2d(o + 3.0*dir)), cv::Scalar(70, 130, 70), 1, cv::LINE_AA);
         }
     }

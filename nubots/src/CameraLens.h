@@ -168,6 +168,22 @@ struct CameraLens
         return px.x() >= 0.0 && px.x() < width && px.y() >= 0.0 && px.y() < height;
     }
 
+    /**
+     * @brief Half of the horizontal field of view [rad].
+     *
+     * Measured, not declared: the angle off the optical axis of the ray that
+     * unprojects from the middle of the left image edge, so it follows whatever
+     * projection model and distortion this calibration carries. The two in use
+     * are nowhere near each other -- 86.7 deg for the NUbots fisheye against
+     * 45.0 deg for the webots pinhole -- so anything drawing a viewing wedge has
+     * to ask rather than assume.
+     */
+    double horizontalHalfFov() const
+    {
+        const Eigen::Vector3d edge = unproject(Eigen::Vector2d(0.0, height*0.5 - centre.y()*width));
+        return std::atan2(std::hypot(edge.y(), edge.z()), edge.x());
+    }
+
     /// @brief One-line description for logging.
     std::string describe() const
     {
