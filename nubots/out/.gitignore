@@ -5,4 +5,4 @@
 !.gitignore
 # and the video and png
 # !localisation.mp4
-!field_trajectory.png
+# !field_trajectory.png
