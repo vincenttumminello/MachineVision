@@ -6,6 +6,7 @@
 #include <opencv2/core.hpp>
 #include "calibrate.h"
 #include "CameraLens.h"
+#include "FieldMap.h"
 #include "fieldLocalisation.h"
 
 int main(int argc, char* argv [])
@@ -18,6 +19,7 @@ int main(int argc, char* argv [])
         "{robocup r       |          | run RoboCup field localisation on recorded data directory}"
         "{interactive i   | 0        | interactivity (0:none, 1:last frame, 2:all frames)}"
         "{lens l          |          | camera calibration to replay with (default: from the frame size)}"
+        "{field f         |          | field the recording was made on (default: follows the camera)}"
         "{export e        |          | export results}";
 
     cv::CommandLineParser parser(argc, argv, keys);
@@ -29,6 +31,7 @@ int main(int argc, char* argv [])
         // The keys string above is a compile-time literal, so the calibrations
         // the build actually knows about are listed here instead.
         std::println("Available --lens calibrations: {}", lensNames());
+        std::println("Available --field sizes: {}", fieldNames());
         for (const CameraLens & lens : lensCatalogue())
         {
             std::println("  {}", lens.describe());
@@ -38,6 +41,7 @@ int main(int argc, char* argv [])
 
     int interactive = parser.get<int>("interactive");
     std::string lensName = parser.get<std::string>("lens");
+    std::string fieldName = parser.get<std::string>("field");
     bool hasExport = parser.has("export");
     bool hasCalibrate = parser.has("calibrate");
     std::filesystem::path inputPath = parser.get<std::string>("@input");
@@ -52,6 +56,12 @@ int main(int argc, char* argv [])
     if (!lensName.empty() && lensByName(lensName) == nullptr)
     {
         std::println("Unknown --lens '{}'. Available calibrations: {}", lensName, lensNames());
+        return EXIT_FAILURE;
+    }
+
+    if (!fieldName.empty() && !fieldByName(fieldName))
+    {
+        std::println("Unknown --field '{}'. Available fields: {}", fieldName, fieldNames());
         return EXIT_FAILURE;
     }
 
@@ -80,7 +90,7 @@ int main(int argc, char* argv [])
         assert(0 <= interactive && interactive <= 2);
         std::println("Running RoboCup field localisation");
         std::println("Data directory: {}", inputPath.string());
-        runFieldLocalisation(inputPath, interactive, outputDirectory, lensName);
+        runFieldLocalisation(inputPath, interactive, outputDirectory, lensName, fieldName);
     }
 
     return EXIT_SUCCESS;

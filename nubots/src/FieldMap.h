@@ -78,6 +78,9 @@
 #ifndef FIELDMAP_H
 #define FIELDMAP_H
 
+#include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
 #include <Eigen/Core>
 
@@ -90,6 +93,7 @@
  */
 struct FieldDimensions
 {
+    std::string name            = "lab";   ///< Which field this is, for logging
     double lineWidth            = 0.05;    ///< Width of field lines
     double fieldLength          = 6.8;     ///< Touchline (sideline) length
     double fieldWidth           = 5.0;     ///< Goal line (baseline) length
@@ -104,6 +108,49 @@ struct FieldDimensions
     double goalpostWidth        = 0.10;    ///< Diameter of a (circular) goal post
     double borderStripMinWidth  = 0.38;    ///< Minimum width of the border strip around the field
 };
+
+/**
+ * @brief The field the webots worlds are built on: the full kid-size RoboCup field.
+ *
+ * Transcribed from NUbots/module/support/configuration/SoccerConfig/data/config/webots/
+ * FieldDescription.yaml, the config the simulator's own localisation and its
+ * RobotPoseGroundTruth are produced against. It is NOT a scaled version of the lab
+ * field -- 9 x 6 m against 6.8 x 5 m, with a different goal width, penalty mark
+ * distance and box sizes -- so replaying a webots recording against the lab map puts
+ * every landmark metres from where the robot actually sees it. The border strip is
+ * also 1.0 m rather than 0.38 m, which OutOfFieldFeatures uses to decide what counts
+ * as carpet.
+ */
+inline FieldDimensions webotsFieldDimensions()
+{
+    FieldDimensions d;
+    d.name                 = "webots";
+    d.lineWidth            = 0.05;
+    d.fieldLength          = 9.0;
+    d.fieldWidth           = 6.0;
+    d.goalDepth            = 0.6;
+    d.goalWidth            = 2.6;
+    d.goalAreaLength       = 1.0;
+    d.goalAreaWidth        = 3.0;
+    d.penaltyMarkDistance  = 1.5;
+    d.centreCircleDiameter = 1.5;
+    d.penaltyAreaLength    = 2.0;
+    d.penaltyAreaWidth     = 5.0;
+    d.goalpostWidth        = 0.10;
+    d.borderStripMinWidth  = 1.0;
+    return d;
+}
+
+/// @brief Look a field up by name ("lab", "webots"); nullopt if there is no such name.
+inline std::optional<FieldDimensions> fieldByName(std::string_view name)
+{
+    if (name == "lab")    return FieldDimensions{};
+    if (name == "webots") return webotsFieldDimensions();
+    return std::nullopt;
+}
+
+/// @brief Comma-separated list of the available field names, for help text.
+inline std::string fieldNames() { return "lab, webots"; }
 
 /**
  * @brief Classification of a field landmark

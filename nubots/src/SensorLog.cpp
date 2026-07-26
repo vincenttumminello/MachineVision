@@ -258,6 +258,9 @@ SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesyst
         throw std::runtime_error("SensorLog: failed to open " + jsonPath.string());
     }
 
+    // Envelope-minus-payload clock samples, collected while parsing (see realign below).
+    std::vector<double> clockOffsets;
+
     for (auto docResult : docs)
     {
         // docResult is a simdjson_result<ondemand::document_reference>: fields are accessed
@@ -267,6 +270,11 @@ SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesyst
 
         if (type == "message.input.Sensors")
         {
+            // Read the envelope timestamp before the payload: simdjson's ondemand
+            // parser is forward-only, and "timestamp" precedes "data" on the wire.
+            int64_t envelopeUs = 0;
+            const bool haveEnvelope = docResult["timestamp"].get_int64().get(envelopeUs) == simdjson::SUCCESS;
+
             simdjson::ondemand::object data;
             if (docResult["data"].get_object().get(data) != simdjson::SUCCESS)
             {
@@ -274,6 +282,12 @@ SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesyst
             }
             SensorsSample sample;
             sample.t = parseIso8601(getStringTolerant(data["timestamp"]));
+            // Sample the offset between the two clocks this file mixes (see the
+            // realign step after parsing).
+            if (haveEnvelope && std::isfinite(sample.t))
+            {
+                clockOffsets.push_back(static_cast<double>(envelopeUs)*1e-6 - sample.t);
+            }
             sample.Htw = parseIso3(data["Htw"]);
             sample.accelerometer = parseVec3(data["accelerometer"]);
             sample.gyroscope = parseVec3(data["gyroscope"]);
@@ -392,6 +406,32 @@ SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesyst
             sample.Hfw = parseIso3(data["Hfw"]);
             sample.cost = getDoubleTolerant(data["cost"]);
             fieldBaseline.push_back(std::move(sample));
+        }
+        else if (type == "message.localisation.RobotPoseGroundTruth")
+        {
+            // The webots supervisor's own answer. Note it is matched on the exact
+            // type rather than a suffix: unlike the stability stream there is a
+            // second, differently-shaped copy of this data hiding inside
+            // RawSensors (field 12), which in the data3_webots recording is
+            // present on every message with exists == false and uninitialised
+            // garbage in Hft. Matching loosely would pick that up.
+            int64_t timestampUs = 0;
+            bool haveTimestamp = docResult["timestamp"].get_int64().get(timestampUs) == simdjson::SUCCESS;
+
+            simdjson::ondemand::object data;
+            if (docResult["data"].get_object().get(data) != simdjson::SUCCESS)
+            {
+                continue;
+            }
+            GroundTruthSample sample;
+            sample.t = haveTimestamp ? static_cast<double>(timestampUs) * 1e-6 : NaN;
+            sample.Hft = parseIso3(data["Hft"]);
+            sample.vTf = parseVec3(data["vTf"]);
+            if (std::isfinite(sample.t) && sample.Hft.rotationMatrix.allFinite()
+                && sample.Hft.translationVector.allFinite())
+            {
+                groundTruth.push_back(std::move(sample));
+            }
         }
         else if (type == "message.input.MotionCapture")
         {
@@ -570,6 +610,46 @@ SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesyst
     std::stable_sort(fieldBaseline.begin(), fieldBaseline.end(), byTime);
     std::stable_sort(linePoints.begin(), linePoints.end(), byTime);
     std::stable_sort(mocap.begin(), mocap.end(), byTime);
+    std::stable_sort(groundTruth.begin(), groundTruth.end(), byTime);
+
+    // ------------------------------------------------------------------------------------------
+    // Clock realignment
+    //
+    // This file mixes two timestamps. message.input.Sensors, the vision messages and the field-line
+    // points carry a payload timestamp (an ISO-8601 string); WalkState, the stability stream, the
+    // NUbots baseline, motion capture and the simulator ground truth carry only the envelope
+    // timestamp NUClear stamped on receipt. On a real robot those are the same clock and the mix is
+    // harmless, which is why it went unnoticed. Under webots the payload timestamp is SIMULATION
+    // time -- data4_webots stamps its Sensors messages "1970-01-01T00:15:44.824Z", i.e. 945 s --
+    // while the envelope stays on the wall clock, so the two are 1.785e9 s apart and every
+    // envelope-stamped stream lands unimaginably far from the samples it is supposed to line up
+    // with. Nothing detects that: the baseline and truth comparisons simply never match a frame,
+    // or match the wrong one.
+    //
+    // Sensors carries both stamps, so the offset between the clocks is measurable. The median is
+    // used rather than the mean because a handful of late-delivered messages would drag a mean.
+    // ------------------------------------------------------------------------------------------
+    if (!clockOffsets.empty())
+    {
+        std::nth_element(clockOffsets.begin(), clockOffsets.begin() + clockOffsets.size()/2, clockOffsets.end());
+        clockOffset = clockOffsets[clockOffsets.size()/2];
+        // A real-robot log has the two clocks within a few ms of each other; leave those alone so
+        // the recordings this pipeline was built on stay bit-for-bit unchanged.
+        constexpr double kRealignThreshold = 1.0;   // [s]
+        if (std::abs(clockOffset) > kRealignThreshold)
+        {
+            for (WalkStateSample & x : walk)             { x.t -= clockOffset; }
+            for (StabilitySample & x : stability)   { x.t -= clockOffset; }
+            for (FieldBaselineSample & x : fieldBaseline) { x.t -= clockOffset; }
+            for (MocapSample & x : mocap)           { x.t -= clockOffset; }
+            for (GroundTruthSample & x : groundTruth) { x.t -= clockOffset; }
+            clockRealigned = true;
+        }
+        else
+        {
+            clockOffset = 0.0;
+        }
+    }
 
     t0 = std::numeric_limits<double>::infinity();
     if (!sensors.empty())

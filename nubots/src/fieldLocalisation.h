@@ -19,8 +19,10 @@
  * @param outputDirectory Directory for exported results (empty: no export)
  * @param lensName Camera calibration to replay with (see CameraLens.h); empty
  *                 selects it from the recorded frame size
+ * @param fieldName Field the recording was made on (see FieldMap.h); empty
+ *                  follows the camera calibration
  */
 void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive, const std::filesystem::path & outputDirectory,
-                          const std::string & lensName = {});
+                          const std::string & lensName = {}, const std::string & fieldName = {});
 
 #endif

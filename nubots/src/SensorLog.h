@@ -111,6 +111,23 @@ struct MocapSample
 };
 
 /**
+ * @brief A single message.localisation.RobotPoseGroundTruth sample.
+ *
+ * The simulator's own answer for where the robot is, published by the Webots
+ * supervisor (NUWebots nugus_controller) and re-emitted by NUbots. This is the
+ * webots counterpart of the OptiTrack MocapSample stream, and the two differ in
+ * more than provenance: Hft is the torso pose in the field frame directly, so
+ * there is no marker body sitting above the torso origin and no capture-volume
+ * alignment to undo. It is EVALUATION ONLY and never reaches the estimator.
+ */
+struct GroundTruthSample
+{
+    double t;               ///< receive time [s since epoch]
+    Pose<double> Hft;       ///< Torso pose in the field frame {f}
+    Eigen::Vector3d vTf;    ///< Torso velocity in {f} [m/s]
+};
+
+/**
  * @brief A single message.vision.FieldLines sample (field-line points as camera rays)
  */
 struct LinePointsSample
@@ -147,7 +164,16 @@ public:
     std::vector<FieldBaselineSample> fieldBaseline;  ///< time-ordered
     std::vector<LinePointsSample> linePoints;        ///< time-ordered
     std::vector<MocapSample> mocap;                  ///< time-ordered (empty if the log has no mocap)
+    std::vector<GroundTruthSample> groundTruth;      ///< time-ordered (empty if the log has no simulator truth)
     std::vector<double> frameTimes;                  ///< [s since epoch] per video frame
+
+    /// @brief Envelope-minus-payload clock offset removed from the envelope-stamped streams [s].
+    ///
+    /// Zero for a real-robot log, where both stamps are the same wall clock. Non-zero for a webots
+    /// recording, whose payload timestamps are simulation time while the envelope stays on the wall
+    /// clock. See the realignment step in SensorLog.cpp.
+    double clockOffset = 0.0;
+    bool clockRealigned = false;                     ///< Whether that offset was large enough to correct
     double t0 = 0;                                    ///< earliest sample time across all streams [s]
 };
 

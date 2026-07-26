@@ -73,6 +73,24 @@ static CameraLens selectLens(const std::filesystem::path & videoPath, const std:
     return CameraLens{};
 }
 
+// Choose the field the recording was made on.
+//
+// The lab field and the webots field are different sizes (6.8 x 5 m against
+// 9 x 6 m), so this is not a detail: replaying against the wrong one puts every
+// landmark metres from where the robot sees it, and the estimate absorbs the
+// difference as pose error. An explicit --field always wins; otherwise it
+// follows the camera, since a recording made through the simulated camera was
+// made in the simulated world.
+static FieldDimensions selectField(const CameraLens & lens, const std::string & fieldName)
+{
+    if (!fieldName.empty())
+    {
+        if (const std::optional<FieldDimensions> named = fieldByName(fieldName)) return *named;
+        throw std::runtime_error(std::format("Unknown --field '{}'; expected one of: {}", fieldName, fieldNames()));
+    }
+    return lens.name == "webots" ? webotsFieldDimensions() : FieldDimensions{};
+}
+
 // Nearest sample index in a time-ordered vector, by member time extractor
 template <typename T, typename F>
 static std::size_t nearestIndex(const std::vector<T> & v, double t, F && timeOf)
@@ -122,12 +140,32 @@ namespace mocaptruth
     constexpr double yawOffset = 59.07*M_PI/180.0;
 }
 
+/// @brief Where a run's ground truth came from. The two are not interchangeable.
+enum class TruthSource
+{
+    NONE,
+    MOCAP,      ///< OptiTrack markers (data, data2): rBFf is the MARKER body, ~6 cm above the torso
+    SIMULATOR   ///< Webots supervisor (data4_webots): rBFf is the torso origin itself
+};
+
+/// @brief Human-readable name of a truth source.
+static const char * to_string(TruthSource src)
+{
+    switch (src)
+    {
+        case TruthSource::MOCAP:     return "MOCAP";
+        case TruthSource::SIMULATOR: return "SIMULATOR";
+        case TruthSource::NONE:      break;
+    }
+    return "none";
+}
+
 /// @brief One ground-truth pose in the field frame.
 struct TruthSample
 {
     double t;               ///< Time since log start [s]
-    Eigen::Vector3d rBFf;   ///< Marker-body position in {f} (z is marker height)
-    double yaw;             ///< Torso yaw in {f} (extrinsics-corrected)
+    Eigen::Vector3d rBFf;   ///< Reference-body position in {f}; see TruthSource for what z means
+    double yaw;             ///< Torso yaw in {f}
 };
 
 /// @brief Convert the raw mocap stream to field-frame ground truth.
@@ -146,6 +184,31 @@ static std::vector<TruthSample> buildTruth(const std::vector<MocapSample> & moca
         s.rBFf = mocaptruth::Rfm*m.position;
         const Eigen::Vector3d bx = mocaptruth::Rfm*m.R.col(0);   // marker-body x axis in {f}
         s.yaw = std::atan2(bx.y(), bx.x()) - mocaptruth::yawOffset;
+        truth.push_back(s);
+    }
+    return truth;
+}
+
+/**
+ * @brief Convert the simulator's RobotPoseGroundTruth stream to field-frame truth.
+ *
+ * Far less work than the mocap path, and deliberately so: Hft is already the
+ * torso pose in the field frame the estimator works in (verified against this
+ * log's own NUbots baseline, which tracks it to ~0.2 m over a whole run), so
+ * there is no capture-volume rotation to undo, no marker body offset above the
+ * torso, and no yaw extrinsic. Anything more here would be inventing a
+ * correction the simulator has already applied.
+ */
+static std::vector<TruthSample> buildTruth(const std::vector<GroundTruthSample> & gt, double t0)
+{
+    std::vector<TruthSample> truth;
+    truth.reserve(gt.size());
+    for (const GroundTruthSample & g : gt)
+    {
+        TruthSample s;
+        s.t = g.t - t0;
+        s.rBFf = g.Hft.translationVector;
+        s.yaw = std::atan2(g.Hft.rotationMatrix(1, 0), g.Hft.rotationMatrix(0, 0));
         truth.push_back(s);
     }
     return truth;
@@ -485,7 +548,7 @@ static bool solveInitialPose(const SensorLog & log, const FieldMap & map,
 }
 
 void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive, const std::filesystem::path & outputDirectory,
-                          const std::string & lensName)
+                          const std::string & lensName, const std::string & fieldName)
 {
     const std::filesystem::path jsonPath = dataDir / "recorded_data.json";
     const std::filesystem::path timecodePath = dataDir / "Left_timecode.txt";
@@ -500,6 +563,13 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                  (log.sensors.empty() ? 0.0 : log.sensors.back().t - t0));
 
     // Odometry-derived body twist input buffer
+    if (log.clockRealigned)
+    {
+        std::println("Clock: payload and envelope timestamps differ by {:.1f} s (webots simulation time vs "
+                     "wall clock); the envelope-stamped streams have been shifted onto the payload clock",
+                     log.clockOffset);
+    }
+
     std::vector<BodyTwistSample> twists = SystemLocalisation::twistFromOdometry(log.sensors, t0);
     std::println("Derived {} body twist samples from odometry", twists.size());
 
@@ -527,19 +597,27 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     }
 
     // Motion-capture ground truth (evaluation only; see mocaptruth above).
-    const std::vector<TruthSample> truth = buildTruth(log.mocap, t0);
+    // Ground truth, from whichever stream this recording carries. The simulator's
+    // is preferred where both exist: it is the pose the world was actually built
+    // from rather than an inference from markers. A log can carry neither, which
+    // is not an error -- it only disables the comparisons.
+    const TruthSource truthSource = !log.groundTruth.empty() ? TruthSource::SIMULATOR
+                                  : !log.mocap.empty()      ? TruthSource::MOCAP
+                                                            : TruthSource::NONE;
+    const std::vector<TruthSample> truth = truthSource == TruthSource::SIMULATOR
+                                         ? buildTruth(log.groundTruth, t0)
+                                         : buildTruth(log.mocap, t0);
     if (!truth.empty())
     {
-        std::println("Ground truth: {} mocap samples spanning t={:.1f}..{:.1f} s", truth.size(),
+        std::println("Ground truth: {} {} samples spanning t={:.1f}..{:.1f} s", truth.size(),
+                     truthSource == TruthSource::SIMULATOR ? "simulator (RobotPoseGroundTruth)"
+                                                           : "mocap (MotionCapture)",
                      truth.front().t, truth.back().t);
     }
     else
     {
-        std::println("Ground truth: none in this log (mocap comparisons disabled)");
+        std::println("Ground truth: none in this log (truth comparisons disabled)");
     }
-
-    // Field landmark map
-    FieldMap map;
 
     // Camera calibration, shared by the out-of-field feature pipeline and the
     // visualiser. The real robots and webots do not merely differ in their
@@ -548,6 +626,14 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     // explicitly; otherwise the recorded frame size picks it.
     const CameraLens lens = selectLens(dataDir / "Left.mp4", lensName);
     std::println("Camera calibration: {}", lens.describe());
+
+    // Field landmark map. Selected after the camera because, absent an explicit
+    // --field, the camera is what says which world this recording came from.
+    const FieldDimensions fieldDims = selectField(lens, fieldName);
+    FieldMap map(fieldDims);
+    std::println("Field: {} ({:.1f} x {:.1f} m, goal width {:.2f} m, border strip {:.2f} m)",
+                 fieldDims.name, fieldDims.fieldLength, fieldDims.fieldWidth,
+                 fieldDims.goalWidth, fieldDims.borderStripMinWidth);
 
     // Out-of-field side disambiguation. On-field landmarks are invariant under
     // the field's 180 deg symmetry, but the background scenery is not: corner
@@ -1472,8 +1558,9 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     if (nTruth > 0)
     {
         std::println("");
-        std::println("vs MOCAP GROUND TRUTH over {} samples: ours RMSE position {:.3f} m, yaw {:.2f} deg",
-                     nTruth, std::sqrt(sumSqTruthXY/nTruth), std::sqrt(sumSqTruthYaw/nTruth)*180.0/M_PI);
+        std::println("vs {} GROUND TRUTH over {} samples: ours RMSE position {:.3f} m, yaw {:.2f} deg",
+                     to_string(truthSource), nTruth,
+                     std::sqrt(sumSqTruthXY/nTruth), std::sqrt(sumSqTruthYaw/nTruth)*180.0/M_PI);
         if (nTruthBoth > 0)
         {
             std::println("head-to-head on the {} samples where the NUbots baseline also reported:", nTruthBoth);
@@ -1484,9 +1571,11 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         }
         const double zMean = sumZerr/nTruth;
         const double zStd = std::sqrt(std::max(0.0, sumSqZerr/nTruth - zMean*zMean));
-        std::println("height: est z - truth marker z = {:+.3f} m mean, {:.3f} m std "
-                     "(markers sit ~6 cm above the torso origin, so ~-0.06 m is expected)",
-                     zMean, zStd);
+        // What "truth z" is differs by source, and so does the figure to expect.
+        std::println("height: est z - truth z = {:+.3f} m mean, {:.3f} m std ({})", zMean, zStd,
+                     truthSource == TruthSource::SIMULATOR
+                         ? "truth z is the torso origin, so 0 is the target"
+                         : "markers sit ~6 cm above the torso origin, so ~-0.06 m is expected");
     }
     if (nOofFrames > 0)
     {

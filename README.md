@@ -337,6 +337,61 @@ needs ground truth during a fall, which `data3_webots` does not carry: its
 `RobotPoseGroundTruth` channel is present in every `RawSensors` message but has
 `exists == false` throughout.
 
+## Field dimensions (`--field`)
+
+Two different fields are in play, and they are not close. `data` and `data2` were
+recorded on the **lab field** (6.8 × 5 m); the webots worlds use the full kid-size
+**RoboCup field** (9 × 6 m), which also has a wider goal (2.6 m vs 1.95 m), a
+different penalty-mark distance and a 1.0 m border strip instead of 0.38 m. Both
+are NUbots configs — `SoccerConfig/data/config/FieldDescription.yaml` is the lab
+one this project's `FieldDimensions` defaults were transcribed from, and
+`SoccerConfig/data/config/webots/FieldDescription.yaml` is the one the simulator
+and its `RobotPoseGroundTruth` are produced against.
+
+Replaying a webots recording against the lab map is not a small error: every
+landmark sits metres from where the robot actually sees it, and the filter absorbs
+the difference as pose error. On `data4_webots` it moved the initial solve from
+(1.82, −2.88) to (2.70, −3.35) — the truth's first sample is (2.96, −3.38) — and
+took position RMSE against truth from 0.955 m to 0.753 m while bringing the torso
+height error to +0.005 m.
+
+`--field=lab|webots` names one explicitly. Otherwise it follows the camera
+calibration, since a recording made through the simulated camera was made in the
+simulated world.
+
+## Ground truth (two sources, two clocks)
+
+Evaluation reference only — neither stream ever reaches the estimator.
+
+| recording | stream | what `rBFf` is |
+|---|---|---|
+| `data`, `data2` | `message.input.MotionCapture` (OptiTrack) | the **marker body**, ~6 cm above the torso origin, after undoing the capture-volume rotation and yaw extrinsic |
+| `data4_webots` | `message.localisation.RobotPoseGroundTruth` (`Hft`) | the **torso origin** itself, already in the field frame |
+| `data3_webots` | — | none: the `RawSensors` copy of `RobotPoseGroundTruth` is present on all 13082 messages with `exists == false` and uninitialised `Hft` |
+
+The simulator path is deliberately thin. `Hft` is already the torso pose in the
+frame the estimator works in — verified against that log's own NUbots baseline,
+which tracks it to ~0.2 m over a whole run — so there is no volume alignment to
+undo, no marker offset and no yaw extrinsic. Anything more would be inventing a
+correction the simulator has already applied. `TruthSource` records which stream a
+run used, because the height comparison means different things for each (0 is the
+target for the simulator, ≈−0.06 m for markers).
+
+**Clocks.** The log mixes two timestamps: `Sensors`, the vision messages and the
+field-line points carry a payload timestamp, while `WalkState`, the stability
+stream, the NUbots baseline, motion capture and the ground truth carry only the
+envelope timestamp NUClear stamped on receipt. On a real robot those are the same
+wall clock and the mix is harmless, which is why it went unnoticed. Under webots
+the payload timestamp is **simulation** time — `data4_webots` stamps its `Sensors`
+messages `1970-01-01T00:15:44.824Z` — so the two clocks sit 1.785 × 10⁹ s apart and
+every envelope-stamped stream lands nowhere near the frames it should align with.
+Nothing detected it; the comparisons just never matched.
+
+`Sensors` carries both stamps, so `SensorLog` measures the median offset and
+shifts the envelope-stamped streams onto the payload clock, reporting when it
+does. The threshold is 1 s, so `data`, `data2` and `data3_webots` (all wall-clock
+payloads) are untouched and bit-for-bit unchanged.
+
 ## Side disambiguation (`SideDisambiguator`, `OutOfFieldFeatures`)
 
 The field is symmetric under 180° rotation, so on-field evidence can never
