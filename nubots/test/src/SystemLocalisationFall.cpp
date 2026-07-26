@@ -5,6 +5,7 @@
 #include "../../src/GaussianInfo.hpp"
 #include "../../src/kinematics_helper.h"
 #include "../../src/SystemLocalisation.h"
+#include "stateHelpers.hpp"
 
 namespace
 {
@@ -17,9 +18,7 @@ GaussianInfo<double> tightBelief(const Eigen::VectorXd & mu, double std = 0.05)
 
 Eigen::VectorXd nominalState()
 {
-    Eigen::VectorXd x(SystemLocalisation::nx);
-    x << 1.5, -0.8, 0.44, 0.0, 0.0, 0.3, 0.0, 0.0;
-    return x;
+    return makeState(1.5, -0.8, 0.44, 0.0, 0.0, 0.3);
 }
 
 /// A constant body twist over a long span, so predict() always finds an input.
@@ -35,7 +34,12 @@ std::vector<BodyTwistSample> constantTwist(const Eigen::Vector3d & v, const Eige
 
 } // namespace
 
-SCENARIO("The Euler-rate transform stays finite through a fall")
+// The localisation filter no longer uses the roll-pitch-yaw rate transform --
+// its attitude is a quaternion, whose kinematics have no singularity. TKfromTheta
+// is still used by SystemVisualNav, so the guard is still worth holding to; what
+// these cases no longer cover is the fall path, which is exercised by the
+// quaternion cases below instead.
+SCENARIO("The Euler-rate transform stays finite at gimbal lock")
 {
     GIVEN("Pitch at the singularity a forward fall passes through")
     {
@@ -125,7 +129,7 @@ SCENARIO("Disturbed mode changes what prediction believes")
             THEN("the belief decays to honest uncertainty instead of coasting")
             {
                 CHECK(std::sqrt(P(0, 0)) > 0.4);
-                CHECK(std::sqrt(P(5, 5)) > 0.4);
+                CHECK(std::sqrt(SystemLocalisation::yawVariance(mu, P)) > 0.4);
             }
         }
 
@@ -142,7 +146,7 @@ SCENARIO("Disturbed mode changes what prediction believes")
 
             THEN("yaw follows the gyroscope")
             {
-                CHECK(sys.density.mean()(5) == doctest::Approx(x0(5) + 0.5).epsilon(0.05));
+                CHECK(stateYaw(sys.density.mean()) == doctest::Approx(stateYaw(x0) + 0.5).epsilon(0.05));
             }
         }
     }
@@ -159,9 +163,15 @@ SCENARIO("Recovery from a fall widens the belief without moving it")
 
         WHEN("the recovery inflation is applied")
         {
-            Eigen::VectorXd extra = Eigen::VectorXd::Zero(SystemLocalisation::nx);
-            extra(0) = extra(1) = 0.25;         // 0.5 m std
-            extra(5) = 1.0;                     // 1 rad std
+            // Built exactly as runFieldLocalisation builds it: position on the
+            // diagonal, yaw as a rank-one block about the field z axis.
+            const double yawStd = 1.0;
+            Eigen::MatrixXd extra = Eigen::MatrixXd::Zero(SystemLocalisation::nx, SystemLocalisation::nx);
+            extra(0, 0) = extra(1, 1) = 0.25;   // 0.5 m std
+            const Eigen::Vector4d jYaw = SystemLocalisation::attitudeTangentField(x0).col(2);
+            extra.block<4, 4>(SystemLocalisation::iQuat, SystemLocalisation::iQuat)
+                = yawStd*yawStd*jYaw*jYaw.transpose();
+            const double yawVar0 = SystemLocalisation::yawVariance(x0, P0);
             sys.inflateCovariance(extra);
 
             THEN("the mean is untouched")
@@ -174,16 +184,29 @@ SCENARIO("Recovery from a fall widens the belief without moving it")
             {
                 const Eigen::MatrixXd P = sys.density.cov();
                 CHECK(P(0, 0) - P0(0, 0) == doctest::Approx(0.25));
-                CHECK(P(5, 5) - P0(5, 5) == doctest::Approx(1.0));
+                // The whole point of the rank-one form: the yaw uncertainty the
+                // filter reports grows by exactly what was asked for, even though
+                // it is spread over four components and no element is "yaw".
+                CHECK(SystemLocalisation::yawVariance(sys.density.mean(), P) - yawVar0
+                      == doctest::Approx(yawStd*yawStd).epsilon(1e-6));
             }
-            THEN("untouched states keep their confidence")
+            THEN("roll and pitch are left alone")
             {
-                // Roll and pitch are re-fixed by the very next gravity update, and
-                // the camera mount bias is a property of the kinematic chain, not
-                // of the posture.
+                // A yaw inflation must not smear into the other two attitude axes:
+                // they are re-fixed by the very next gravity update and inflating
+                // them would only make that update fight a wider prior.
+                const Eigen::Matrix3d A0 = SystemLocalisation::attitudeCovariance(x0, P0);
+                const Eigen::Matrix3d A = SystemLocalisation::attitudeCovariance(sys.density.mean(),
+                                                                                 sys.density.cov());
+                CHECK(A(0, 0) == doctest::Approx(A0(0, 0)).epsilon(1e-6));
+                CHECK(A(1, 1) == doctest::Approx(A0(1, 1)).epsilon(1e-6));
+            }
+            THEN("the camera mount bias keeps its confidence")
+            {
+                // A property of the kinematic chain, not of the posture.
                 const Eigen::MatrixXd P = sys.density.cov();
-                CHECK(P(3, 3) == doctest::Approx(P0(3, 3)));
-                CHECK(P(6, 6) == doctest::Approx(P0(6, 6)));
+                CHECK(P(SystemLocalisation::iBias, SystemLocalisation::iBias)
+                      == doctest::Approx(P0(SystemLocalisation::iBias, SystemLocalisation::iBias)));
             }
             THEN("the position std exceeds the disambiguator's map-building gate")
             {
@@ -245,8 +268,15 @@ SCENARIO("predictAll advances every hypothesis over the same interval")
             THEN("both components keep their means and both lose confidence")
             {
                 REQUIRE(sys.numHypotheses() == 2);
-                CHECK((sys.hypotheses()[0].mean() - x0).norm() == doctest::Approx(0.0).epsilon(1e-6));
-                CHECK((sys.hypotheses()[1].mean() - mirror0).norm() == doctest::Approx(0.0).epsilon(1e-6));
+                // Compare poses, not raw components: predict renormalises the
+                // quaternion into w >= 0, and q and -q are the same rotation, so
+                // a component-wise comparison can fail on a sign that means nothing.
+                CHECK((sys.hypotheses()[0].mean().head<3>() - x0.head<3>()).norm()
+                      == doctest::Approx(0.0).epsilon(1e-6));
+                CHECK((sys.hypotheses()[1].mean().head<3>() - mirror0.head<3>()).norm()
+                      == doctest::Approx(0.0).epsilon(1e-6));
+                CHECK((stateRpy(sys.hypotheses()[0].mean()) - stateRpy(x0)).norm() < 1e-6);
+                CHECK((stateRpy(sys.hypotheses()[1].mean()) - stateRpy(mirror0)).norm() < 1e-6);
                 for (const GaussianInfo<double> & c : sys.hypotheses())
                 {
                     CHECK(std::sqrt(c.cov()(0, 0)) > std::sqrt(0.05*0.05));

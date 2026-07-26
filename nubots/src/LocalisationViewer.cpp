@@ -167,6 +167,20 @@ void covEllipse(const Eigen::Matrix2d & P, double nSigma, double & ax, double & 
 
 } // namespace
 
+const char * to_string(FrameSkip s)
+{
+    switch (s)
+    {
+        case FrameSkip::NONE:           return nullptr;
+        case FrameSkip::BEFORE_INIT:    return "before the initial pose solve";
+        case FrameSkip::NOT_UPRIGHT:    return "NOT UPRIGHT: predicting only";
+        case FrameSkip::NO_DETECTIONS:  return "no detections";
+        case FrameSkip::BAD_POSE:       return "no valid camera pose in the log";
+        case FrameSkip::NO_SAMPLE:      return "no vision sample at this frame";
+    }
+    return nullptr;
+}
+
 LocalisationViewer::LocalisationViewer(const FieldMap & map, const CameraLens & lens,
                                        const std::filesystem::path & videoPath)
     : map_(map)
@@ -989,11 +1003,21 @@ cv::Mat LocalisationViewer::renderComposite(const std::vector<ViewerFrame> & fra
     cv::Mat body;
     cv::hconcat(cam, top, body);
 
-    cv::Mat header(kHeaderH, body.cols, CV_8UC3, cv::Scalar(25, 25, 25));
-    hudText(header, std::format("sample {}/{}   t={:.2f}s   |   keys: [space] play/step  [n]/[p] next/prev  "
+    // The timeline is every frame of the video, so most frames the filter never
+    // updated on. Say so on the ones it skipped, otherwise a static overlay on
+    // moving footage reads as a broken estimator rather than a suppressed one.
+    const char * why = to_string(f.skip);
+    cv::Mat header(kHeaderH, body.cols, CV_8UC3,
+                   f.skip == FrameSkip::NOT_UPRIGHT ? cv::Scalar(0, 30, 70) : cv::Scalar(25, 25, 25));
+    hudText(header, std::format("frame {}/{}   t={:.2f}s   |   keys: [space] play/step  [n]/[p] next/prev  "
                                 "[Home]/[End] jump  [3] 2D/3D  [k] key  [s] save  [q] quit",
                                 idx + 1, frames.size(), f.t),
             cv::Point(10, 24), 0.44);
+    if (why != nullptr)
+    {
+        hudText(header, std::format("[no update: {}]", why), cv::Point(body.cols - 380, 24), 0.44,
+                f.skip == FrameSkip::NOT_UPRIGHT ? cv::Scalar(80, 180, 255) : cv::Scalar(150, 150, 150));
+    }
 
     cv::Mat composite;
     cv::vconcat(header, body, composite);

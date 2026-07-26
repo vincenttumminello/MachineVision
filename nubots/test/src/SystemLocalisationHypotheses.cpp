@@ -9,6 +9,7 @@
 #include "../../src/rotation.hpp"
 #include "../../src/SensorLog.h"
 #include "../../src/SystemLocalisation.h"
+#include "stateHelpers.hpp"
 
 // Same synthetic-detection helper as the MeasurementFieldLandmarks test: the
 // four corner rays all equal the true unit ray to the landmark from pose Tfc.
@@ -25,10 +26,9 @@ static Detection makeDetection(const std::string & name, const Eigen::Vector3d &
 
 SCENARIO("SystemLocalisation mirror transform")
 {
-    GIVEN("An arbitrary 8-DOF state")
+    GIVEN("An arbitrary state")
     {
-        Eigen::VectorXd x(SystemLocalisation::nx);
-        x << 1.3, -0.7, 0.45, 0.02, -0.03, 0.6, 0.01, -0.02;
+        const Eigen::VectorXd x = makeState(1.3, -0.7, 0.45, 0.02, -0.03, 0.6, 0.01, -0.02);
 
         WHEN("it is mirrored across the field centre")
         {
@@ -39,27 +39,35 @@ SCENARIO("SystemLocalisation mirror transform")
                 CHECK(y(0) == doctest::Approx(-1.3));
                 CHECK(y(1) == doctest::Approx(0.7));
                 CHECK(y(2) == doctest::Approx(0.45));           // height unchanged
-                CHECK(y(3) == doctest::Approx(0.02));           // roll unchanged
-                CHECK(y(4) == doctest::Approx(-0.03));          // pitch unchanged
-                CHECK(std::abs(std::remainder(y(5) - (0.6 + M_PI), 2.0*M_PI)) < 1e-9);
-                CHECK(y(6) == doctest::Approx(0.01));           // camera bias unchanged
-                CHECK(y(7) == doctest::Approx(-0.02));
+                const Eigen::Vector3d rpy = stateRpy(y);
+                CHECK(rpy(0) == doctest::Approx(0.02).epsilon(1e-6));    // roll unchanged
+                CHECK(rpy(1) == doctest::Approx(-0.03).epsilon(1e-6));   // pitch unchanged
+                CHECK(std::abs(std::remainder(rpy(2) - (0.6 + M_PI), 2.0*M_PI)) < 1e-9);
+                CHECK(y(SystemLocalisation::iBias) == doctest::Approx(0.01));
+                CHECK(y(SystemLocalisation::iBias + 1) == doctest::Approx(-0.02));
+                // The mirror is a rotation, so it cannot change |q|.
+                CHECK(y.segment<4>(SystemLocalisation::iQuat).norm() == doctest::Approx(1.0).epsilon(1e-12));
             }
 
             THEN("mirroring twice returns the original pose")
             {
                 Eigen::VectorXd z = SystemLocalisation::mirrorState(y);
-                CHECK((z.head<5>() - x.head<5>()).norm() < 1e-9);
-                CHECK(std::abs(std::remainder(z(5) - x(5), 2.0*M_PI)) < 1e-9);
+                CHECK((z.head<3>() - x.head<3>()).norm() < 1e-9);
                 CHECK((z.tail<2>() - x.tail<2>()).norm() < 1e-9);
+                // qz(pi) applied twice is -1, i.e. the same rotation with the
+                // opposite sign, so compare rotations rather than components.
+                CHECK(std::abs(std::remainder(stateYaw(z) - stateYaw(x), 2.0*M_PI)) < 1e-9);
+                CHECK((stateRpy(z) - stateRpy(x)).norm() < 1e-9);
             }
         }
 
         WHEN("a density is mirrored")
         {
             Eigen::MatrixXd S = Eigen::MatrixXd::Zero(SystemLocalisation::nx, SystemLocalisation::nx);
-            S.diagonal() << 0.3, 0.2, 0.05, 0.05, 0.05, 0.15, 0.05, 0.05;
-            S(0, 5) = 0.1;    // Cross-covariance between x-position and yaw
+            S.diagonal() << 0.3, 0.2, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05;
+            // Cross-covariance between x-position and the quaternion z component,
+            // which is the yaw-carrying one at this near-identity attitude.
+            S(0, SystemLocalisation::iQuat + 3) = 0.1;
             auto g = GaussianInfo<double>::fromSqrtMoment(Eigen::VectorXd(x), S);
 
             auto gm = SystemLocalisation::mirrorDensity(g);
@@ -67,7 +75,7 @@ SCENARIO("SystemLocalisation mirror transform")
             THEN("the mean is the mirrored state")
             {
                 Eigen::VectorXd mu = gm.mean();
-                CHECK((mu - SystemLocalisation::mirrorState(x)).head<5>().norm() < 1e-9);
+                CHECK((mu - SystemLocalisation::mirrorState(x)).norm() < 1e-9);
             }
 
             THEN("variances are preserved and the x-yaw covariance flips sign")
@@ -75,8 +83,23 @@ SCENARIO("SystemLocalisation mirror transform")
                 Eigen::MatrixXd P = g.cov();
                 Eigen::MatrixXd Pm = gm.cov();
                 CHECK(Pm(0, 0) == doctest::Approx(P(0, 0)).epsilon(1e-6));   // var(x) unchanged
-                CHECK(Pm(5, 5) == doctest::Approx(P(5, 5)).epsilon(1e-6));   // var(yaw) unchanged
-                CHECK(Pm(0, 5) == doctest::Approx(-P(0, 5)).epsilon(1e-6));  // sign flip (x negated, yaw not)
+                // The mirror map is orthogonal on the quaternion block, so the
+                // yaw variance is preserved even though no single element is yaw.
+                CHECK(SystemLocalisation::yawVariance(gm.mean(), Pm)
+                      == doctest::Approx(SystemLocalisation::yawVariance(g.mean(), P)).epsilon(1e-6));
+                // x is negated and the attitude is not, so the covariance between
+                // position and heading flips sign. The mirror permutes the
+                // quaternion components, so this has to be read through the yaw
+                // direction rather than off one element.
+                auto xYawCov = [](const GaussianInfo<double> & gg) {
+                    const Eigen::VectorXd mu = gg.mean();
+                    const Eigen::Matrix<double, 3, 4> G =
+                        quat2rot(Eigen::Vector4d(mu.segment<4>(SystemLocalisation::iQuat)))
+                        *2.0*quatXi(Eigen::Vector4d(mu.segment<4>(SystemLocalisation::iQuat).normalized())).transpose();
+                    const Eigen::RowVector4d gz = G.row(2);
+                    return (gg.cov().block<1, 4>(0, SystemLocalisation::iQuat)*gz.transpose())(0, 0);
+                };
+                CHECK(xYawCov(gm) == doctest::Approx(-xYawCov(g)).epsilon(1e-6));
             }
         }
     }
@@ -88,8 +111,7 @@ SCENARIO("Hypothesis bank + out-of-field evidence resolve the field symmetry")
     {
         FieldMap map;
 
-        Eigen::VectorXd etaTrue = Eigen::VectorXd::Zero(SystemLocalisation::nx);
-        etaTrue.head<6>() << -1.0, 0.2, 0.45, 0.0, 0.0, 0.1;
+        const Eigen::VectorXd etaTrue = makeState(-1.0, 0.2, 0.45, 0.0, 0.0, 0.1);
         const Eigen::VectorXd etaMirror = SystemLocalisation::mirrorState(etaTrue);
 
         Pose<double> Tbc;
@@ -169,7 +191,7 @@ SCENARIO("Hypothesis bank + out-of-field evidence resolve the field symmetry")
                 CHECK(*std::max_element(w.begin(), w.end()) > 0.9);
                 Eigen::VectorXd mu = system.density.mean();
                 CHECK((mu.head<2>() - etaTrue.head<2>()).norm() < 0.15);
-                CHECK(std::abs(std::remainder(mu(5) - etaTrue(5), 2.0*M_PI)) < 0.15);
+                CHECK(std::abs(std::remainder(stateYaw(mu) - stateYaw(etaTrue), 2.0*M_PI)) < 0.15);
             }
         }
 
@@ -188,7 +210,7 @@ SCENARIO("Hypothesis bank + out-of-field evidence resolve the field symmetry")
             {
                 Eigen::VectorXd mu = system.density.mean();
                 CHECK((mu.head<2>() - etaMirror.head<2>()).norm() < 0.15);
-                CHECK(std::abs(std::remainder(mu(5) - etaMirror(5), 2.0*M_PI)) < 0.15);
+                CHECK(std::abs(std::remainder(stateYaw(mu) - stateYaw(etaMirror), 2.0*M_PI)) < 0.15);
             }
         }
 

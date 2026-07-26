@@ -6,6 +6,7 @@
 #define SYSTEMLOCALISATION_H
 
 #include <vector>
+#include <cmath>
 #include <Eigen/Core>
 #include "GaussianInfo.hpp"
 #include "Pose.hpp"
@@ -82,11 +83,37 @@ public:
         double sigmaYawDisturbed   = 0.60;  ///< Yaw process noise PSD while not upright [rad/sqrt(s)]
     };
 
-    static constexpr Eigen::Index nx = 8;   ///< State dimension
+    // State layout (nx = 9):
+    //   0..2  rBFf         torso position in {f} [m]
+    //   3..6  q            attitude quaternion (w, x, y, z), Rfb = quat2rot(q)
+    //   7..8  camera mount bias (roll, pitch) [rad]
+    //
+    // Attitude was roll-pitch-yaw until the fall work. The Euler-rate transform
+    // is singular at pitch = +-90 deg, which is not an edge case for a falling
+    // robot -- it is on the trajectory of every topple. Passing through it landed
+    // the state on the gimbal alias (roll+180, 180-pitch, yaw+180): the same
+    // rotation, so fieldPose() and the landmark models carried on working, but
+    // every consumer reading x(5) as heading was then 180 deg out, which is the
+    // yaw flip seen across both real falls in data3_webots. A quaternion has no
+    // such point, so the state can sit at pitch = 90 deg for as long as the robot
+    // is face-down and measurement updates can keep running there.
+    //
+    // The cost is a fourth parameter for three degrees of freedom. quat2rot
+    // normalises, so |q| is invisible to every geometric model; the information
+    // along it comes from MeasurementQuaternionNorm alone, which is what keeps
+    // the MAP Hessian non-singular. See attitudeTangent() for the mapping used
+    // wherever a 3-DOF attitude quantity (process noise, yaw variance, a yaw
+    // inflation) has to be expressed in these four components.
+    static constexpr Eigen::Index nx = 9;   ///< State dimension
+
+    static constexpr Eigen::Index iPos  = 0;   ///< First position index
+    static constexpr Eigen::Index iQuat = 3;   ///< First quaternion index
+    static constexpr Eigen::Index iBias = 7;   ///< First camera-bias index
 
     SystemLocalisation(const GaussianInfo<double> & density, const std::vector<BodyTwistSample> & twistBuffer);
     virtual SystemLocalisation * clone() const;
 
+    virtual void predict(double time) override;
     virtual Eigen::VectorXd dynamics(double t, const Eigen::VectorXd & x, const Eigen::VectorXd & u) const override;
     virtual Eigen::VectorXd dynamics(double t, const Eigen::VectorXd & x, const Eigen::VectorXd & u, Eigen::MatrixXd & J) const override;
     virtual Eigen::VectorXd input(double t, const Eigen::VectorXd & x) const override;
@@ -95,29 +122,112 @@ public:
 
     /**
      * @brief Torso pose in field frame from a state vector.
-     * @param x State vector (6)
+     * @param x State vector (nx)
      * @return Tfb with rotationMatrix Rfb and translationVector rBFf
      */
     template <typename Scalar>
     static Pose<Scalar> fieldPose(const Eigen::VectorX<Scalar> & x)
     {
         Pose<Scalar> Tfb;
-        Tfb.rotationMatrix = rpy2rot(Eigen::Vector3<Scalar>(x.template segment<3>(3)));
-        Tfb.translationVector = x.template segment<3>(0);
+        Tfb.rotationMatrix = quat2rot(Eigen::Vector4<Scalar>(x.template segment<4>(iQuat)));
+        Tfb.translationVector = x.template segment<3>(iPos);
         return Tfb;
     }
 
     /**
      * @brief Camera-mount attitude bias correction from a state vector.
-     * @param x State vector (8)
+     * @param x State vector (nx)
      * @return Rotation applied on the camera side of the extrinsic: R(deltaC)
      */
     template <typename Scalar>
     static Eigen::Matrix3<Scalar> cameraBiasRotation(const Eigen::VectorX<Scalar> & x)
     {
         Eigen::Vector3<Scalar> rpy;
-        rpy << x(6), x(7), Scalar(0);
+        rpy << x(iBias), x(iBias + 1), Scalar(0);
         return rpy2rot(rpy);
+    }
+
+    /**
+     * @brief Roll, pitch and yaw of the estimated attitude, for reporting.
+     *
+     * Always read heading through this rather than off a state element. The
+     * quaternion has no distinguished yaw component, and the whole point of the
+     * change is that no single index means "heading" any more.
+     */
+    static Eigen::Vector3d attitudeRpy(const Eigen::VectorXd & x)
+    {
+        return rot2rpy(quat2rot(Eigen::Vector4d(x.segment<4>(iQuat))));
+    }
+
+    /// @brief Heading (yaw) of the estimated attitude [rad].
+    static double heading(const Eigen::VectorXd & x) { return attitudeRpy(x)(2); }
+
+    /**
+     * @brief Jacobian of a body-frame rotation vector w.r.t. the quaternion states.
+     *
+     * A small body rotation dtheta perturbs the quaternion by dq = 0.5*Xi(q)*dtheta,
+     * so this 4x3 matrix maps 3-DOF attitude quantities into the four components
+     * and its pseudo-inverse maps them back. Everything that used to index the
+     * single yaw element -- process noise, the association gate's yaw variance,
+     * the recovery inflation -- goes through it.
+     *
+     * @param x State vector (nx)
+     * @return 4x3 matrix dq/dtheta at the state's attitude
+     */
+    static Eigen::Matrix<double, 4, 3> attitudeTangent(const Eigen::VectorXd & x)
+    {
+        Eigen::Vector4d q = x.segment<4>(iQuat);
+        q.normalize();
+        return 0.5*quatXi(q);
+    }
+
+    /**
+     * @brief Jacobian mapping a field-frame rotation vector to the quaternion states.
+     *
+     * dq = 0.5*Xi(q)*Rfb^T*dtheta_f. Used wherever an uncertainty is naturally
+     * stated about a field axis -- above all yaw, about field z.
+     */
+    static Eigen::Matrix<double, 4, 3> attitudeTangentField(const Eigen::VectorXd & x)
+    {
+        const Eigen::Matrix3d Rfb = quat2rot(Eigen::Vector4d(x.segment<4>(iQuat)));
+        return attitudeTangent(x)*Rfb.transpose();
+    }
+
+    /**
+     * @brief Attitude covariance as a 3x3 in the field-frame tangent [rad^2].
+     *
+     * The replacement for reading P(3..5, 3..5) directly. Xi has orthonormal
+     * columns for a unit q, so the pseudo-inverse of dq/dtheta is 2*Xi^T; that
+     * maps the quaternion block of P back to three degrees of freedom, and Rfb
+     * puts them on the field axes. Element (2, 2) is the yaw variance.
+     *
+     * @param x State mean (nx)
+     * @param P State covariance (nx by nx)
+     */
+    static Eigen::Matrix3d attitudeCovariance(const Eigen::VectorXd & x, const Eigen::MatrixXd & P)
+    {
+        // dq = 0.5*Xi*dtheta and Xi has orthonormal columns, so the left inverse
+        // is dtheta = 2*Xi^T*dq. Note that is 2*Xi^T, NOT 2*attitudeTangent^T --
+        // attitudeTangent already carries the 0.5, and folding it in twice
+        // under-reports every attitude std dev by a factor of two.
+        Eigen::Vector4d q = x.segment<4>(iQuat);
+        q.normalize();
+        const Eigen::Matrix3d Rfb = quat2rot(q);
+        const Eigen::Matrix<double, 3, 4> Jinv = 2.0*quatXi(q).transpose();
+        const Eigen::Matrix<double, 3, 4> G = Rfb*Jinv;
+        return G*P.block<4, 4>(iQuat, iQuat)*G.transpose();
+    }
+
+    /// @brief Variance of the field-frame yaw implied by the attitude covariance.
+    static double yawVariance(const Eigen::VectorXd & x, const Eigen::MatrixXd & P)
+    {
+        return attitudeCovariance(x, P)(2, 2);
+    }
+
+    /// @brief Per-axis attitude std devs in the field tangent (roll, pitch, yaw) [rad].
+    static Eigen::Vector3d attitudeStd(const Eigen::VectorXd & x, const Eigen::MatrixXd & P)
+    {
+        return attitudeCovariance(x, P).diagonal().cwiseMax(0.0).cwiseSqrt();
     }
 
     /**
@@ -178,6 +288,58 @@ public:
      * @param extraVar Variance to add per state element (length nx, non-negative)
      */
     void inflateCovariance(const Eigen::VectorXd & extraVar);
+
+    /**
+     * @brief Add a full covariance block to the belief without moving its mean.
+     *
+     * The diagonal overload cannot express an attitude inflation any more: yaw
+     * uncertainty about the field z axis lands on the quaternion states as a
+     * rank-one block (attitudeTangentField), not on one element.
+     *
+     * @param extraCov Positive-semidefinite matrix (nx by nx) added to the covariance
+     */
+    void inflateCovariance(const Eigen::MatrixXd & extraCov);
+
+    /**
+     * @brief Project the attitude mean back onto the unit sphere (and w >= 0).
+     *
+     * Called after every predict and every measurement update.
+     * MeasurementQuaternionNorm keeps the belief near the sphere but is a soft
+     * prior, so this is what actually holds |q| = 1.
+     */
+    void normaliseQuaternion();
+
+    /**
+     * @brief 180 deg field rotation as a linear map on the quaternion components.
+     *
+     * qz(pi) (x) q for qz(pi) = (0, 0, 0, 1) sends (w, x, y, z) to (-z, -y, x, w).
+     */
+    static Eigen::Matrix4d mirrorQuatMap()
+    {
+        Eigen::Matrix4d M = Eigen::Matrix4d::Zero();
+        M(0, 3) = -1.0;
+        M(1, 2) = -1.0;
+        M(2, 1) =  1.0;
+        M(3, 0) =  1.0;
+        return M;
+    }
+
+    /**
+     * @brief Per-component process-noise std devs for the quaternion block.
+     *
+     * The PSDs are specified in the 3-DOF body tangent (roll/pitch and yaw), which
+     * is where they are meaningful. A small body rotation dtheta moves the
+     * quaternion by 0.5*Xi(q)*dtheta and Xi has orthonormal columns, so a tangent
+     * std of s becomes a component std of s/2. The fourth (radial) component is
+     * given the same magnitude as the attitude channels: it is invisible to every
+     * geometric model, so its only job is to leave MeasurementQuaternionNorm room
+     * to work rather than to fight it.
+     */
+    static Eigen::Vector4d quaternionSigma(double sigmaAtt, double sigmaYaw)
+    {
+        const double s = 0.5*std::max(sigmaAtt, sigmaYaw);
+        return Eigen::Vector4d::Constant(s);
+    }
 
     /**
      * @brief Advance the belief to @p time with no measurement.

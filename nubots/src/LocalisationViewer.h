@@ -98,11 +98,34 @@ struct OofLandmarkView
     int status = 0;                                  ///< SideDisambiguator::LandmarkStatus this frame
 };
 
-/// @brief Everything needed to render both panels for one processed frame.
+/**
+ * @brief Why a frame carries no measurement update.
+ *
+ * The replay timeline is the *video*, not the filter's update history: every
+ * frame of the recording gets a ViewerFrame so playback runs continuously. A
+ * fall is exactly when the raw footage is worth watching, and it is also when
+ * the estimator has least to say about it, so the two must not be conflated --
+ * this says which frames the filter actually learned from.
+ */
+enum class FrameSkip
+{
+    NONE = 0,       ///< A measurement update ran on this frame
+    BEFORE_INIT,    ///< Earlier than the initial pose solve: the filter has not started
+    NOT_UPRIGHT,    ///< Posture gate: predicted only (see FallDetector)
+    NO_DETECTIONS,  ///< Nothing detected, so there was nothing to update from
+    BAD_POSE,       ///< Non-finite Hcw in the log
+    NO_SAMPLE       ///< Video frame that no vision sample matched
+};
+
+/// @brief Short human-readable reason, or nullptr when the frame was processed.
+const char * to_string(FrameSkip s);
+
+/// @brief Everything needed to render both panels for one frame of the replay.
 struct ViewerFrame
 {
     int videoFrame = -1;                     ///< Index into the video, or -1 if unmatched
     double t = 0.0;                          ///< Time since log start [s]
+    FrameSkip skip = FrameSkip::NONE;        ///< Whether the filter updated here, and why not
 
     Pose<double> Tfc;                        ///< Estimated camera pose in {f} (for re-projection)
     Eigen::Vector2d estPos = Eigen::Vector2d::Zero();

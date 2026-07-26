@@ -9,6 +9,7 @@
 #include "../../src/rotation.hpp"
 #include "../../src/SensorLog.h"
 #include "../../src/SystemLocalisation.h"
+#include "stateHelpers.hpp"
 
 // Build a synthetic detection whose relevant rays equal the true ray to a landmark
 // seen from camera pose Tfc (all four corners set to the ray; goal posts use BR/BL,
@@ -32,8 +33,7 @@ SCENARIO("MeasurementFieldLandmarks association and MAP update")
 
         // True torso pose: 1 m behind centre, 0.45 m torso height, facing +x
         // (camera mount bias states zero)
-        Eigen::VectorXd etaTrue = Eigen::VectorXd::Zero(SystemLocalisation::nx);
-        etaTrue.head<6>() << -1.0, 0.2, 0.45, 0.0, 0.0, 0.1;
+        const Eigen::VectorXd etaTrue = makeState(-1.0, 0.2, 0.45, 0.0, 0.0, 0.1);
 
         // Camera 0.1 m above torso origin, aligned with torso
         Pose<double> Tbc;
@@ -116,10 +116,7 @@ SCENARIO("MeasurementFieldLandmarks association and MAP update")
 
         WHEN("the prior is offset from the true pose")
         {
-            Eigen::VectorXd etaPrior = etaTrue;
-            etaPrior(0) += 0.15;
-            etaPrior(1) -= 0.1;
-            etaPrior(5) += 0.05;
+            const Eigen::VectorXd etaPrior = makeState(-1.0 + 0.15, 0.2 - 0.1, 0.45, 0.0, 0.0, 0.1 + 0.05);
 
             Eigen::MatrixXd Sp = Eigen::MatrixXd::Identity(SystemLocalisation::nx, SystemLocalisation::nx)*0.2;
             Sp.diagonal().tail<2>().setConstant(0.02);  // Tight camera-bias prior: rays here are exact
@@ -134,16 +131,91 @@ SCENARIO("MeasurementFieldLandmarks association and MAP update")
             THEN("the MAP update recovers the true pose and reports evidence")
             {
                 double errBefore = (system.density.mean() - etaTrue).head(2).norm();
-                meas.process(system);
-                Eigen::VectorXd err = system.density.mean() - etaTrue;
+                // Route through the system, as the pipeline does: that is what
+                // projects the attitude mean back onto the unit sphere afterwards.
+                system.process(meas);
+                const Eigen::VectorXd mu = system.density.mean();
+                Eigen::VectorXd err = mu - etaTrue;
                 CHECK(err.head(2).norm() < errBefore);
                 CHECK(err.head(2).norm() < 0.05);  // Wide bearing spread pins the pose
-                CHECK(std::abs(err(5)) < 0.02);    // Yaw corrected
+                CHECK(std::abs(stateYaw(mu) - stateYaw(etaTrue)) < 0.02);   // Yaw corrected
                 CHECK(std::isfinite(meas.logEvidence()));
 
-                // Posterior covariance shrinks relative to prior in observed directions
-                CHECK(system.density.cov()(5, 5) < 0.2*0.2);
+                // Posterior yaw uncertainty shrinks relative to the prior. Read
+                // through yawVariance: the attitude is a quaternion, so no single
+                // covariance element is the yaw variance.
+                CHECK(SystemLocalisation::yawVariance(mu, system.density.cov()) < 0.2*0.2);
+                CHECK(mu.segment<4>(SystemLocalisation::iQuat).norm() == doctest::Approx(1.0).epsilon(1e-6));
             }
+        }
+    }
+}
+
+SCENARIO("The association pre-gate widens with yaw uncertainty")
+{
+    // A fall and getup can leave the robot turned further than the nominal 0.35 rad
+    // pre-gate. That gate is purely geometric, so on its own it also bounds what
+    // the filter can ever recover from -- inflating the covariance does nothing if
+    // the candidates are thrown away before the covariance is ever consulted.
+    GIVEN("A robot whose belief is yawed 45 deg away from the truth")
+    {
+        FieldMap map;
+
+        const Eigen::VectorXd etaTrue = makeState(-1.0, 0.2, 0.45, 0.0, 0.0, 0.0);
+
+        Pose<double> Tbc;
+        Tbc.translationVector = Eigen::Vector3d(0.05, 0, 0.1);
+        const Pose<double> Tfc = SystemLocalisation::fieldPose<double>(Eigen::VectorXd(etaTrue))*Tbc;
+
+        VisionSample sample;
+        sample.t = 0;
+        sample.videoFrame = -1;
+        for (const auto & post : map.landmarks(LandmarkType::GOAL_POST))
+        {
+            if (post.x() > 0) sample.detections.push_back(makeDetection("goal post", post, Tfc));
+        }
+        for (const auto & xm : map.landmarks(LandmarkType::X_INTERSECTION))
+        {
+            if (xm.x() > 1.0) sample.detections.push_back(makeDetection("X-intersection", xm, Tfc));
+        }
+        const std::size_t nDetections = sample.detections.size();
+        REQUIRE(nDetections >= 3);
+
+        // Well beyond the nominal 0.35 rad (20 deg) gate
+        const Eigen::VectorXd etaPrior = makeState(-1.0, 0.2, 0.45, 0.0, 0.0, 45.0*M_PI/180.0);
+
+        std::vector<BodyTwistSample> twists;
+
+        // Associations reached with a given yaw std dev in the belief.
+        auto associatedWithYawStd = [&](double yawStd) {
+            // Yaw uncertainty about field z lands on the quaternion states as a
+            // rank-one block, not on one element.
+            Eigen::MatrixXd P = Eigen::MatrixXd::Identity(SystemLocalisation::nx, SystemLocalisation::nx)*(0.05*0.05);
+            const Eigen::Vector4d j = SystemLocalisation::attitudeTangentField(etaPrior).col(2);
+            P.block<4, 4>(SystemLocalisation::iQuat, SystemLocalisation::iQuat) += yawStd*yawStd*j*j.transpose();
+            auto p0 = GaussianInfo<double>::fromMoment(etaPrior, P);
+            SystemLocalisation system(p0, twists);
+            MeasurementFieldLandmarks meas(0.0, sample, Tbc, map, system);
+            return meas.numAssociated();
+        };
+
+        THEN("a confident belief cannot reach past the nominal gate")
+        {
+            CHECK(associatedWithYawStd(0.05) < nDetections);
+        }
+
+        THEN("the yaw uncertainty a fall leaves behind lets the landmarks back in")
+        {
+            // 60 deg is what the recovery inflation hands back, so this is the case
+            // the inflation exists to serve.
+            CHECK(associatedWithYawStd(60.0*M_PI/180.0) > associatedWithYawStd(0.05));
+        }
+
+        THEN("the widening is bounded, so it cannot reach arbitrarily far")
+        {
+            // gateAngleMax caps it: an enormous yaw std does not associate everything
+            // in sight regardless of geometry.
+            CHECK(associatedWithYawStd(10.0) <= nDetections);
         }
     }
 }

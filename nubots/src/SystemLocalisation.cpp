@@ -36,17 +36,20 @@ static Eigen::VectorX<Scalar> dynamicsLocalisationTemplated(const Eigen::VectorX
     assert(x.size() == SystemLocalisation::nx);
     assert(u.size() == 6);
 
-    const Eigen::VectorX<Scalar> Theta = x.segment(3, 3);
-    const Eigen::Matrix3<Scalar> Rfb = rpy2rot(Theta);
-    const Eigen::Matrix3<Scalar> TK = TKfromThetaTemplated<Scalar>(Theta);
+    const Eigen::Vector4<Scalar> q = x.segment(SystemLocalisation::iQuat, 4);
+    const Eigen::Matrix3<Scalar> Rfb = quat2rot(q);
 
     const Eigen::Vector3d vBb = u.head<3>();
     const Eigen::Vector3d omegaBb = u.tail<3>();
 
     Eigen::VectorX<Scalar> f(SystemLocalisation::nx);
     f.setZero();
-    f.segment(0, 3) = Rfb * vBb.cast<Scalar>();
-    f.segment(3, 3) = TK * omegaBb.cast<Scalar>();
+    f.segment(SystemLocalisation::iPos, 3) = Rfb * vBb.cast<Scalar>();
+    // qdot = 0.5*Xi(q)*omega_b. No singularity anywhere: every entry of Xi is
+    // linear in q, so the toppling robot that used to blow up the roll-pitch-yaw
+    // rate transform at pitch = +-90 deg now integrates like any other attitude.
+    f.segment(SystemLocalisation::iQuat, 4) =
+        Scalar(0.5)*quatXi(q)*omegaBb.cast<Scalar>();
     // Camera mount bias states are a random walk: zero drift
     return f;
 }
@@ -122,13 +125,13 @@ GaussianInfo<double> SystemLocalisation::processNoiseDensity(double dt) const
         // posture, so it keeps its ordinary (deliberately tiny) PSD: a fall is no
         // reason to let the extrinsic calibration wander.
         sigma << params.sigmaPosXYDisturbed, params.sigmaPosXYDisturbed, params.sigmaPosZDisturbed,
-                 params.sigmaAttDisturbed, params.sigmaAttDisturbed, params.sigmaYawDisturbed,
+                 quaternionSigma(params.sigmaAttDisturbed, params.sigmaYawDisturbed),
                  params.sigmaCamBias, params.sigmaCamBias;
     }
     else
     {
         sigma << params.sigmaPosXY, params.sigmaPosXY, params.sigmaPosZ,
-                 params.sigmaAtt, params.sigmaAtt, params.sigmaYaw,
+                 quaternionSigma(params.sigmaAtt, params.sigmaYaw),
                  params.sigmaCamBias, params.sigmaCamBias;
     }
 
@@ -139,7 +142,13 @@ GaussianInfo<double> SystemLocalisation::processNoiseDensity(double dt) const
 
 std::vector<Eigen::Index> SystemLocalisation::processNoiseIndex() const
 {
-    return {0, 1, 2, 3, 4, 5, 6, 7};
+    // Every state takes process noise. Built from nx rather than written out: the
+    // list silently disagreeing with processNoiseDensity's dimension is not caught
+    // anywhere, and when the state grew to carry a quaternion the stale eight-entry
+    // literal turned the first non-zero-dt prediction into NaN.
+    std::vector<Eigen::Index> idx(nx);
+    std::iota(idx.begin(), idx.end(), Eigen::Index{0});
+    return idx;
 }
 
 std::vector<BodyTwistSample> SystemLocalisation::twistFromOdometry(const std::vector<SensorsSample> & sensors, double t0, double maxGap)
@@ -239,11 +248,17 @@ void SystemLocalisation::inflateCovariance(const Eigen::VectorXd & extraVar)
 {
     assert(extraVar.size() == nx);
     assert((extraVar.array() >= 0.0).all());
+    inflateCovariance(Eigen::MatrixXd(extraVar.asDiagonal()));
+}
+
+void SystemLocalisation::inflateCovariance(const Eigen::MatrixXd & extraCov)
+{
+    assert(extraCov.rows() == nx && extraCov.cols() == nx);
 
     auto inflate = [&](const GaussianInfo<double> & g)
     {
         Eigen::MatrixXd P = g.cov();
-        P.diagonal() += extraVar;
+        P += extraCov;
         // Symmetrise before the Cholesky in fromMoment, matching mirrorDensity.
         P = 0.5*(P + P.transpose()).eval();
         return GaussianInfo<double>::fromMoment(g.mean(), P);
@@ -292,7 +307,53 @@ GaussianInfo<double> SystemLocalisation::positionDensity() const
 
 GaussianInfo<double> SystemLocalisation::orientationDensity() const
 {
-    return density.marginal(Eigen::seqN(3, 3));
+    return density.marginal(Eigen::seqN(iQuat, 4));
+}
+
+// Project one density's attitude mean back onto the unit sphere.
+static GaussianInfo<double> projectQuaternion(const GaussianInfo<double> & g)
+{
+    Eigen::VectorXd mu = g.mean();
+    const double n = mu.segment<4>(SystemLocalisation::iQuat).norm();
+    if (!(n > 1e-9)) return g;      // Degenerate: leave it for the norm prior to pull back
+    mu.segment<4>(SystemLocalisation::iQuat) /= n;
+    // q and -q are the same rotation. Letting the mean wander between the two
+    // hemispheres would make a Gaussian over the components describe a bimodal
+    // thing it cannot represent, so it is kept in w >= 0.
+    if (mu(SystemLocalisation::iQuat) < 0.0)
+    {
+        mu.segment<4>(SystemLocalisation::iQuat) = -mu.segment<4>(SystemLocalisation::iQuat);
+    }
+    return GaussianInfo<double>::fromMoment(mu, g.cov());
+}
+
+void SystemLocalisation::predict(double time)
+{
+    SystemEstimator::predict(time);
+    // Prediction integrates qdot, which leaves the unit sphere at second order
+    // over a step and would otherwise let |q| wander. Only `density` is touched:
+    // predictAll drives this per component with density as its working copy.
+    density = projectQuaternion(density);
+}
+
+void SystemLocalisation::normaliseQuaternion()
+{
+    // Renormalising the mean is a projection back onto the unit sphere, which
+    // MeasurementQuaternionNorm keeps the belief near but cannot enforce exactly
+    // (it is a soft prior, and prediction pushes off the sphere between updates).
+    // The covariance is left alone: to first order the projection's Jacobian is
+    // the identity on the three attitude directions, and the radial direction is
+    // the one the norm prior owns.
+    if (components_.empty())
+    {
+        density = projectQuaternion(density);
+        return;
+    }
+    for (GaussianInfo<double> & c : components_)
+    {
+        c = projectQuaternion(c);
+    }
+    setRepresentative();
 }
 
 // =========================================================================
@@ -302,31 +363,35 @@ GaussianInfo<double> SystemLocalisation::orientationDensity() const
 Eigen::VectorXd SystemLocalisation::mirrorState(const Eigen::VectorXd & x)
 {
     assert(x.size() == nx);
-    // 180 deg rotation about the field-centre z axis: premultiplying the pose
-    // by Rz(pi) negates the horizontal position and offsets yaw by pi, leaving
-    // roll, pitch, height and the camera-mount bias unchanged.
+    // 180 deg rotation about the field-centre z axis: premultiplying the pose by
+    // Rz(pi) negates the horizontal position and turns the attitude by pi about
+    // field z, leaving height and the camera-mount bias unchanged. On the
+    // quaternion that premultiplication is qz(pi) (x) q with qz(pi) = (0,0,0,1),
+    // i.e. (w,x,y,z) -> (-z,-y,x,w) -- a signed permutation, so unlike the yaw
+    // offset it used to be it is exactly linear and needs no wrapping.
     Eigen::VectorXd y = x;
     y(0) = -x(0);
     y(1) = -x(1);
-    y(5) = std::remainder(x(5) + M_PI, 2.0*M_PI);
+    y.segment<4>(iQuat) = mirrorQuatMap()*Eigen::Vector4d(x.segment<4>(iQuat));
     return y;
 }
 
 GaussianInfo<double> SystemLocalisation::mirrorDensity(const GaussianInfo<double> & g)
 {
     assert(g.dim() == nx);
-    // The mirror map is affine: y = M*x + c with M = diag(-1,-1,1,1,1,1,1,1)
-    // (the yaw offset pi lives in c and does not affect the covariance).
-    // Hence mu' = mirrorState(mu) and P' = M*P*M^T, which for a diagonal sign
-    // matrix simply flips the sign of the cross-covariances between the negated
-    // (x, y) block and the rest.
-    Eigen::VectorXd m = Eigen::VectorXd::Ones(nx);
-    m(0) = -1.0;
-    m(1) = -1.0;
+    // The mirror map is now exactly linear: y = M*x, with M block-diagonal over
+    // (position, quaternion, camera bias). It used to be affine because the yaw
+    // offset pi lived in the constant term; on the quaternion the same rotation
+    // is the signed permutation mirrorQuatMap(), which is orthogonal, so
+    // P' = M*P*M^T is exact rather than a small-angle approximation.
+    Eigen::MatrixXd M = Eigen::MatrixXd::Identity(nx, nx);
+    M(0, 0) = -1.0;
+    M(1, 1) = -1.0;
+    M.block<4, 4>(iQuat, iQuat) = mirrorQuatMap();
 
     Eigen::VectorXd mu = mirrorState(g.mean());
     Eigen::MatrixXd P = g.cov();
-    Eigen::MatrixXd Pm = m.asDiagonal()*P*m.asDiagonal();
+    Eigen::MatrixXd Pm = M*P*M.transpose();
     // Symmetrise to remove any tiny asymmetry before the Cholesky in fromMoment
     Pm = 0.5*(Pm + Pm.transpose()).eval();
     return GaussianInfo<double>::fromMoment(mu, Pm);
@@ -551,6 +616,7 @@ void SystemLocalisation::process(Event & event)
     if (components_.empty())
     {
         event.process(*this);
+        normaliseQuaternion();
         return;
     }
 
@@ -584,6 +650,7 @@ void SystemLocalisation::process(Event & event)
     }
     // time_ is now the event time (set by the last component's predict).
 
+    normaliseQuaternion();
     normaliseWeights();
     mergeComponents();
     pruneComponents();

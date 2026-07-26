@@ -27,6 +27,7 @@
 #include "MeasurementFieldLines.h"
 #include "MeasurementGravity.h"
 #include "MeasurementKinematicHeight.h"
+#include "MeasurementQuaternionNorm.h"
 #include "SideDisambiguator.h"
 #include "Pose.hpp"
 #include "rotation.hpp"
@@ -433,7 +434,10 @@ static bool solveInitialPose(const SensorLog & log, const FieldMap & map,
                 for (double yaw = -M_PI; yaw < M_PI; yaw += dyaw)
                 {
                     Eigen::VectorXd cand(SystemLocalisation::nx);
-                    cand << x, y, z0, roll0, pitch0, yaw, 0.0, 0.0;
+                    cand.setZero();
+                    cand.head<3>() << x, y, z0;
+                    cand.segment<4>(SystemLocalisation::iQuat) =
+                        rpy2quat(Eigen::Vector3d(roll0, pitch0, yaw));
                     probe.resetTo(GaussianInfo<double>::fromSqrtMoment(cand, Stmp), tInit);
                     MeasurementFieldLandmarks meas(tInit, v, Tbc, map, probe);
                     if (meas.numAssociated() < minAssoc) continue;
@@ -639,13 +643,18 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     }
     std::println("Initialising at t={:.3f} s from first-frame landmark solve "
                  "(x={:.2f} m, y={:.2f} m, yaw={:.1f} deg)",
-                 tInit, eta0(0), eta0(1), eta0(5)*180.0/M_PI);
+                 tInit, eta0(0), eta0(1), SystemLocalisation::heading(eta0)*180.0/M_PI);
 
     // Deliberately loose prior: the grid localises coarsely and the recursive
     // updates sharpen it over the first (stationary) seconds. z, roll and pitch
     // come from kinematics so their prior is tight; (x, y, yaw) start wide.
+    // The attitude entries are quaternion-component std devs: a body rotation of
+    // s maps to 0.5*s on the components (see quaternionSigma), so the 0.05 rad
+    // roll/pitch and 0.5 rad yaw priors become 0.025 and 0.25. Yaw dominates, and
+    // it is not separable across components, so all four carry the loose figure --
+    // the tight roll/pitch prior is re-established within a frame by gravity.
     Eigen::MatrixXd S0 = Eigen::MatrixXd::Zero(SystemLocalisation::nx, SystemLocalisation::nx);
-    S0.diagonal() << 1.0, 1.0, 0.05, 0.05, 0.05, 0.5, 0.02, 0.02;  // pose [m/rad] + camera bias [rad]
+    S0.diagonal() << 1.0, 1.0, 0.05, 0.25, 0.25, 0.25, 0.25, 0.02, 0.02;
     auto p0 = GaussianInfo<double>::fromSqrtMoment(eta0, S0);
 
     SystemLocalisation system(p0, twists);
@@ -677,6 +686,8 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         double t;
         Eigen::VectorXd mean;
         Eigen::VectorXd sigma;
+        Eigen::Vector3d rpy;        ///< Attitude derived from the state quaternion [rad]
+        Eigen::Vector3d attStd;     ///< Attitude std devs in the field tangent [rad]
         std::size_t nAssoc, nCand;
         double baseX, baseY, baseYaw, baseCost;
         double errXY, errYaw;
@@ -697,6 +708,86 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     {
         viewFrames.reserve(log.vision.size());
     }
+
+    // The belief as the viewer needs it. Shared by processed frames and by the
+    // frames the estimator skipped, because the replay timeline is the video:
+    // playback must not jump over a fall, and during one the predicted belief is
+    // precisely what is worth watching drift against the footage.
+    auto captureBelief = [&](ViewerFrame & vf, const Eigen::VectorXd & mean) {
+        vf.estPos = mean.head<2>();
+        vf.estYaw = SystemLocalisation::heading(mean);
+        const Eigen::Matrix3d Ppos = system.density.cov().topLeftCorner<3, 3>();
+        vf.estCov = Ppos.topLeftCorner<2, 2>();
+        vf.estPos3 = mean.head<3>();
+        vf.estCov3 = Ppos;
+
+        // Hypotheses (falls back to the single density when the bank is off).
+        const std::vector<double> hw = system.hypothesisWeights();
+        if (system.hypotheses().empty())
+        {
+            HypothesisView h;
+            h.pos = vf.estPos;
+            h.yaw = vf.estYaw;
+            h.cov = vf.estCov;
+            h.pos3 = vf.estPos3;
+            h.cov3 = vf.estCov3;
+            h.weight = 1.0;
+            vf.hypotheses.push_back(h);
+        }
+        else
+        {
+            const auto & comps = system.hypotheses();
+            for (std::size_t i = 0; i < comps.size(); ++i)
+            {
+                const Eigen::VectorXd m = comps[i].mean();
+                HypothesisView h;
+                h.pos = m.head<2>();
+                h.yaw = SystemLocalisation::heading(m);
+                h.pos3 = m.head<3>();
+                h.cov3 = comps[i].cov().topLeftCorner<3, 3>();
+                h.cov = h.cov3.topLeftCorner<2, 2>();
+                h.weight = i < hw.size() ? hw[i] : 0.0;
+                vf.hypotheses.push_back(h);
+            }
+        }
+    };
+
+    // Ground truth at a time, for the top-down trail (evaluation only).
+    auto captureTruth = [&](ViewerFrame & vf, double tt) {
+        if (truth.empty()) return;
+        const std::size_t ti = nearestIndex(truth, tt, [](const TruthSample & s) { return s.t; });
+        if (std::abs(truth[ti].t - tt) >= 0.05) return;
+        vf.hasTruth = true;
+        vf.truthPos = truth[ti].rBFf;
+        vf.truthYaw = truth[ti].yaw;
+    };
+
+    // A frame the filter did not update on. The overlay still gets the predicted
+    // camera pose where the log carries one, so the horizon and the re-projected
+    // map keep being drawn -- watching them slide off the scene is the clearest
+    // picture of what a blind window costs. Detections and associations are left
+    // empty because there genuinely were none used.
+    auto captureSkipped = [&](const VisionSample & vv, double tt, FrameSkip why) {
+        if (!captureFrames) return;
+        ViewerFrame vf;
+        vf.videoFrame = vv.videoFrame;
+        vf.t = tt;
+        vf.skip = why;
+        const Eigen::VectorXd mean = system.density.mean();
+        captureBelief(vf, mean);
+        captureTruth(vf, tt);
+        if (vv.Hcw.rotationMatrix.allFinite() && vv.Hcw.translationVector.allFinite() && !log.sensors.empty())
+        {
+            const std::size_t sk = nearestIndex(log.sensors, vv.t, [](const SensorsSample & s) { return s.t; });
+            if (std::abs(log.sensors[sk].t - vv.t) <= 0.1)
+            {
+                const Pose<double> Tbc = log.sensors[sk].Htw*vv.Hcw.inverse();
+                vf.Tfc = SystemLocalisation::fieldPose<double>(mean)*Tbc
+                         *Pose<double>(SystemLocalisation::cameraBiasRotation<double>(mean), Eigen::Vector3d::Zero());
+            }
+        }
+        viewFrames.push_back(std::move(vf));
+    };
 
     // The NUbots baseline is itself an estimate whose cost spikes when it is
     // lost; restrict the headline comparison to samples where it is trustworthy.
@@ -749,16 +840,55 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
 
     double lastRespawnT = -std::numeric_limits<double>::infinity();  ///< Bank-mode mirror re-seed cooldown
 
+    // How long the *Disturbed process noise PSDs stay in force once the robot
+    // stops being upright.
+    //
+    // What a fall does to the pose is a bounded event, not a diffusion: the torso
+    // moves while it topples and while it is levered back upright, and in between
+    // it lies still on the carpet. Running the disturbed PSDs for the whole fallen
+    // window models the still part as a random walk at 0.40 m/sqrt(s), so the
+    // belief's width ends up reporting how long the robot lay there rather than
+    // how far it could have gone -- 1.5 m of position std after 12 s down, for a
+    // robot that has not moved since the second it landed. (Measured across the
+    // two real falls in data3_webots, the NUbots baseline moves 0.0 m and 0.6 m.)
+    // So the disturbed PSDs cover the dynamic part and then stand down, and the
+    // event-sized part of the uncertainty is the one-shot inflation below.
+    const double disturbedWindow = 2.0;                 ///< [s]
+
     // Belief handed back on recovery from a fall (see the recovery block below).
     // The position figure is deliberately at SideDisambiguator's maxPosStd so that
     // recovering also freezes background-map building; the yaw figure is what a
     // getup can plausibly reorient the robot by without the gyroscope catching it.
-    const double recoveryPosStd = 0.50;                 ///< [m]
-    const double recoveryYawStd = 60.0*M_PI/180.0;      ///< [rad]
+    //
+    // FALL_GATE=off and FALL_INFLATE=<m>,<deg> exist to measure this design rather
+    // than assume it: the first replays straight through a fall with every update
+    // applied, the second changes what recovery hands back (0,0 disables it). Both
+    // default to the behaviour described above.
+    const bool fallGate = [] {
+        const char * e = std::getenv("FALL_GATE");
+        return e == nullptr || std::string_view(e) != "off";
+    }();
+    double recoveryPosStd = 0.50;                 ///< [m]
+    double recoveryYawStd = 60.0*M_PI/180.0;      ///< [rad]
+    if (const char * inflateEnv = std::getenv("FALL_INFLATE"))
+    {
+        const std::string s(inflateEnv);
+        const std::size_t comma = s.find(',');
+        recoveryPosStd = std::atof(s.substr(0, comma).c_str());
+        recoveryYawStd = comma == std::string::npos ? 0.0
+                       : std::atof(s.substr(comma + 1).c_str())*M_PI/180.0;
+    }
+    if (!fallGate)
+    {
+        std::println("FALL_GATE=off: measurement updates are NOT suppressed while not upright");
+    }
+    std::println("Recovery inflation: sigma_xy +{:.2f} m, sigma_yaw +{:.1f} deg",
+                 recoveryPosStd, recoveryYawStd*180.0/M_PI);
 
     Posture prevPosture = Posture::UPRIGHT;
     double fallStartT = std::numeric_limits<double>::quiet_NaN();
     std::size_t nFalls = 0, nFallenFrames = 0;
+    std::size_t nGravityRejected = 0;   ///< Frames where the specific force was not quasi-static
 
     for (const VisionSample & v : log.vision)
     {
@@ -766,28 +896,43 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         if (t < tInit)
         {
             nSkipped++;
+            // Still shown: the replay covers the whole recording, and the frames
+            // before initialisation are where the grid solve's input can be
+            // eyeballed. The belief drawn on them is the seeded prior, which is
+            // what the filter is about to start from.
+            captureSkipped(v, t, FrameSkip::BEFORE_INIT);
             continue;
         }
 
-        // Posture gate. Upright is an assumption of every measurement model in this
-        // filter -- gravity assumes the accelerometer reads gravity, kinematic
-        // height assumes the support leg reaches the ground, the landmark model
-        // assumes predicted bearings land within a 0.35 rad gate, and the side
-        // disambiguator assumes the pose it triangulates background corners from is
-        // roughly right. A fall breaks all four simultaneously, and nothing
-        // downstream is robust to it: the accelerometer reads 0 in free fall and
-        // 20-40 m/s^2 on impact against a 1 m/s^2 noise model, which is a 10-30
-        // sigma pull on roll and pitch, and a handful of landmarks that happen to
-        // line up under the wrong attitude will shrink the covariance around a pose
-        // that is simply wrong. So while the robot is not upright the belief is
-        // predicted and nothing else.
-        Posture posture = falls.at(t);
-        if (std::isfinite(fallT) && t >= fallT && t < fallT + fallDuration)
+        // Posture gate. This used to suppress every update while the robot was not
+        // upright, on the grounds that all four measurement models assume an
+        // upright robot. That was only half right. The models that break are the
+        // ones whose *assumption* breaks -- kinematic height needs the support leg
+        // on the ground, and the accelerometer only reads gravity when the robot
+        // is not being accelerated. The landmark and out-of-field models are plain
+        // geometry: given the right attitude they are as valid face-down as
+        // standing. What actually forced blanket suppression was the roll-pitch-yaw
+        // state, which could not represent a fallen robot without passing through
+        // gimbal lock; with a quaternion (see SystemLocalisation) it can, so the
+        // gate is now per-model rather than all-or-nothing. That matters because a
+        // fall is exactly when the estimate is most at risk: a robot that spins
+        // while toppling or getting up changes its heading, and only measurements
+        // taken during the event can catch it.
+        //
+        // FALL_GATE=off makes the whole run read as upright, so the recovery block
+        // below never fires either -- the ablation is "no posture handling at all",
+        // not "suppression off but recovery still on".
+        Posture posture = fallGate ? falls.at(t) : Posture::UPRIGHT;
+        if (fallGate && std::isfinite(fallT) && t >= fallT && t < fallT + fallDuration)
         {
             posture = Posture::FALLEN;      // Simulated fall (see FALL_T above)
         }
         const bool upright = posture == Posture::UPRIGHT;
-        system.setDisturbed(!upright);
+        // Only the first disturbedWindow seconds of a fall get the disturbed
+        // PSDs; past that the robot is lying still and diffusing the belief
+        // further would be inventing motion. See disturbedWindow above.
+        const double fallElapsed = (!upright && std::isfinite(fallStartT)) ? t - fallStartT : 0.0;
+        system.setDisturbed(!upright && fallElapsed < disturbedWindow);
 
         // Prediction used to happen only inside Event::process, so a frame that
         // produced no usable measurement advanced neither the state nor the clock.
@@ -795,22 +940,24 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         // filter would emerge from it holding its pre-fall mean at its pre-fall
         // covariance -- confidently wrong rather than honestly uncertain.
         const bool poseFinite = v.Hcw.rotationMatrix.allFinite() && v.Hcw.translationVector.allFinite();
-        if (!upright || v.detections.empty() || !poseFinite)
+        if (v.detections.empty() || !poseFinite)
         {
             system.predictAll(t);
             nSkipped++;
-            if (!upright)
-            {
-                if (prevPosture == Posture::UPRIGHT)
-                {
-                    fallStartT = t;
-                    std::println("NOT UPRIGHT at t={:.2f} s ({}): suppressing gravity, kinematic-height, "
-                                 "landmark and out-of-field updates until recovery", t, to_string(posture));
-                }
-                nFallenFrames++;
-            }
+            captureSkipped(v, t, !poseFinite ? FrameSkip::BAD_POSE : FrameSkip::NO_DETECTIONS);
             prevPosture = posture;
             continue;
+        }
+
+        if (!upright)
+        {
+            if (prevPosture == Posture::UPRIGHT)
+            {
+                fallStartT = t;
+                std::println("NOT UPRIGHT at t={:.2f} s ({}): suppressing kinematic height; landmark, "
+                             "out-of-field and (quasi-static) gravity updates continue", t, to_string(posture));
+            }
+            nFallenFrames++;
         }
 
         // Recovery from a fall. The mean is kept: a fall and getup move the torso
@@ -822,12 +969,22 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         // given back. The inflated position std also exceeds SideDisambiguator's
         // maxPosStd, which freezes background-map building until the filter has
         // reconverged, so no landmarks are triangulated from the recovering pose.
-        if (prevPosture != Posture::UPRIGHT)
+        // Recovery fires on the transition back to upright, not merely on "the
+        // last frame was not upright" -- now that not-upright frames run their
+        // updates through this same path, the latter would re-inflate every frame
+        // of the fall.
+        if (prevPosture != Posture::UPRIGHT && upright)
         {
-            Eigen::VectorXd extraVar = Eigen::VectorXd::Zero(SystemLocalisation::nx);
-            extraVar(0) = extraVar(1) = recoveryPosStd*recoveryPosStd;
-            extraVar(5) = recoveryYawStd*recoveryYawStd;
-            system.inflateCovariance(extraVar);
+            // Yaw uncertainty is about the field z axis, which on the quaternion
+            // states is a rank-one block rather than a single diagonal element --
+            // there is no "the yaw element" any more.
+            const Eigen::VectorXd xr = system.density.mean();
+            Eigen::MatrixXd extraCov = Eigen::MatrixXd::Zero(SystemLocalisation::nx, SystemLocalisation::nx);
+            extraCov(0, 0) = extraCov(1, 1) = recoveryPosStd*recoveryPosStd;
+            const Eigen::Vector4d jYaw = SystemLocalisation::attitudeTangentField(xr).col(2);
+            extraCov.block<4, 4>(SystemLocalisation::iQuat, SystemLocalisation::iQuat) =
+                recoveryYawStd*recoveryYawStd*jYaw*jYaw.transpose();
+            system.inflateCovariance(extraCov);
 
             // A fall is also a chance to have been turned around without the
             // landmarks noticing, and they can never notice: the two symmetric
@@ -841,7 +998,9 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
             std::println("RECOVERED at t={:.2f} s after {:.2f} s not upright: inflated to "
                          "sigma_xy {:.2f} m, sigma_yaw {:.1f} deg ({} hypotheses)",
                          t, t - fallStartT, std::sqrt(system.density.cov()(0, 0)),
-                         std::sqrt(system.density.cov()(5, 5))*180.0/M_PI, system.numHypotheses());
+                         std::sqrt(SystemLocalisation::yawVariance(system.density.mean(),
+                                                                   system.density.cov()))*180.0/M_PI,
+                         system.numHypotheses());
             nFalls++;
         }
         prevPosture = posture;
@@ -859,7 +1018,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
             kidnapDone = true;
             Eigen::VectorXd xk = system.density.mean();
             std::println("KIDNAP: state mirrored at t={:.2f} s -> x={:.2f} m, y={:.2f} m, yaw={:.1f} deg",
-                         t, xk(0), xk(1), xk(5)*180.0/M_PI);
+                         t, xk(0), xk(1), SystemLocalisation::heading(xk)*180.0/M_PI);
         }
 
         // Measurement toggles (for ablation experiments)
@@ -889,12 +1048,42 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                 frameLineRays = lp.rays;
             }
         }
+        // Unit-norm pseudo-measurement. The four attitude states carry three
+        // degrees of freedom and quat2rot normalises, so |q| is invisible to
+        // every other model here; without this the MAP Hessian is singular along
+        // it and the Newton step has a flat direction to wander down. Applied
+        // first so the rest of the frame's updates see a belief that is on the
+        // sphere. See MeasurementQuaternionNorm.
+        {
+            MeasurementQuaternionNorm mqn(t);
+            system.process(mqn);
+        }
+        // Gravity is valid whenever the torso is not being accelerated -- which is
+        // true of a robot lying still on the carpet and false of one in free fall
+        // or hitting the ground, regardless of posture. Gating on the specific
+        // force magnitude tests that directly, which is both the right condition
+        // during a fall and a better one than "upright" while walking. The
+        // threshold is deliberately loose: ordinary gait swings the magnitude by
+        // a couple of m/s^2, and the model already carries a 1 m/s^2 noise.
+        constexpr double kQuasiStaticTol = 3.0;    ///< [m/s^2] from standard gravity
         if (useGravity && log.sensors[k].accelerometer.allFinite())
         {
-            MeasurementGravity mg(t, log.sensors[k].accelerometer);
-            system.process(mg);
+            const double aMag = log.sensors[k].accelerometer.norm();
+            if (std::abs(aMag - 9.80665) < kQuasiStaticTol)
+            {
+                MeasurementGravity mg(t, log.sensors[k].accelerometer);
+                system.process(mg);
+            }
+            else
+            {
+                nGravityRejected++;
+            }
         }
-        if (useKinematicHeight)
+        // Torso height above ground assumes the support leg reaches the ground, so
+        // this is the one model a fall genuinely invalidates: lying down, the
+        // chain still reports a near-upright 0.44 m torso and would fight the
+        // attitude the other measurements are establishing.
+        if (useKinematicHeight && upright)
         {
             // Torso height above ground from the odometry/kinematic chain
             double h = log.sensors[k].Htw.inverse().translationVector.z();
@@ -922,6 +1111,8 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         r.t = t;
         r.mean = system.density.mean();
         r.sigma = system.density.cov().diagonal().cwiseSqrt();
+        r.rpy = SystemLocalisation::attitudeRpy(r.mean);
+        r.attStd = SystemLocalisation::attitudeStd(r.mean, system.density.cov());
         r.nAssoc = meas.numAssociated();
         r.nCand = meas.numCandidates();
         r.updateMs = ms;
@@ -945,7 +1136,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                 r.baseYaw = rpyBase.z();
                 r.baseCost = b.cost;
                 r.errXY = (r.mean.head<2>() - TfbBase.translationVector.head<2>()).norm();
-                r.errYaw = wrapAngle(r.mean(5) - r.baseYaw);
+                r.errYaw = wrapAngle(r.rpy(2) - r.baseYaw);
                 sumSqErrXY += r.errXY*r.errXY;
                 sumSqErrYaw += r.errYaw*r.errYaw;
                 nCompared++;
@@ -957,7 +1148,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                 {
                     Eigen::VectorXd baseEta = Eigen::VectorXd::Zero(SystemLocalisation::nx);
                     baseEta.head<3>() = TfbBase.translationVector;
-                    baseEta.segment<3>(3) = rot2rpy(TfbBase.rotationMatrix);
+                    baseEta.segment<4>(SystemLocalisation::iQuat) = rot2quat(TfbBase.rotationMatrix);
                     auto [rs, ns] = meanReprojResidual(r.mean, v, Tbc);
                     auto [rb, nb] = meanReprojResidual(baseEta, v, Tbc);
                     if (ns > 0 && nb > 0)
@@ -988,7 +1179,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                 r.truthZ = g.rBFf.z();
                 r.truthYaw = g.yaw;
                 r.errXYTruth = (r.mean.head<2>() - g.rBFf.head<2>()).norm();
-                r.errYawTruth = wrapAngle(r.mean(5) - g.yaw);
+                r.errYawTruth = wrapAngle(r.rpy(2) - g.yaw);
                 sumSqTruthXY += r.errXYTruth*r.errXYTruth;
                 sumSqTruthYaw += r.errYawTruth*r.errYawTruth;
                 sumZerr += r.mean(2) - g.rBFf.z();
@@ -1028,7 +1219,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                      *Pose<double>(SystemLocalisation::cameraBiasRotation<double>(mirrorEta), Eigen::Vector3d::Zero());
 
             side = sideDis.process(t, gray, TfcEst, TfcMirror,
-                                   std::max(r.sigma(0), r.sigma(1)), r.sigma(5),
+                                   std::max(r.sigma(0), r.sigma(1)), r.attStd(2),
                                    std::abs(log.sensors[k].gyroscope.z()));
             sideRan = true;
             double oofMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ticOof).count();
@@ -1085,7 +1276,8 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                 nSideFlips++;
                 Eigen::VectorXd xf = system.density.mean();
                 std::println("SIDE FLIP at t={:.2f} s (llr={:+.1f}, assoc {}/{} own/mirror): corrected to x={:.2f} m, y={:.2f} m, yaw={:.1f} deg",
-                             t, side.llr, side.nAssociated, side.nAssociatedMirror, xf(0), xf(1), xf(5)*180.0/M_PI);
+                             t, side.llr, side.nAssociated, side.nAssociatedMirror,
+                             xf(0), xf(1), SystemLocalisation::heading(xf)*180.0/M_PI);
             }
         }
         records.push_back(r);
@@ -1097,42 +1289,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
             vf.videoFrame = v.videoFrame;
             vf.t = t;
             vf.Tfc = TfcEst;
-            vf.estPos = r.mean.head<2>();
-            vf.estYaw = r.mean(5);
-            const Eigen::Matrix3d Ppos = system.density.cov().topLeftCorner<3, 3>();
-            vf.estCov = Ppos.topLeftCorner<2, 2>();
-            vf.estPos3 = r.mean.head<3>();
-            vf.estCov3 = Ppos;
-
-            // Hypotheses (falls back to the single density when the bank is off).
-            std::vector<double> hw = system.hypothesisWeights();
-            if (system.hypotheses().empty())
-            {
-                HypothesisView h;
-                h.pos = r.mean.head<2>();
-                h.yaw = r.mean(5);
-                h.cov = vf.estCov;
-                h.pos3 = vf.estPos3;
-                h.cov3 = vf.estCov3;
-                h.weight = 1.0;
-                vf.hypotheses.push_back(h);
-            }
-            else
-            {
-                const auto & comps = system.hypotheses();
-                for (std::size_t i = 0; i < comps.size(); ++i)
-                {
-                    Eigen::VectorXd m = comps[i].mean();
-                    HypothesisView h;
-                    h.pos = m.head<2>();
-                    h.yaw = m(5);
-                    h.pos3 = m.head<3>();
-                    h.cov3 = comps[i].cov().topLeftCorner<3, 3>();
-                    h.cov = h.cov3.topLeftCorner<2, 2>();
-                    h.weight = i < hw.size() ? hw[i] : 0.0;
-                    vf.hypotheses.push_back(h);
-                }
-            }
+            captureBelief(vf, r.mean);
 
             // Raw YOLO detections (boxes), each flagged with what the landmark
             // measurement did with it: associated, gated out, dropped for low
@@ -1229,15 +1386,77 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         }
     }
 
+    // Rebuild the viewer timeline as the video timeline. Vision samples are not
+    // one-to-one with video frames -- messages get dropped and the two streams
+    // run at slightly different rates -- so one entry per sample silently drops
+    // footage. Walking the frames instead and emitting a carried-forward entry
+    // wherever no sample landed makes the replay play the recording through, at
+    // the cost of some frames on which the overlay simply does not change.
+    if (captureFrames && !viewFrames.empty())
+    {
+        // What a frame with no sample of its own inherits. Held by value: a
+        // reference into `dense` would dangle as the vector grows.
+        ViewerFrame carried;
+        carried.skip = FrameSkip::NO_SAMPLE;
+        auto carry = [&carried](const ViewerFrame & src) {
+            carried.Tfc = src.Tfc;
+            carried.estPos = src.estPos;
+            carried.estYaw = src.estYaw;
+            carried.estCov = src.estCov;
+            carried.estPos3 = src.estPos3;
+            carried.estCov3 = src.estCov3;
+            carried.hypotheses = src.hypotheses;
+        };
+        carry(viewFrames.front());   // Leading frames show the seeded prior
+
+        const int nVideo = static_cast<int>(log.frameTimes.size());
+        std::vector<ViewerFrame> dense;
+        dense.reserve(static_cast<std::size_t>(nVideo) + viewFrames.size());
+        std::size_t cursor = 0;
+        for (int f = 0; f < nVideo; ++f)
+        {
+            // Samples belonging at or before this frame. A sample that matched no
+            // frame at all (videoFrame == -1) is emitted where the walk reaches
+            // it, which is its right place in time since samples are in order.
+            while (cursor < viewFrames.size()
+                   && (viewFrames[cursor].videoFrame < 0 || viewFrames[cursor].videoFrame <= f))
+            {
+                carry(viewFrames[cursor]);
+                dense.push_back(std::move(viewFrames[cursor]));
+                ++cursor;
+            }
+            if (dense.empty() || dense.back().videoFrame != f)
+            {
+                ViewerFrame gap = carried;
+                gap.videoFrame = f;
+                gap.t = log.frameTimes[static_cast<std::size_t>(f)] - t0;
+                captureTruth(gap, gap.t);
+                dense.push_back(std::move(gap));
+            }
+        }
+        // Samples timestamped past the end of the video, if any.
+        for (; cursor < viewFrames.size(); ++cursor)
+        {
+            dense.push_back(std::move(viewFrames[cursor]));
+        }
+
+        std::println("Viewer timeline: {} frames over {} video frames ({} carried forward where no "
+                     "vision sample matched)",
+                     dense.size(), nVideo, dense.size() - viewFrames.size());
+        viewFrames.swap(dense);
+    }
+
     // Summary
     std::println("");
     std::println("Processed {} vision updates ({} skipped, of which {} while not upright)",
                  nUpdates, nSkipped, nFallenFrames);
-    std::println("Falls recovered from: {}", nFalls);
+    std::println("Falls recovered from: {} ({} frames not upright, {} gravity updates rejected as non-quasi-static)",
+                 nFalls, nFallenFrames, nGravityRejected);
     {
         Eigen::VectorXd xFinal = system.density.mean();
         std::println("Final camera mount bias estimate: roll {:.2f} deg, pitch {:.2f} deg",
-                     xFinal(6)*180.0/M_PI, xFinal(7)*180.0/M_PI);
+                     xFinal(SystemLocalisation::iBias)*180.0/M_PI,
+                     xFinal(SystemLocalisation::iBias + 1)*180.0/M_PI);
     }
     std::println("Mean update time {:.2f} ms, max {:.2f} ms", nUpdates ? sumMs/nUpdates : 0.0, maxMs);
     if (nCompared > 0)
@@ -1410,10 +1629,15 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         csv << "t,x,y,z,roll,pitch,yaw,sx,sy,sz,sroll,spitch,syaw,camBiasRoll,camBiasPitch,sCamRoll,sCamPitch,nAssoc,nCand,baseX,baseY,baseYaw,baseCost,errXY,errYaw,updateMs,sideLlr,oofAssoc,truthX,truthY,truthZ,truthYaw,errXYTruth,errYawTruth\n";
         for (const Record & r : records)
         {
+            // The CSV columns stay (x, y, z, roll, pitch, yaw): the state carries a
+            // quaternion now, so the attitude columns are derived rather than copied.
             csv << r.t;
-            for (int i = 0; i < 6; ++i) csv << ',' << r.mean(i);
-            for (int i = 0; i < 6; ++i) csv << ',' << r.sigma(i);
-            csv << ',' << r.mean(6) << ',' << r.mean(7) << ',' << r.sigma(6) << ',' << r.sigma(7);
+            for (int i = 0; i < 3; ++i) csv << ',' << r.mean(i);
+            for (int i = 0; i < 3; ++i) csv << ',' << r.rpy(i);
+            for (int i = 0; i < 3; ++i) csv << ',' << r.sigma(i);
+            for (int i = 0; i < 3; ++i) csv << ',' << r.attStd(i);
+            csv << ',' << r.mean(SystemLocalisation::iBias) << ',' << r.mean(SystemLocalisation::iBias + 1)
+                << ',' << r.sigma(SystemLocalisation::iBias) << ',' << r.sigma(SystemLocalisation::iBias + 1);
             csv << ',' << r.nAssoc << ',' << r.nCand
                 << ',' << r.baseX << ',' << r.baseY << ',' << r.baseYaw << ',' << r.baseCost
                 << ',' << r.errXY << ',' << r.errYaw << ',' << r.updateMs

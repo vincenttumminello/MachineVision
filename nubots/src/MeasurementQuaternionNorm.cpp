@@ -1,29 +1,10 @@
 #include <Eigen/Core>
 #include <autodiff/forward/dual.hpp>
 #include <autodiff/forward/dual/eigen.hpp>
-#include "Measurement.h"
-#include "MeasurementGravity.h"
+#include "MeasurementQuaternionNorm.h"
 
-MeasurementGravity::MeasurementGravity(double time, const Eigen::Vector3d & accelerometer, double sigma)
-    : Measurement(time, 0)
-    , y_(accelerometer)
-    , sigma_(sigma)
-{
-    updateMethod_ = UpdateMethod::NEWTONTRUSTEIG;
-}
-
-Eigen::VectorXd MeasurementGravity::simulate(const Eigen::VectorXd & x, const SystemEstimator & system) const
-{
-    const Eigen::Matrix3d Rfb = quat2rot(Eigen::Vector4d(x.segment<4>(SystemLocalisation::iQuat)));
-    return Rfb.transpose()*Eigen::Vector3d(0, 0, gravity_);
-}
-
-double MeasurementGravity::logLikelihood(const Eigen::VectorXd & x, const SystemEstimator & system) const
-{
-    return logLikelihoodImpl<double>(x);
-}
-
-double MeasurementGravity::logLikelihood(const Eigen::VectorXd & x, const SystemEstimator & system, Eigen::VectorXd & g) const
+double MeasurementQuaternionNorm::logLikelihood(const Eigen::VectorXd & x, const SystemEstimator & system,
+                                                Eigen::VectorXd & g) const
 {
     using autodiff::dual;
     using autodiff::gradient;
@@ -40,7 +21,8 @@ double MeasurementGravity::logLikelihood(const Eigen::VectorXd & x, const System
     return static_cast<double>(fdual);
 }
 
-double MeasurementGravity::logLikelihood(const Eigen::VectorXd & x, const SystemEstimator & system, Eigen::VectorXd & g, Eigen::MatrixXd & H) const
+double MeasurementQuaternionNorm::logLikelihood(const Eigen::VectorXd & x, const SystemEstimator & system,
+                                                Eigen::VectorXd & g, Eigen::MatrixXd & H) const
 {
     using autodiff::dual2nd;
     using autodiff::hessian;

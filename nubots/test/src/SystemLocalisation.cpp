@@ -4,12 +4,13 @@
 #include "../../src/GaussianInfo.hpp"
 #include "../../src/SensorLog.h"
 #include "../../src/SystemLocalisation.h"
+#include "stateHelpers.hpp"
 
 SCENARIO("SystemLocalisation dynamics and prediction")
 {
     GIVEN("A system at the field origin with an identity-orientation state")
     {
-        Eigen::VectorXd eta0 = Eigen::VectorXd::Zero(SystemLocalisation::nx);
+        Eigen::VectorXd eta0 = makeState(0, 0, 0, 0, 0, 0);
         Eigen::MatrixXd S0 = Eigen::MatrixXd::Identity(SystemLocalisation::nx, SystemLocalisation::nx)*0.01;
         auto p0 = GaussianInfo<double>::fromSqrtMoment(eta0, S0);
 
@@ -34,14 +35,17 @@ SCENARIO("SystemLocalisation dynamics and prediction")
                 REQUIRE(f.size() == SystemLocalisation::nx);
                 CHECK(f(0) == doctest::Approx(0.5));
                 CHECK(f(1) == doctest::Approx(0.0));
-                CHECK(f(5) == doctest::Approx(0.1));
+                // qdot = 0.5*Xi(q)*omega. At the identity quaternion (1,0,0,0) a
+                // yaw rate of 0.1 shows up as 0.05 on the z component and nowhere
+                // else -- there is no "the yaw rate element" any more.
+                CHECK(f(SystemLocalisation::iQuat + 3) == doctest::Approx(0.05));
+                CHECK(f(SystemLocalisation::iQuat) == doctest::Approx(0.0));
             }
 
             THEN("the dynamics Jacobian matches finite differences")
             {
                 const int n = SystemLocalisation::nx;
-                Eigen::VectorXd x = Eigen::VectorXd::Zero(n);
-                x.head<6>() << 0.3, -0.2, 0.0, 0.05, -0.1, 0.7;
+                Eigen::VectorXd x = makeState(0.3, -0.2, 0.0, 0.05, -0.1, 0.7);
                 Eigen::VectorXd u(6);
                 u << 0.4, 0.1, -0.02, 0.01, 0.03, 0.2;
 
@@ -70,6 +74,7 @@ SCENARIO("SystemLocalisation dynamics and prediction")
                 system.predict(1.0);
                 Eigen::VectorXd mu = system.density.mean();
                 CHECK(mu(0) == doctest::Approx(0.5).epsilon(0.02));
+                CHECK(mu.segment<4>(SystemLocalisation::iQuat).norm() == doctest::Approx(1.0).epsilon(1e-9));
                 CHECK(std::abs(mu(1)) < 0.01);
                 CHECK(std::sqrt(system.density.cov()(0, 0)) > sigma0);
             }

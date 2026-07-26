@@ -208,8 +208,17 @@ While the posture is anything other than upright:
   it is executing while the robot is on the ground; the zero-order hold would
   otherwise carry the last pre-fall velocity across the whole event. The
   gyroscope-derived angular rate is kept, because it measures the topple for real.
-- Process noise switches to the `*Disturbed` PSDs, so the belief decays honestly
-  (≈0.40 m/√s in position, 0.60 rad/√s in yaw) rather than coasting.
+- Process noise switches to the `*Disturbed` PSDs (≈0.40 m/√s in position,
+  0.60 rad/√s in yaw) **for the first 2 s only**, and then stands back down. What
+  a fall does to the pose is a bounded event, not a diffusion: the torso moves
+  while it topples and while it is levered upright, and in between it lies still.
+  Running the disturbed PSDs for the whole window instead made the belief's width
+  report how long the robot had been down rather than how far it could have gone —
+  1.48 m of position std after 12 s, for a robot that had not moved since it
+  landed, and a yaw std of 134°, which is not a meaningful figure on a circle.
+  Across the two real falls in `data3_webots` the NUbots baseline moves 0.0 m and
+  0.6 m, so the displacement is event-sized and the one-shot inflation below is
+  where it belongs.
 
 On recovery the **mean is kept** and only the covariance is widened (+0.50 m in
 position, +60° in yaw). A fall and getup translate the torso well under a metre,
@@ -221,7 +230,19 @@ the halfway line. The inflated position std also exceeds `SideDisambiguator`'s
 `maxPosStd`, which freezes background-map building until the filter reconverges,
 so no landmarks are triangulated from the recovering pose. With the bank live, the
 mirror is re-seeded, since a fall is also an opportunity to have been turned around
-without the landmarks being able to notice.
+without the landmarks being able to notice — but note that `useHypothesisBank`
+defaults to `false`, so in the shipped configuration that re-seed never runs.
+
+For the inflation to be worth anything, the association gate has to be able to
+reach the widened belief. `MeasurementFieldLandmarks`' pre-gate is a *geometric*
+cap on the residual angle, so it does not consult the covariance at all: at a
+fixed 0.35 rad it silently bounded what the filter could ever recover from, and a
+getup that turned the robot further than 20° put every predicted bearing outside
+it no matter how much variance recovery handed back. The pre-gate now widens to
+`gateYawScale` (2) yaw std devs, capped at `gateAngleMax` (1 rad). It takes
+σ_yaw > 10° before that exceeds the nominal 0.35 rad, so ordinary operation is
+untouched — `data2` is bit-identical at 0.107 m / 5.41° — and the surprisal score
+still decides what actually associates.
 
 Separately, `TKfromThetaTemplated` now saturates `|cos(pitch)|` at 1e-3. The
 roll-pitch-yaw rate transform is singular at pitch = ±90°, which a forward or
@@ -230,14 +251,91 @@ into the predicted covariance and hands the Newton update a NaN prior, poisoning
 the filter for the rest of the run rather than just for the fall. The clamp never
 binds below 89.94° of pitch, so upright behaviour is bit-for-bit unchanged.
 
-**Neither recording contains a fall** — the torso never leaves 0.43–0.44 m and
-tilt peaks at 34°. `FALL_T=<s> FALL_DURATION=<s>` forces the posture to fallen over
-a window so the suppress → coast → inflate → recover path can be exercised on real
-data. A 3 s injected fall at t = 40 s on `data2` recovers to σ_xy 0.86 m / σ_yaw
-84.5° and reconverges to 0.108 m / 5.40° RMSE against mocap, versus 0.107 m / 5.41°
-undisturbed. Note what that does and does not show: the robot really is upright
-throughout, so it demonstrates the filter survives and reconverges after a blind
-window, not that the detector fires on a genuine topple.
+`data` and `data2` contain no fall — the torso never leaves 0.43–0.44 m and tilt
+peaks at 34°. `data3_webots` **does**: the accelerometer fallback flags
+t = 60.2–68.3 s and t = 80.8–88.6 s, and the video confirms both (the camera is
+looking at open sky through the first and buried in the carpet through the
+second). That is the detector firing on genuine topples on real data, which the
+injected-fall harness below cannot demonstrate.
+
+`FALL_T=<s> FALL_DURATION=<s>` forces the posture to fallen over a window so the
+suppress → coast → inflate → recover path can be exercised where ground truth
+exists. On `data2` at t = 40 s:
+
+| fall length | σ_xy at recovery | σ_yaw at recovery | RMSE vs mocap |
+|---|---|---|---|
+| none | — | — | 0.107 m / 5.41° |
+| 3 s | 0.77 m | 77.6° | 0.108 m / 5.40° |
+| 12 s | 0.92 m | 78.3° | 0.110 m / 5.41° |
+| 30 s | 0.91 m | 79.3° | 0.099 m / 5.63° |
+
+The recovery belief now describes the event rather than the clock: it saturates
+instead of growing without bound (the same three rows were 0.86 m/84.5°,
+1.48 m/133.9° and ≈2.2 m/200°+ before). Note what this harness does and does not
+show: the robot really is upright throughout, so it demonstrates that the filter
+survives and reconverges after a blind window, not that suppression is the right
+response to a real topple.
+
+Two ablation switches exist to measure the design rather than assume it.
+`FALL_GATE=off` replays straight through, applying every update; `FALL_INFLATE=<m>,<deg>`
+changes (or with `0,0` removes) what recovery hands back. Both leave `data2`'s RMSE
+at 0.107–0.111 m, because its fall is synthetic and the filter reconverges within
+2–7 frames either way — the fall response is, on the available ground-truthed data,
+unfalsifiable, and the numbers above are design arithmetic rather than evidence.
+
+### Attitude is a quaternion (and why the gate is now per-model)
+
+Suppressing *every* update while not upright was never really justified by the
+measurement models being invalid — a robot lying still on the carpet gives a
+perfectly good gravity vector, and the landmark and out-of-field models are plain
+geometry. It was justified by the **state parameterisation**. Attitude used to be
+roll-pitch-yaw, whose rate transform is singular at pitch = ±90°, and that is not
+an edge case for a falling robot: it is on the trajectory of every topple. Passing
+through it landed the state on the gimbal alias `(roll+180, 180−pitch, yaw+180)` —
+the same rotation, so `fieldPose()` and the landmark models carried on working,
+but every consumer reading `x(5)` as heading was then 180° out. Both real falls in
+`data3_webots` did exactly this: stored attitude went from `(−0.0°, 8.7°, 178.7°)`
+to `(541.3°, −162.1°, −361.3°)`, whose canonical form is `(1.3°, −17.9°, 178.8°)`.
+The heading never moved; only the chart flipped.
+
+The state is now `[x y z | qw qx qy qz | camBiasRoll camBiasPitch]` (nx = 9), with
+`Rfb = quat2rot(q)` and `q̇ = ½·Ξ(q)·ω_b` — every entry of `Ξ` linear in `q`, so a
+topple is an ordinary point. The cost is a fourth parameter for three degrees of
+freedom, handled three ways: `quat2rot` normalises (so `|q|` is invisible to every
+geometric model and cannot corrupt attitude), `MeasurementQuaternionNorm` supplies
+the only information along that direction (without it the MAP Hessian is singular
+there), and `SystemLocalisation::normaliseQuaternion` projects the mean back onto
+the sphere after every predict and update. Attitude quantities that used to index
+one element — process noise, the association gate's yaw variance, the recovery
+inflation — go through `attitudeTangent`/`attitudeCovariance` instead; yaw
+uncertainty about field z is a **rank-one** block on the quaternion states, not a
+diagonal entry.
+
+With that in place the posture gate is per-model rather than all-or-nothing:
+
+- **Kinematic height** stays suppressed. It is the one model a fall genuinely
+  invalidates — lying down, the chain still reports a near-upright 0.44 m torso.
+- **Gravity** is gated on the *specific force* instead of on posture:
+  `| ‖a‖ − g | < 3 m/s²`. That is the actual validity condition (true of a robot
+  lying still, false in free fall or on impact) and a better test than "upright"
+  while walking too.
+- **Landmarks and out-of-field** keep running. Given the right attitude they are
+  as valid face-down as standing, and a fall is exactly when they are needed: a
+  robot that spins while toppling or getting up changes its heading, and only
+  measurements taken during the event can catch it.
+
+On `data3_webots` the attitude now tracks continuously through both falls
+(pitch −8.8° → −48.0° → back, yaw 179.4° → 179.5°) with σ_yaw rising to 17°
+during the blind-ish window rather than the filter being blind outright, and
+`data2` is unchanged at 0.108 m / 5.40° against mocap.
+
+**Still open.** The tracked pitch peaks at 48° through a fall where the camera is
+looking at open sky, so the true attitude is nearer 90° — the filter follows the
+fall in the right direction but under-shoots it. Tuning that (accelerometer noise,
+the quasi-static threshold, how much the out-of-field corners should pull attitude)
+needs ground truth during a fall, which `data3_webots` does not carry: its
+`RobotPoseGroundTruth` channel is present in every `RawSensors` message but has
+`exists == false` throughout.
 
 ## Side disambiguation (`SideDisambiguator`, `OutOfFieldFeatures`)
 
