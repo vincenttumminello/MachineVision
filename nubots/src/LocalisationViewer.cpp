@@ -162,7 +162,7 @@ void covEllipse(const Eigen::Matrix2d & P, double nSigma, double & ax, double & 
 
 } // namespace
 
-LocalisationViewer::LocalisationViewer(const FieldMap & map, const FisheyeLens & lens,
+LocalisationViewer::LocalisationViewer(const FieldMap & map, const CameraLens & lens,
                                        const std::filesystem::path & videoPath)
     : map_(map)
     , lens_(lens)
@@ -194,7 +194,7 @@ cv::Mat LocalisationViewer::renderCameraPanel(const ViewerFrame & f, const cv::M
     auto safe = [&](const cv::Point2d & p) { return std::abs(p.x) < 5*panelW && std::abs(p.y) < 5*panelH; };
     auto toPanel = [&](const Eigen::Vector2d & px) { return cv::Point2d(px.x()*scale, px.y()*scale); };
     auto projectPanel = [&](const Eigen::Vector3d & ray, cv::Point2d & out) -> bool {
-        if (!FisheyeLens::inFrontOfCamera(ray)) return false;
+        if (!CameraLens::inFrontOfCamera(ray)) return false;
         out = toPanel(lens_.project(ray));
         return safe(out);
     };

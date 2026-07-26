@@ -10,7 +10,7 @@
 #include "SideDisambiguator.h"
 #include "rotation.hpp"
 
-SideDisambiguator::SideDisambiguator(const FisheyeLens & lens, const FieldDimensions & dims, const Options & opts)
+SideDisambiguator::SideDisambiguator(const CameraLens & lens, const FieldDimensions & dims, const Options & opts)
     : options(opts)
     , lens_(lens)
     , detector_(lens, dims)
@@ -18,7 +18,7 @@ SideDisambiguator::SideDisambiguator(const FisheyeLens & lens, const FieldDimens
     , halfCarpetWidth_(dims.fieldWidth/2 + dims.borderStripMinWidth + opts.fieldMargin)
 {}
 
-SideDisambiguator::SideDisambiguator(const FisheyeLens & lens, const FieldDimensions & dims)
+SideDisambiguator::SideDisambiguator(const CameraLens & lens, const FieldDimensions & dims)
     : SideDisambiguator(lens, dims, Options{})
 {}
 
@@ -167,7 +167,7 @@ std::vector<SideDisambiguator::Association> SideDisambiguator::associate(
 
         const Eigen::Vector3d uFf = rel/range;
         const Eigen::Vector3d uCc = Rcf*uFf;
-        if (!FisheyeLens::inFrontOfCamera(uCc)) continue;
+        if (!CameraLens::inFrontOfCamera(uCc)) continue;
         const Eigen::Vector2d px = lens_.project(uCc);
         if (!lens_.inImage(px)) continue;
 

@@ -6,7 +6,7 @@
 #include <opencv2/features2d.hpp>
 #include "OutOfFieldFeatures.h"
 
-OutOfFieldDetector::OutOfFieldDetector(const FisheyeLens & lens, const FieldDimensions & dims, const Options & opts)
+OutOfFieldDetector::OutOfFieldDetector(const CameraLens & lens, const FieldDimensions & dims, const Options & opts)
     : options(opts)
     , lens_(lens)
     , halfCarpetLength_(dims.fieldLength/2 + dims.borderStripMinWidth + opts.fieldMargin)
@@ -14,7 +14,7 @@ OutOfFieldDetector::OutOfFieldDetector(const FisheyeLens & lens, const FieldDime
     , orb_(cv::ORB::create())
 {}
 
-OutOfFieldDetector::OutOfFieldDetector(const FisheyeLens & lens, const FieldDimensions & dims)
+OutOfFieldDetector::OutOfFieldDetector(const CameraLens & lens, const FieldDimensions & dims)
     : OutOfFieldDetector(lens, dims, Options{})
 {}
 

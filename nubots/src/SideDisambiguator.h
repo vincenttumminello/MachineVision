@@ -44,7 +44,7 @@
 #include <Eigen/Core>
 #include <opencv2/core.hpp>
 #include "FieldMap.h"
-#include "FisheyeLens.h"
+#include "CameraLens.h"
 #include "OutOfFieldFeatures.h"
 #include "Pose.hpp"
 
@@ -263,10 +263,10 @@ public:
      * @param dims Field dimensions (carpet extent)
      * @param options Tuning options
      */
-    SideDisambiguator(const FisheyeLens & lens, const FieldDimensions & dims, const Options & options);
+    SideDisambiguator(const CameraLens & lens, const FieldDimensions & dims, const Options & options);
 
     /// @brief Construct with default options.
-    SideDisambiguator(const FisheyeLens & lens, const FieldDimensions & dims);
+    SideDisambiguator(const CameraLens & lens, const FieldDimensions & dims);
 
     /**
      * @brief Process one video frame.
@@ -399,7 +399,7 @@ private:
                           const Pose<double> & Tfc, double t,
                           std::vector<char> & featureGrewTrack);
 
-    const FisheyeLens & lens_;
+    const CameraLens & lens_;
     OutOfFieldDetector detector_;
     double halfCarpetLength_;   ///< Field half-length + border strip + margin [m]
     double halfCarpetWidth_;    ///< Field half-width + border strip + margin [m]

@@ -3,7 +3,7 @@
 #include <Eigen/Core>
 #include <opencv2/core.hpp>
 #include "../../src/FieldMap.h"
-#include "../../src/FisheyeLens.h"
+#include "../../src/CameraLens.h"
 #include "../../src/LocalisationViewer.h"
 #include "../../src/Pose.hpp"
 #include "../../src/SideDisambiguator.h"
@@ -95,7 +95,7 @@ static ViewerFrame makeFrame(const FieldMap & map)
 SCENARIO("LocalisationViewer renders a composite without a display")
 {
     FieldMap map;
-    FisheyeLens lens;
+    CameraLens lens;
     LocalisationViewer viewer(map, lens, "unused.mp4");
 
     GIVEN("A recorded frame and a blank camera image")

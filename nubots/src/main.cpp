@@ -5,6 +5,7 @@
 #include <print>
 #include <opencv2/core.hpp>
 #include "calibrate.h"
+#include "CameraLens.h"
 #include "fieldLocalisation.h"
 
 int main(int argc, char* argv [])
@@ -16,6 +17,7 @@ int main(int argc, char* argv [])
         "{calibrate c     |          | perform camera calibration for given configuration XML}"
         "{robocup r       |          | run RoboCup field localisation on recorded data directory}"
         "{interactive i   | 0        | interactivity (0:none, 1:last frame, 2:all frames)}"
+        "{lens l          |          | camera calibration to replay with (default: from the frame size)}"
         "{export e        |          | export results}";
 
     cv::CommandLineParser parser(argc, argv, keys);
@@ -24,10 +26,18 @@ int main(int argc, char* argv [])
     if (parser.has("help"))
     {
         parser.printMessage();
+        // The keys string above is a compile-time literal, so the calibrations
+        // the build actually knows about are listed here instead.
+        std::println("Available --lens calibrations: {}", lensNames());
+        for (const CameraLens & lens : lensCatalogue())
+        {
+            std::println("  {}", lens.describe());
+        }
         return EXIT_SUCCESS;
     }
 
     int interactive = parser.get<int>("interactive");
+    std::string lensName = parser.get<std::string>("lens");
     bool hasExport = parser.has("export");
     bool hasCalibrate = parser.has("calibrate");
     std::filesystem::path inputPath = parser.get<std::string>("@input");
@@ -36,6 +46,12 @@ int main(int argc, char* argv [])
     {
         parser.printMessage();
         parser.printErrors();
+        return EXIT_FAILURE;
+    }
+
+    if (!lensName.empty() && lensByName(lensName) == nullptr)
+    {
+        std::println("Unknown --lens '{}'. Available calibrations: {}", lensName, lensNames());
         return EXIT_FAILURE;
     }
 
@@ -64,7 +80,7 @@ int main(int argc, char* argv [])
         assert(0 <= interactive && interactive <= 2);
         std::println("Running RoboCup field localisation");
         std::println("Data directory: {}", inputPath.string());
-        runFieldLocalisation(inputPath, interactive, outputDirectory);
+        runFieldLocalisation(inputPath, interactive, outputDirectory, lensName);
     }
 
     return EXIT_SUCCESS;

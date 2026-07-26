@@ -7,6 +7,7 @@
 #include <fstream>
 #include <limits>
 #include <print>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <Eigen/Core>
@@ -19,7 +20,7 @@
 #include "FallDetector.h"
 #include "FieldMap.h"
 #include "fieldLocalisation.h"
-#include "FisheyeLens.h"
+#include "CameraLens.h"
 #include "GaussianInfo.hpp"
 #include "LocalisationViewer.h"
 #include "MeasurementFieldLandmarks.h"
@@ -36,6 +37,39 @@
 static double wrapAngle(double a)
 {
     return std::atan2(std::sin(a), std::cos(a));
+}
+
+// Choose the camera calibration for a recording.
+//
+// An explicit name always wins (and is fatal if unknown -- silently replaying
+// through the wrong lens produces a plausible-looking but wrong trajectory,
+// which is far worse than stopping). Otherwise the recorded frame size decides:
+// the fisheye cameras record 1280x1024 and the simulated one 640x480, so the
+// video identifies which family of calibration applies without any per-dataset
+// configuration to keep in sync.
+static CameraLens selectLens(const std::filesystem::path & videoPath, const std::string & lensName)
+{
+    if (!lensName.empty())
+    {
+        if (const CameraLens * named = lensByName(lensName)) return *named;
+        throw std::runtime_error(std::format("Unknown --lens '{}'; expected one of: {}", lensName, lensNames()));
+    }
+
+    cv::VideoCapture cap(videoPath.string());
+    if (cap.isOpened())
+    {
+        const double w = cap.get(cv::CAP_PROP_FRAME_WIDTH);
+        const double h = cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+        if (const CameraLens * detected = lensForResolution(w, h)) return *detected;
+        std::println("WARNING: no calibration for {}x{} frames; falling back to {}. Pass --lens=<{}>.",
+                     static_cast<int>(w), static_cast<int>(h), CameraLens{}.name, lensNames());
+    }
+    else
+    {
+        std::println("WARNING: could not open {} to detect the camera; falling back to {}. Pass --lens=<{}>.",
+                     videoPath.string(), CameraLens{}.name, lensNames());
+    }
+    return CameraLens{};
 }
 
 // Nearest sample index in a time-ordered vector, by member time extractor
@@ -446,7 +480,8 @@ static bool solveInitialPose(const SensorLog & log, const FieldMap & map,
     return false;
 }
 
-void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive, const std::filesystem::path & outputDirectory)
+void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive, const std::filesystem::path & outputDirectory,
+                          const std::string & lensName)
 {
     const std::filesystem::path jsonPath = dataDir / "recorded_data.json";
     const std::filesystem::path timecodePath = dataDir / "Left_timecode.txt";
@@ -502,11 +537,13 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     // Field landmark map
     FieldMap map;
 
-    // NUbots equidistant lens (1280x1024); defaults to sarah (the robot that
-    // made the data2 ground-truth recording). Shared by the out-of-field
-    // feature pipeline and the visualiser.
-    // TODO: Adjust if replacing recording
-    FisheyeLens lens;
+    // Camera calibration, shared by the out-of-field feature pipeline and the
+    // visualiser. The real robots and webots do not merely differ in their
+    // numbers, they use different projection models (see CameraLens.h), so this
+    // has to follow the recording rather than be fixed. --lens names one
+    // explicitly; otherwise the recorded frame size picks it.
+    const CameraLens lens = selectLens(dataDir / "Left.mp4", lensName);
+    std::println("Camera calibration: {}", lens.describe());
 
     // Out-of-field side disambiguation. On-field landmarks are invariant under
     // the field's 180 deg symmetry, but the background scenery is not: corner

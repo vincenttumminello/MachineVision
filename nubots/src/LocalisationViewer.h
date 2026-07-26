@@ -31,7 +31,7 @@
 #include <Eigen/Core>
 #include <opencv2/core.hpp>
 #include "FieldMap.h"
-#include "FisheyeLens.h"
+#include "CameraLens.h"
 #include "Pose.hpp"
 
 /// @brief What the landmark measurement did with a YOLO detection.
@@ -155,7 +155,7 @@ public:
      * @param lens      Fisheye lens model for ray<->pixel projection
      * @param videoPath Path to the source video (seeked per frame)
      */
-    LocalisationViewer(const FieldMap & map, const FisheyeLens & lens, const std::filesystem::path & videoPath);
+    LocalisationViewer(const FieldMap & map, const CameraLens & lens, const std::filesystem::path & videoPath);
 
     /**
      * @brief Replay the recorded frames interactively.
@@ -188,7 +188,7 @@ private:
     cv::Mat render3DPanel(const std::vector<ViewerFrame> & frames, std::size_t idx, int panelH) const;
 
     const FieldMap & map_;
-    FisheyeLens lens_;
+    CameraLens lens_;
     std::filesystem::path videoPath_;
 
     // Right-pane mode and 3D orbit state (adjusted from the interactive loop /
