@@ -939,6 +939,11 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     // two real falls in data3_webots, the NUbots baseline moves 0.0 m and 0.6 m.)
     // So the disturbed PSDs cover the dynamic part and then stand down, and the
     // event-sized part of the uncertainty is the one-shot inflation below.
+    //
+    // This windows the PSDs ONLY. Discarding the walk-engine linear velocity runs
+    // for the whole time the robot is down: that is a claim about whether the signal
+    // means anything, not about how long the event lasts, and it does not come back
+    // after two seconds. See SystemLocalisation::setPosture.
     const double disturbedWindow = 2.0;                 ///< [s]
 
     // Belief handed back on recovery from a fall (see the recovery block below).
@@ -1014,27 +1019,6 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
             posture = Posture::FALLEN;      // Simulated fall (see FALL_T above)
         }
         const bool upright = posture == Posture::UPRIGHT;
-        // Only the first disturbedWindow seconds of a fall get the disturbed
-        // PSDs; past that the robot is lying still and diffusing the belief
-        // further would be inventing motion. See disturbedWindow above.
-        const double fallElapsed = (!upright && std::isfinite(fallStartT)) ? t - fallStartT : 0.0;
-        system.setDisturbed(!upright && fallElapsed < disturbedWindow);
-
-        // Prediction used to happen only inside Event::process, so a frame that
-        // produced no usable measurement advanced neither the state nor the clock.
-        // A face-down fall produces exactly that (no detections at all), and the
-        // filter would emerge from it holding its pre-fall mean at its pre-fall
-        // covariance -- confidently wrong rather than honestly uncertain.
-        const bool poseFinite = v.Hcw.rotationMatrix.allFinite() && v.Hcw.translationVector.allFinite();
-        if (v.detections.empty() || !poseFinite)
-        {
-            system.predictAll(t);
-            nSkipped++;
-            captureSkipped(v, t, !poseFinite ? FrameSkip::BAD_POSE : FrameSkip::NO_DETECTIONS);
-            prevPosture = posture;
-            continue;
-        }
-
         if (!upright)
         {
             if (prevPosture == Posture::UPRIGHT)
@@ -1045,6 +1029,13 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
             }
             nFallenFrames++;
         }
+        // Posture goes in before anything can `continue` past it, and the fall start
+        // is already set above, so the elapsed time is measured from THIS episode
+        // rather than the previous one. The velocity discard runs for the whole time
+        // the robot is down; only the elevated PSDs are windowed. See setPosture.
+        system.params.disturbedWindow = disturbedWindow;
+        const double fallElapsed = (!upright && std::isfinite(fallStartT)) ? t - fallStartT : 0.0;
+        system.setPosture(upright, fallElapsed);
 
         // Recovery from a fall. The mean is kept: a fall and getup move the torso
         // well under a metre, so the pre-fall position is still the best estimate
@@ -1090,6 +1081,26 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
             nFalls++;
         }
         prevPosture = posture;
+
+        // Prediction used to happen only inside Event::process, so a frame that
+        // produced no usable measurement advanced neither the state nor the clock.
+        // A face-down fall produces exactly that (no detections at all), and the
+        // filter would emerge from it holding its pre-fall mean at its pre-fall
+        // covariance -- confidently wrong rather than honestly uncertain.
+        //
+        // This sits AFTER the recovery block on purpose. A getup ends in motion
+        // blur, so the frame the robot first reads upright again is very often one
+        // with no detections; skipping out above it meant recovery never ran on
+        // those falls, and the filter came out holding pre-fall confidence in a mean
+        // that had moved -- an association gate too narrow to ever re-acquire.
+        const bool poseFinite = v.Hcw.rotationMatrix.allFinite() && v.Hcw.translationVector.allFinite();
+        if (v.detections.empty() || !poseFinite)
+        {
+            system.predictAll(t);
+            nSkipped++;
+            captureSkipped(v, t, !poseFinite ? FrameSkip::BAD_POSE : FrameSkip::NO_DETECTIONS);
+            continue;
+        }
 
         // Camera pose w.r.t. torso from the kinematic chain (odometry cancels):
         // Tbc = Htw * Hcw^{-1}
