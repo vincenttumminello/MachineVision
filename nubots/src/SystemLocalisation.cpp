@@ -495,7 +495,9 @@ void SystemLocalisation::mergeComponents()
                 Eigen::VectorXd mi = components_[i].mean();
                 Eigen::VectorXd mj = components_[j].mean();
                 double dPos = (mi.head<2>() - mj.head<2>()).norm();
-                double dYaw = std::abs(std::remainder(mi(5) - mj(5), 2.0*M_PI));
+                // Through heading(), not an element: x(5) was yaw under the old
+                // roll-pitch-yaw state but is the quaternion's y component now.
+                double dYaw = std::abs(std::remainder(heading(mi) - heading(mj), 2.0*M_PI));
                 if (dPos < hyp.mergePosition && dYaw < hyp.mergeYaw)
                 {
                     std::size_t keep = logWeights_[i] >= logWeights_[j] ? i : j;

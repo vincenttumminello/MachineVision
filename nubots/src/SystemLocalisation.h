@@ -206,16 +206,28 @@ public:
      */
     static Eigen::Matrix3d attitudeCovariance(const Eigen::VectorXd & x, const Eigen::MatrixXd & P)
     {
+        const Eigen::Matrix<double, 3, 4> G = attitudeJacobian(x);
+        return G*P.block<4, 4>(iQuat, iQuat)*G.transpose();
+    }
+
+    /**
+     * @brief Left inverse of attitudeTangentField: field rotation vector per unit dq.
+     *
+     * Row 2 is what maps a quaternion perturbation to a heading change, so it is
+     * also what any cross-covariance between position and yaw has to go through.
+     *
+     * @param x State vector (nx)
+     * @return 3x4 matrix dtheta_f/dq at the state's attitude
+     */
+    static Eigen::Matrix<double, 3, 4> attitudeJacobian(const Eigen::VectorXd & x)
+    {
         // dq = 0.5*Xi*dtheta and Xi has orthonormal columns, so the left inverse
         // is dtheta = 2*Xi^T*dq. Note that is 2*Xi^T, NOT 2*attitudeTangent^T --
         // attitudeTangent already carries the 0.5, and folding it in twice
         // under-reports every attitude std dev by a factor of two.
         Eigen::Vector4d q = x.segment<4>(iQuat);
         q.normalize();
-        const Eigen::Matrix3d Rfb = quat2rot(q);
-        const Eigen::Matrix<double, 3, 4> Jinv = 2.0*quatXi(q).transpose();
-        const Eigen::Matrix<double, 3, 4> G = Rfb*Jinv;
-        return G*P.block<4, 4>(iQuat, iQuat)*G.transpose();
+        return quat2rot(q)*(2.0*quatXi(q).transpose());
     }
 
     /// @brief Variance of the field-frame yaw implied by the attitude covariance.
