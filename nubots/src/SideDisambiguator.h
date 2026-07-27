@@ -158,6 +158,40 @@ public:
         std::size_t flipBlindOwnMax = 1;///< ... with at most this many own-side associations
         std::size_t flipBlindMinAssoc = 2; ///< ... and at least this many mirror-side associations
         int flipBlindConsecutive = 40;  ///< ... over this many (leaky) scored frames
+        // The escape's premise is that a pose staring at unmapped territory while
+        // the mirror matches must BE the mirror. That is only sound if the robot
+        // has not simply turned to face somewhere it never mapped. Against a
+        // background that is itself 180 deg symmetric -- the webots stadium, both
+        // ends alike -- turning around in place and being mirrored produce the
+        // SAME observation, exactly, and the escape resolves the tie towards
+        // "mirrored" by construction. It did so on data4_webots at t = 65.8 s
+        // after the robot physically turned 164.6 deg, flipping a pose that was
+        // correct to 2 cm and costing the rest of the run.
+        //
+        // The odometry knows about that turn, and a flip asserts a 180 deg jump
+        // that contradicts it. So the escape is refused while the net heading
+        // change since the map last confirmed the own side is itself near 180 deg:
+        // in that case the mirror-looking view is what a turn predicts, and "no
+        // decision" is the honest answer. A kidnapped robot is carried, not
+        // turned under its own gyroscope, so a genuine displacement still gets
+        // through. The fair path above is untouched either way.
+        // The escape therefore requires that the own hypothesis PREDICTS something
+        // and fails to match it. A hypothesis that predicts nothing cannot be
+        // contradicted by anything: visOwn == 0 says the map does not cover where
+        // own is looking, which is what happens every time the robot turns to
+        // face new scenery, and says nothing whatever about which side it is on.
+        // Scoring it as mirror evidence is the reasoning error; on data4_webots
+        // it flipped a pose correct to 2 cm after a 164.6 deg turn.
+        //
+        // A net-180 deg turn gate is kept as a second line: after a turn the map
+        // may still predict a handful of landmarks near the edge of view, and a
+        // turn of about half a revolution is precisely the motion that makes a
+        // symmetric background look mirrored.
+        std::size_t flipBlindMinVisibleOwn = 1;       ///< Own must predict at least this many landmarks in view
+        double blindTurnTolerance = 60.0*M_PI/180.0;  ///< Refuse the escape within this of a 180 deg net turn [rad]
+        std::size_t blindMatchMinAssoc = 10;          ///< Own counts as confirmed at this many associations ...
+        double blindMatchFraction = 0.1;              ///< ... and at least this fraction of its predicted-visible
+
         double flipCooldown   = 5.0;    ///< Freeze map building for this long after a flip [s], so the
                                         ///< estimator can re-converge before new observations are trusted
     };
@@ -252,6 +286,8 @@ public:
         double llr = 0.0;               ///< Accumulated own-vs-mirror log-likelihood ratio [nats]
         bool mapFrozen = false;         ///< Map building was frozen this frame
         bool flipRequested = false;     ///< The evidence says the filter is on the wrong side
+        double turnSinceMatch = 0.0;    ///< Net heading change since the own side was last confirmed [rad]
+        bool blindTurnBlocked = false;  ///< The blind escape was refused because that turn explains the view
         std::vector<OutOfFieldFeature> features;    ///< The detected corners (for display)
         std::vector<int> featureStatus; ///< Per detected corner: a FeatureStatus
         std::vector<LandmarkView> landmarkViews;    ///< Map landmarks projected into the image at the current pose
@@ -279,9 +315,10 @@ public:
      * @param yawRateAbs Magnitude of the current yaw rate [rad/s] (turn gating)
      * @return Association/score/decision summary for this frame
      */
+    /// @param heading Estimated torso yaw in {f} [rad] (for the blind-escape turn gate)
     FrameResult process(double t, const cv::Mat & gray,
                         const Pose<double> & Tfc, const Pose<double> & TfcMirror,
-                        double posStd, double yawStd, double yawRateAbs);
+                        double posStd, double yawStd, double yawRateAbs, double heading);
 
     /**
      * @brief Notify that the filter state was mirrored (flip applied or kidnap injected).
@@ -411,6 +448,8 @@ private:
     int flipStreak_ = 0;        ///< Consecutive scored frames at/below the flip threshold
     int blindStreak_ = 0;       ///< Leaky streak for the blind-own flip escape
     bool doubt_ = false;        ///< Latched after deep doubt; cleared only by positive evidence
+    double headingAtOwnMatch_ = 0.0;    ///< Heading when the map last confirmed the own side [rad]
+    bool haveOwnMatch_ = false;         ///< Whether headingAtOwnMatch_ has been set
     double mapFreezeUntil_ = -std::numeric_limits<double>::infinity();  ///< Post-flip map-building freeze [s]
     Stats stats_;               ///< Map-building funnel diagnostics
 };

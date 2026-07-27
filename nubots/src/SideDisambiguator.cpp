@@ -435,7 +435,8 @@ void SideDisambiguator::updateCandidates(const std::vector<OutOfFieldFeature> & 
 
 SideDisambiguator::FrameResult SideDisambiguator::process(double t, const cv::Mat & gray,
                                                           const Pose<double> & Tfc, const Pose<double> & TfcMirror,
-                                                          double posStd, double yawStd, double yawRateAbs)
+                                                          double posStd, double yawStd, double yawRateAbs,
+                                                          double heading)
 {
     FrameResult res;
 
@@ -575,14 +576,48 @@ SideDisambiguator::FrameResult SideDisambiguator::process(double t, const cv::Ma
             flipStreak_--;      // Still in doubt, frame unqualifying: leak, don't reset
         }
 
+        // Remember where the robot was pointing the last time the map actually
+        // confirmed the own side. That is the reference the turn gate below
+        // measures against, so it deliberately needs a healthy match rather than
+        // any match at all: during a turn the association count decays through
+        // small non-zero values, and taking the last of those as the reference
+        // would measure the turn from halfway through it.
+        const bool ownConfirmed = visOwn > 0
+            && res.nAssociated >= std::max(options.blindMatchMinAssoc,
+                   static_cast<std::size_t>(std::ceil(options.blindMatchFraction*static_cast<double>(visOwn))));
+        if (ownConfirmed)
+        {
+            headingAtOwnMatch_ = heading;
+            haveOwnMatch_ = true;
+        }
+
+        // Net heading change since then. A flip asserts a 180 deg discontinuity;
+        // if the robot has already turned by about that much under its own
+        // gyroscope, the mirror-looking view is what the turn predicts and the
+        // out-of-field evidence cannot separate the two (see Options).
+        const double turn = haveOwnMatch_ ? std::remainder(heading - headingAtOwnMatch_, 2.0*M_PI) : 0.0;
+        res.turnSinceMatch = turn;
+        const bool turnExplainsMirror =
+            haveOwnMatch_ && std::abs(std::abs(turn) - M_PI) < options.blindTurnTolerance;
+
         // Blind-own escape (see Options): near-clamp LLR, own essentially
         // blind, mirror matching real structure. Same leak/reset semantics.
         if (llr_ <= -options.flipBlindLlr
+            && visOwn >= options.flipBlindMinVisibleOwn
             && res.nAssociated <= options.flipBlindOwnMax
             && res.nAssociatedMirror >= std::max(options.flipBlindMinAssoc,
-                   static_cast<std::size_t>(std::ceil(options.flipDominance*static_cast<double>(res.nAssociated)))))
+                   static_cast<std::size_t>(std::ceil(options.flipDominance*static_cast<double>(res.nAssociated))))
+            && !turnExplainsMirror)
         {
             blindStreak_++;
+        }
+        else if (llr_ <= -options.flipBlindLlr
+                 && (turnExplainsMirror || visOwn < options.flipBlindMinVisibleOwn))
+        {
+            // Refused because the comparison is not a comparison: hold the streak
+            // rather than leaking it, so a robot that turns back to mapped
+            // territory neither flips nor re-earns the evidence from scratch.
+            res.blindTurnBlocked = true;
         }
         else if (llr_ > -options.flipThreshold)
         {

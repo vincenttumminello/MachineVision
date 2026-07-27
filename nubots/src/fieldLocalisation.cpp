@@ -1306,7 +1306,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
 
             side = sideDis.process(t, gray, TfcEst, TfcMirror,
                                    std::max(r.sigma(0), r.sigma(1)), r.attStd(2),
-                                   std::abs(log.sensors[k].gyroscope.z()));
+                                   std::abs(log.sensors[k].gyroscope.z()), r.rpy(2));
             sideRan = true;
             double oofMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ticOof).count();
             sumOofMs += oofMs;
@@ -1321,10 +1321,12 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
             if (nOofFrames % 100 == 0 || side.llr < 0.0)
             {
                 std::println("  side t={:6.1f}s: {} landmarks, {} candidates, assoc {}/{} visible {}/{} own/mirror, "
-                             "{} corners rejected, llr {:+.1f}{}",
+                             "{} corners rejected, llr {:+.1f}{} turn {:+.0f}deg{}",
                              t, side.nLandmarks, side.nCandidates, side.nAssociated, side.nAssociatedMirror,
                              side.nVisibleOwn, side.nVisibleMirror, side.nOutlier, side.llr,
-                             side.mapFrozen ? " [frozen]" : "");
+                             side.mapFrozen ? " [frozen]" : "",
+                             side.turnSinceMatch*180.0/M_PI,
+                             side.blindTurnBlocked ? " [turn-blocked]" : "");
             }
 
             if (useHypothesisBank)
