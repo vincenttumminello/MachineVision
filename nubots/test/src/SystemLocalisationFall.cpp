@@ -4,6 +4,7 @@
 #include <Eigen/Core>
 #include "../../src/GaussianInfo.hpp"
 #include "../../src/kinematics_helper.h"
+#include "../../src/MeasurementBodyRates.h"
 #include "../../src/SystemLocalisation.h"
 #include "stateHelpers.hpp"
 
@@ -21,15 +22,14 @@ Eigen::VectorXd nominalState()
     return makeState(1.5, -0.8, 0.44, 0.0, 0.0, 0.3);
 }
 
-/// A constant body twist over a long span, so predict() always finds an input.
-std::vector<BodyTwistSample> constantTwist(const Eigen::Vector3d & v, const Eigen::Vector3d & w)
+/// A state moving at a given body-fixed twist. The twist is part of the state now,
+/// not an input buffer -- that is the whole point of the velocity states.
+Eigen::VectorXd movingState(const Eigen::Vector3d & v, const Eigen::Vector3d & w = Eigen::Vector3d::Zero())
 {
-    std::vector<BodyTwistSample> buf;
-    for (double t = -1.0; t < 100.0; t += 0.01)
-    {
-        buf.push_back({t, v, w});
-    }
-    return buf;
+    Eigen::VectorXd x = nominalState();
+    x.segment<3>(SystemLocalisation::iVel) = v;
+    x.segment<3>(SystemLocalisation::iOmega) = w;
+    return x;
 }
 
 } // namespace
@@ -83,68 +83,62 @@ SCENARIO("The Euler-rate transform stays finite at gimbal lock")
     }
 }
 
-SCENARIO("Disturbed mode changes what prediction believes")
+SCENARIO("The velocity states carry the estimate, and measurements steer them")
 {
-    GIVEN("A filter walking forward at 0.3 m/s with a tight belief")
+    GIVEN("A belief moving at 0.3 m/s along the body x axis")
     {
-        std::vector<BodyTwistSample> twists = constantTwist(Eigen::Vector3d(0.3, 0.0, 0.0),
-                                                            Eigen::Vector3d::Zero());
-        const Eigen::VectorXd x0 = nominalState();
+        const Eigen::VectorXd x0 = movingState(Eigen::Vector3d(0.3, 0.0, 0.0));
 
-        WHEN("two seconds are predicted while upright")
+        WHEN("two seconds are predicted")
         {
-            SystemLocalisation sys(tightBelief(x0), twists);
+            SystemLocalisation sys(tightBelief(x0));
             sys.resetTo(tightBelief(x0), 0.0);
             sys.predictAll(2.0);
             const Eigen::VectorXd mu = sys.density.mean();
-            const Eigen::MatrixXd P = sys.density.cov();
 
-            THEN("the odometry twist carries the estimate forward")
+            THEN("the velocity state carries the position forward")
             {
-                // 0.3 m/s for 2 s along the body x axis, rotated into {f} by yaw 0.3.
-                CHECK(mu(0) == doctest::Approx(x0(0) + 0.6*std::cos(0.3)).epsilon(0.02));
-                CHECK(mu(1) == doctest::Approx(x0(1) + 0.6*std::sin(0.3)).epsilon(0.02));
-            }
-            THEN("uncertainty grows at the walking process noise")
-            {
-                CHECK(std::sqrt(P(0, 0)) < 0.2);
+                // 0.3 m/s for 2 s along body x, rotated into {f} by yaw 0.3. Nothing
+                // was fed in: the motion comes from the state, which is what makes
+                // the odometry a measurement rather than an assertion.
+                CHECK(mu(0) == doctest::Approx(x0(0) + 0.6*std::cos(0.3)).epsilon(0.05));
+                CHECK(mu(1) == doctest::Approx(x0(1) + 0.6*std::sin(0.3)).epsilon(0.05));
             }
         }
 
-        WHEN("the same two seconds are predicted while not upright")
+        WHEN("a zero-velocity update is applied")
         {
-            SystemLocalisation sys(tightBelief(x0), twists);
+            SystemLocalisation sys(tightBelief(x0));
             sys.resetTo(tightBelief(x0), 0.0);
-            sys.setPosture(false, 0.0);
-            sys.predictAll(2.0);
-            const Eigen::VectorXd mu = sys.density.mean();
-            const Eigen::MatrixXd P = sys.density.cov();
+            MeasurementBodyVelocity zupt = MeasurementBodyVelocity::stationary(0.0, 0.01);
+            sys.process(zupt);
 
-            THEN("the walk-engine velocity is discarded rather than integrated")
+            THEN("the velocity state is pulled to a stop")
             {
-                // On the ground the odometry describes a gait that is not happening.
-                CHECK(mu(0) == doctest::Approx(x0(0)).epsilon(1e-6));
-                CHECK(mu(1) == doctest::Approx(x0(1)).epsilon(1e-6));
+                CHECK(SystemLocalisation::bodyVelocity(sys.density.mean()).norm() < 0.05);
             }
-            THEN("the belief decays to honest uncertainty instead of coasting")
+            THEN("and the estimate then stays put under prediction")
             {
-                CHECK(std::sqrt(P(0, 0)) > 0.4);
-                CHECK(std::sqrt(SystemLocalisation::yawVariance(mu, P)) > 0.4);
+                // This is the property that keeps a fallen robot on the spot. Without
+                // it the pre-fall gait integrates for the whole fall.
+                const Eigen::VectorXd before = sys.density.mean();
+                sys.predictAll(4.0);
+                CHECK((sys.density.mean().head<2>() - before.head<2>()).norm() < 0.05);
             }
         }
+    }
 
-        WHEN("the robot is disturbed but rotating")
+    GIVEN("A belief with a spin about the body z axis")
+    {
+        const Eigen::VectorXd x0 = movingState(Eigen::Vector3d::Zero(), Eigen::Vector3d(0.0, 0.0, 0.5));
+
+        WHEN("one second is predicted")
         {
-            // The gyroscope measures the topple for real, so unlike the odometry
-            // velocity it is still integrated.
-            std::vector<BodyTwistSample> spin = constantTwist(Eigen::Vector3d(0.3, 0.0, 0.0),
-                                                              Eigen::Vector3d(0.0, 0.0, 0.5));
-            SystemLocalisation sys(tightBelief(x0), spin);
+            SystemLocalisation sys(tightBelief(x0));
             sys.resetTo(tightBelief(x0), 0.0);
-            sys.setPosture(false, 0.0);
             sys.predictAll(1.0);
 
-            THEN("yaw follows the gyroscope")
+            THEN("the heading follows the angular velocity state")
             {
                 CHECK(stateYaw(sys.density.mean()) == doctest::Approx(stateYaw(x0) + 0.5).epsilon(0.05));
             }
@@ -152,46 +146,36 @@ SCENARIO("Disturbed mode changes what prediction believes")
     }
 }
 
-SCENARIO("A long fall does not integrate the getup as if it were walking")
+SCENARIO("The gyroscope measures the rate, and its bias is observable")
 {
-    GIVEN("A robot down for eight seconds while the odometry still reports motion")
+    GIVEN("A stationary belief and a gyroscope reading a pure bias")
     {
-        // The walk engine and the getup script both keep moving the torso in the
-        // odometry world frame, so vBb stays large the whole time the robot is on
-        // the ground. It is not locomotion and must never be integrated.
-        std::vector<BodyTwistSample> twists = constantTwist(Eigen::Vector3d(0.6, 0.0, 0.0),
-                                                            Eigen::Vector3d::Zero());
+        // A robot held still while the gyro reads 0.02 rad/s about z. The reading is
+        // omegaBb + bGyro, so on its own it cannot say which of the two it is --
+        // that is exactly why the bias needs something else to pin the rate.
         const Eigen::VectorXd x0 = nominalState();
+        SystemLocalisation sys(tightBelief(x0, 0.02));
+        sys.resetTo(tightBelief(x0, 0.02), 0.0);
 
-        WHEN("the posture is driven from a single fall start, past the disturbed window")
+        WHEN("the gyroscope reading is applied with the rate held at zero")
         {
-            SystemLocalisation sys(tightBelief(x0), twists);
-            sys.resetTo(tightBelief(x0), 0.0);
-            for (double t = 0.05; t <= 8.0; t += 0.05)
+            // Standing in for what the landmark measurements do: they pin the
+            // attitude, and hence the rate, leaving the difference to the bias.
+            for (int i = 1; i <= 200; ++i)
             {
-                sys.setPosture(false, t);   // Not upright throughout; elapsed grows past the window
-                sys.predictAll(t);
+                const double t = 0.01*i;
+                MeasurementGyroscope mg(t, Eigen::Vector3d(0.0, 0.0, 0.02), 0.02);
+                sys.process(mg);
+                MeasurementBodyVelocity zupt = MeasurementBodyVelocity::stationary(t, 0.01);
+                sys.process(zupt);
             }
 
-            THEN("the estimate has not moved")
+            THEN("the reading is explained by the rate and bias together")
             {
-                // The regression: tying the velocity discard to the same window as the
-                // PSDs meant that from 2 s in, the getup's odometry was integrated at
-                // full weight -- 0.6 m/s for six seconds is 3.6 m, straight off the
-                // field, and the belief stayed too tight for the association gate to
-                // pull it back.
-                CHECK((sys.density.mean().head<2>() - x0.head<2>()).norm()
-                      == doctest::Approx(0.0).epsilon(1e-6));
-            }
-            THEN("the disturbed PSDs have stood down, so the belief is bounded")
-            {
-                CHECK_FALSE(sys.diffusing());
-                CHECK(sys.disturbed());
-                // Still uncertain from the first two seconds, but not 0.40 m/sqrt(s)
-                // for the full eight.
-                const double posStd = std::sqrt(sys.density.cov()(0, 0));
-                CHECK(posStd > 0.4);
-                CHECK(posStd < 1.0);
+                const Eigen::VectorXd mu = sys.density.mean();
+                const double predicted = SystemLocalisation::bodyRate(mu).z()
+                                       + SystemLocalisation::gyroBias(mu).z();
+                CHECK(predicted == doctest::Approx(0.02).epsilon(0.2));
             }
         }
     }
@@ -202,7 +186,7 @@ SCENARIO("Recovery from a fall widens the belief without moving it")
     GIVEN("A confident single-hypothesis belief")
     {
         const Eigen::VectorXd x0 = nominalState();
-        SystemLocalisation sys(tightBelief(x0), {});
+        SystemLocalisation sys(tightBelief(x0));
         sys.resetTo(tightBelief(x0), 0.0);
         const Eigen::MatrixXd P0 = sys.density.cov();
 
@@ -266,7 +250,7 @@ SCENARIO("Recovery from a fall widens the belief without moving it")
     GIVEN("An active hypothesis bank")
     {
         const Eigen::VectorXd x0 = nominalState();
-        SystemLocalisation sys(tightBelief(x0), {});
+        SystemLocalisation sys(tightBelief(x0));
         sys.resetTo(tightBelief(x0), 0.0);
         sys.initialiseHypotheses();
         REQUIRE(sys.numHypotheses() == 2);
@@ -299,9 +283,7 @@ SCENARIO("predictAll advances every hypothesis over the same interval")
     GIVEN("A bank of two hypotheses and a stationary robot")
     {
         const Eigen::VectorXd x0 = nominalState();
-        std::vector<BodyTwistSample> twists = constantTwist(Eigen::Vector3d::Zero(),
-                                                            Eigen::Vector3d::Zero());
-        SystemLocalisation sys(tightBelief(x0), twists);
+        SystemLocalisation sys(tightBelief(x0));
         sys.resetTo(tightBelief(x0), 0.0);
         sys.initialiseHypotheses();
         const Eigen::VectorXd mirror0 = sys.hypotheses()[1].mean();

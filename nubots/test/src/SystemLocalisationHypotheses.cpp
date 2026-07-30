@@ -63,8 +63,12 @@ SCENARIO("SystemLocalisation mirror transform")
 
         WHEN("a density is mirrored")
         {
-            Eigen::MatrixXd S = Eigen::MatrixXd::Zero(SystemLocalisation::nx, SystemLocalisation::nx);
-            S.diagonal() << 0.3, 0.2, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05;
+            // Sized from nx rather than written out: a short comma-initialiser is
+            // silently truncated with NDEBUG on, which produces a malformed density
+            // rather than a failed test.
+            Eigen::MatrixXd S = Eigen::MatrixXd::Identity(SystemLocalisation::nx, SystemLocalisation::nx)*0.05;
+            S(0, 0) = 0.3;
+            S(1, 1) = 0.2;
             // Cross-covariance between x-position and the quaternion z component,
             // which is the yaw-carrying one at this near-identity attitude.
             S(0, SystemLocalisation::iQuat + 3) = 0.1;
@@ -136,7 +140,7 @@ SCENARIO("Hypothesis bank + out-of-field evidence resolve the field symmetry")
         Eigen::MatrixXd S0 = Eigen::MatrixXd::Identity(SystemLocalisation::nx, SystemLocalisation::nx)*0.2;
         S0.diagonal().tail<2>().setConstant(0.02);
         auto p0 = GaussianInfo<double>::fromSqrtMoment(etaTrue, S0);
-        SystemLocalisation system(p0, twists);
+        SystemLocalisation system(p0);
 
         MeasurementFieldLandmarks::Options options;
         options.sigmaAngular = 0.02;
@@ -221,7 +225,7 @@ SCENARIO("Hypothesis bank + out-of-field evidence resolve the field symmetry")
             THEN("system.process matches a direct single-Gaussian update")
             {
                 // Reference: direct Event::process on an identical system
-                SystemLocalisation ref(p0, twists);
+                SystemLocalisation ref(p0);
                 MeasurementFieldLandmarks measRef(0.0, sample, Tbc, map, ref, options);
                 measRef.process(ref);
 

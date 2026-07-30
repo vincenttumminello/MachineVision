@@ -77,7 +77,7 @@ SCENARIO("MeasurementFieldLandmarks association and MAP update")
         WHEN("the prior is centred at the true pose")
         {
             auto p0 = GaussianInfo<double>::fromSqrtMoment(etaTrue, Eigen::MatrixXd(Eigen::MatrixXd::Identity(SystemLocalisation::nx, SystemLocalisation::nx)*0.1));
-            SystemLocalisation system(p0, twists);
+            SystemLocalisation system(p0);
             MeasurementFieldLandmarks meas(0.0, sample, Tbc, map, system);
 
             THEN("all detections associate")
@@ -121,7 +121,7 @@ SCENARIO("MeasurementFieldLandmarks association and MAP update")
             Eigen::MatrixXd Sp = Eigen::MatrixXd::Identity(SystemLocalisation::nx, SystemLocalisation::nx)*0.2;
             Sp.diagonal().tail<2>().setConstant(0.02);  // Tight camera-bias prior: rays here are exact
             auto p0 = GaussianInfo<double>::fromSqrtMoment(etaPrior, Sp);
-            SystemLocalisation system(p0, twists);
+            SystemLocalisation system(p0);
             // The synthetic rays are exact, so use a correspondingly tight noise model
             MeasurementFieldLandmarks::Options options;
             options.sigmaAngular = 0.005;
@@ -194,7 +194,7 @@ SCENARIO("The association pre-gate widens with yaw uncertainty")
             const Eigen::Vector4d j = SystemLocalisation::attitudeTangentField(etaPrior).col(2);
             P.block<4, 4>(SystemLocalisation::iQuat, SystemLocalisation::iQuat) += yawStd*yawStd*j*j.transpose();
             auto p0 = GaussianInfo<double>::fromMoment(etaPrior, P);
-            SystemLocalisation system(p0, twists);
+            SystemLocalisation system(p0);
             MeasurementFieldLandmarks meas(0.0, sample, Tbc, map, system);
             return meas.numAssociated();
         };

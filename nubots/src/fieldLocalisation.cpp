@@ -23,6 +23,7 @@
 #include "CameraLens.h"
 #include "GaussianInfo.hpp"
 #include "LocalisationViewer.h"
+#include "MeasurementBodyRates.h"
 #include "MeasurementFieldLandmarks.h"
 #include "MeasurementFieldLines.h"
 #include "MeasurementGravity.h"
@@ -448,7 +449,7 @@ private:
 // standing in the opponent half back across the halfway line. Recovery from a
 // fall is handled instead by widening the belief around the pose already held.
 static bool solveInitialPose(const SensorLog & log, const FieldMap & map,
-                             const std::vector<BodyTwistSample> & twists, double t0, double ownHalfXSign,
+                             double t0, double ownHalfXSign,
                              const FallDetector & falls,
                              Eigen::VectorXd & eta0Out, double & tInitOut, std::size_t & visIdxOut)
 {
@@ -473,6 +474,8 @@ static bool solveInitialPose(const SensorLog & log, const FieldMap & map,
         if (std::abs(log.sensors[k].t - v.t) > 0.1) continue;
 
         // Camera pose w.r.t. torso, and gravity-aligned torso attitude/height.
+        // Camera pose w.r.t. torso from the kinematic chain (odometry cancels):
+        // Tbc = Htw * Hcw^{-1}
         Pose<double> Tbc = log.sensors[k].Htw*v.Hcw.inverse();
         Pose<double> Twt = log.sensors[k].Htw.inverse();
         const Eigen::Vector3d rpyTorso = rot2rpy(Twt.rotationMatrix);
@@ -484,7 +487,7 @@ static bool solveInitialPose(const SensorLog & log, const FieldMap & map,
         // Probe system used only to drive association/likelihood scoring.
         const Eigen::MatrixXd Stmp = Eigen::MatrixXd::Identity(SystemLocalisation::nx, SystemLocalisation::nx)*0.01;
         SystemLocalisation probe(GaussianInfo<double>::fromSqrtMoment(
-                                     Eigen::VectorXd::Zero(SystemLocalisation::nx), Stmp), twists);
+                                     Eigen::VectorXd::Zero(SystemLocalisation::nx), Stmp));
 
         double bestScore = -std::numeric_limits<double>::infinity();
         std::size_t bestAssoc = 0;
@@ -645,6 +648,12 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     constexpr bool useOutOfField = true;
     SideDisambiguator sideDis(lens, map.dims);
 
+    // Read a tuning override from the environment, for ablation sweeps.
+    auto envDouble = [](const char * name, double fallback) {
+        if (const char * e = std::getenv(name)) { return std::atof(e); }
+        return fallback;
+    };
+
     // Simulated kidnap for verification: KIDNAP_T=<seconds> mirrors the filter
     // state once at that time WITHOUT telling the disambiguator, emulating an
     // unnoticed symmetry flip that it must detect and correct.
@@ -719,7 +728,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     double tInit = 0.0;
     std::size_t initVisIdx = 0;
     auto ticInit = std::chrono::steady_clock::now();
-    bool solved = solveInitialPose(log, map, twists, t0, ownHalfXSign, falls, eta0, tInit, initVisIdx);
+    bool solved = solveInitialPose(log, map, t0, ownHalfXSign, falls, eta0, tInit, initVisIdx);
     double initMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ticInit).count();
     std::println("Initial global grid solve took {:.1f} ms", initMs);
     if (!solved)
@@ -739,11 +748,30 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     // roll/pitch and 0.5 rad yaw priors become 0.025 and 0.25. Yaw dominates, and
     // it is not separable across components, so all four carry the loose figure --
     // the tight roll/pitch prior is re-established within a frame by gravity.
+    // The velocity states start at zero (the robot is stationary at kick-off) with
+    // a prior wide enough to cover a walk if it is not; the gyroscope bias starts
+    // at zero with a prior covering a few deg/s, which is the scale of the drift
+    // it exists to absorb.
     Eigen::MatrixXd S0 = Eigen::MatrixXd::Zero(SystemLocalisation::nx, SystemLocalisation::nx);
-    S0.diagonal() << 1.0, 1.0, 0.05, 0.25, 0.25, 0.25, 0.25, 0.02, 0.02;
+    // GYRO_BIAS=off also pins the initial bias covariance, since the random-walk
+    // PSD alone only limits drift -- the state would still be estimated down from
+    // its prior. Both have to be shut off to hold it at zero.
+    const bool freezeBias = [] {
+        const char * e = std::getenv("GYRO_BIAS");
+        return e != nullptr && std::string(e) == "off";
+    }();
+    // Small enough to be frozen against the ~2 deg/s under test, large enough
+    // that the information form (which inverts this) stays conditioned.
+    const double s0GyroBias = freezeBias ? 1e-4 : 0.05;
+    S0.diagonal() << 1.0, 1.0, 0.05,             // position
+                     0.25, 0.25, 0.25, 0.25,     // quaternion
+                     0.30, 0.30, 0.10,           // body linear velocity [m/s]
+                     0.50, 0.50, 0.50,           // body angular velocity [rad/s]
+                     s0GyroBias, s0GyroBias, s0GyroBias,   // gyroscope bias [rad/s] (~3 deg/s)
+                     0.02, 0.02;                 // camera mount bias
     auto p0 = GaussianInfo<double>::fromSqrtMoment(eta0, S0);
 
-    SystemLocalisation system(p0, twists);
+    SystemLocalisation system(p0);
     system.resetTo(p0, tInit);
 
     // Multi-hypothesis field-symmetry handling. When enabled the belief is a
@@ -902,7 +930,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                                   const Pose<double> & TbcArg) -> std::pair<double, std::size_t>
     {
         const Eigen::MatrixXd Stmp = Eigen::MatrixXd::Identity(SystemLocalisation::nx, SystemLocalisation::nx)*0.01;
-        SystemLocalisation probe(GaussianInfo<double>::fromSqrtMoment(eta, Stmp), twists);
+        SystemLocalisation probe(GaussianInfo<double>::fromSqrtMoment(eta, Stmp));
         probe.resetTo(GaussianInfo<double>::fromSqrtMoment(eta, Stmp), 0.0);
         MeasurementFieldLandmarks m(0.0, vv, TbcArg, map, probe);
         const auto & U = m.measuredRays();
@@ -980,6 +1008,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     double fallStartT = std::numeric_limits<double>::quiet_NaN();
     std::size_t nFalls = 0, nFallenFrames = 0;
     std::size_t nGravityRejected = 0;   ///< Frames where the specific force was not quasi-static
+    std::size_t nZupt = 0;              ///< Zero-velocity updates applied while fallen
 
     for (const VisionSample & v : log.vision)
     {
@@ -1034,6 +1063,17 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         // rather than the previous one. The velocity discard runs for the whole time
         // the robot is down; only the elevated PSDs are windowed. See setPosture.
         system.params.disturbedWindow = disturbedWindow;
+        // GYRO_BIAS=off freezes the bias state at its initial value, to tell a bias
+        // that is measuring a sensor from one that is absorbing modelling error: if
+        // freezing it IMPROVES the fit, the state was soaking up someone else's
+        // inconsistency rather than estimating a gyroscope.
+        {
+            static const bool freezeGyroBias = [] {
+                const char * e = std::getenv("GYRO_BIAS");
+                return e != nullptr && std::string(e) == "off";
+            }();
+            if (freezeGyroBias) system.params.sigmaGyroBias = 1e-5;
+        }
         const double fallElapsed = (!upright && std::isfinite(fallStartT)) ? t - fallStartT : 0.0;
         system.setPosture(upright, fallElapsed);
 
@@ -1082,6 +1122,84 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         }
         prevPosture = posture;
 
+        // Nearest odometry/IMU sample to this frame. Needed by the body-rate
+        // measurements below as well as by the camera extrinsic further down.
+        std::size_t k = nearestIndex(log.sensors, v.t, [](const SensorsSample & s) { return s.t; });
+
+        constexpr bool useGravity = true;
+        constexpr bool useKinematicHeight = true;
+        constexpr bool useGyroscope = true;
+        // Gyroscope noise is small and the sensor is trustworthy; the walk-engine
+        // odometry velocity is neither, so it is admitted with a sigma comparable
+        // to the walk speed itself -- present as evidence, never as truth. The
+        // zero-velocity update is the most confident of the three because a robot
+        // lying on the carpet really is not going anywhere.
+        // SIGMA_GYRO / SIGMA_ODOM_VEL / SIGMA_VEL override these, for sweeping the
+        // rate tuning against ground truth rather than guessing at it.
+        static const double sigmaGyro    = envDouble("SIGMA_GYRO", 0.02);       ///< [rad/s]
+        static const double sigmaOdomVel = envDouble("SIGMA_ODOM_VEL", 0.15);   ///< [m/s]
+        constexpr double sigmaZupt        = 0.02;   ///< [m/s] lying still
+        constexpr double sigmaZuptDynamic = 0.30;   ///< [m/s] toppling or getting up
+
+        // Body-rate measurements go in before the no-detections gate below, because
+        // neither of them has anything to do with whether YOLO found something. A
+        // fallen robot's camera is in the carpet, so those are exactly the frames
+        // that return no detections -- and exactly the frames where an unmeasured
+        // velocity state would integrate the pre-fall gait straight off the field.
+        // (Measurement::process predicts to t itself, so the predictAll below is a
+        // zero-dt no-op once these have run.)
+        // Body-rate measurements. These used to be a known input to the process
+        // model; they are measurements of the velocity states now, so their noise
+        // is modelled rather than asserted and the gyroscope's bias is estimated
+        // rather than subtracted by heuristic up front.
+        //
+        // The gyroscope runs unconditionally, including through a fall: it is the
+        // one sensor that measures a topple honestly, and its reading is valid
+        // whatever the robot's posture.
+        if (useGyroscope && log.sensors[k].gyroscope.allFinite())
+        {
+            MeasurementGyroscope mg(t, log.sensors[k].gyroscope, sigmaGyro);
+            system.process(mg);
+        }
+        // The walk-engine odometry velocity, on the other hand, describes the gait
+        // the engine believes it is executing. Upright that is loose but real
+        // information; on the ground it is fiction, and during a getup it is a
+        // scripted flail that is not locomotion. So it is suppressed while not
+        // upright -- the same per-model gating as kinematic height, which is a
+        // tidier way to say it than the special case that used to live inside the
+        // process model's input().
+        if (upright)
+        {
+            std::size_t vi = nearestIndex(twists, t, [](const BodyTwistSample & s) { return s.t; });
+            if (!twists.empty() && std::abs(twists[vi].t - t) < 0.1 && twists[vi].vBb.allFinite())
+            {
+                MeasurementBodyVelocity mv(t, twists[vi].vBb, sigmaOdomVel);
+                system.process(mv);
+            }
+        }
+        else
+        {
+            // Zero-velocity update. A robot lying on the carpet is not translating,
+            // and saying so is the most confident measurement available. It is also
+            // the only thing stopping the pre-fall walking velocity from integrating
+            // across the whole fall, which with velocity in the state is exactly how
+            // the estimate walks off the field: measured across data4_webots,
+            // leaving the toppling and getting-up frames unmeasured let the error
+            // compound 0.12 -> 0.62 -> 1.76 m over two falls and never recover.
+            //
+            // It is applied through the whole non-upright window, not just while
+            // FALLEN, because "no measurement" is not the neutral choice it looks
+            // like -- it says the robot may still be travelling at whatever it was
+            // doing when it fell, which is the one thing it is certainly not doing.
+            // The sigma is what changes with posture: lying still the robot really
+            // is stationary, whereas toppling and being levered upright genuinely
+            // move the torso, just not anywhere.
+            const double sigma = posture == Posture::FALLEN ? sigmaZupt : sigmaZuptDynamic;
+            MeasurementBodyVelocity zupt = MeasurementBodyVelocity::stationary(t, sigma);
+            system.process(zupt);
+            nZupt++;
+        }
+
         // Prediction used to happen only inside Event::process, so a frame that
         // produced no usable measurement advanced neither the state nor the clock.
         // A face-down fall produces exactly that (no detections at all), and the
@@ -1102,9 +1220,6 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
             continue;
         }
 
-        // Camera pose w.r.t. torso from the kinematic chain (odometry cancels):
-        // Tbc = Htw * Hcw^{-1}
-        std::size_t k = nearestIndex(log.sensors, v.t, [](const SensorsSample & s) { return s.t; });
         Pose<double> Tbc = log.sensors[k].Htw*v.Hcw.inverse();
 
         // Simulated kidnap: mirror the filter state once, without notifying the
@@ -1119,8 +1234,6 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         }
 
         // Measurement toggles (for ablation experiments)
-        constexpr bool useGravity = true;
-        constexpr bool useKinematicHeight = true;
         constexpr bool useFieldLines = false;
 
         Eigen::Matrix<double, 3, Eigen::Dynamic> frameLineRays;  // captured for the viewer
@@ -1549,6 +1662,27 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     std::println("");
     std::println("Processed {} vision updates ({} skipped, of which {} while not upright)",
                  nUpdates, nSkipped, nFallenFrames);
+    {
+        // Does the bias state actually converge? That is the whole reason it exists,
+        // and RMSE alone will not say -- a bias stuck at zero looks fine until the
+        // heading drifts. The old heuristic measured ~0.75 deg/s of z-bias on data2
+        // by averaging quiet samples, so that is the number to recognise here.
+        const Eigen::VectorXd muEnd = system.density.mean();
+        const Eigen::MatrixXd Pend = system.density.cov();
+        const Eigen::Vector3d b = SystemLocalisation::gyroBias(muEnd);
+        const Eigen::Vector3d bs = Pend.block<3, 3>(SystemLocalisation::iGyroBias,
+                                                    SystemLocalisation::iGyroBias)
+                                       .diagonal().cwiseMax(0.0).cwiseSqrt();
+        std::println("Estimated gyro bias: [{:+.3f}, {:+.3f}, {:+.3f}] deg/s "
+                     "(sigma [{:.3f}, {:.3f}, {:.3f}] deg/s)",
+                     b.x()*180.0/M_PI, b.y()*180.0/M_PI, b.z()*180.0/M_PI,
+                     bs.x()*180.0/M_PI, bs.y()*180.0/M_PI, bs.z()*180.0/M_PI);
+        std::println("Final body velocity: [{:+.3f}, {:+.3f}, {:+.3f}] m/s",
+                     SystemLocalisation::bodyVelocity(muEnd).x(),
+                     SystemLocalisation::bodyVelocity(muEnd).y(),
+                     SystemLocalisation::bodyVelocity(muEnd).z());
+    }
+    std::println("Zero-velocity updates applied while not upright: {}", nZupt);
     std::println("Falls recovered from: {} ({} frames not upright, {} gravity updates rejected as non-quasi-static)",
                  nFalls, nFallenFrames, nGravityRejected);
     {
