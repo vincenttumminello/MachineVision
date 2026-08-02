@@ -117,7 +117,7 @@ GaussianInfo<double> SystemLocalisation::processNoiseDensity(double dt) const
                  Eigen::Vector3d::Constant(params.sigmaVelDisturbed),
                  Eigen::Vector3d::Constant(params.sigmaOmegaDisturbed),
                  Eigen::Vector3d::Constant(params.sigmaGyroBias),
-                 params.sigmaCamBias, params.sigmaCamBias;
+                 Eigen::Vector3d::Constant(params.sigmaCamBias);
     }
     else
     {
@@ -126,7 +126,7 @@ GaussianInfo<double> SystemLocalisation::processNoiseDensity(double dt) const
                  Eigen::Vector3d::Constant(params.sigmaVel),
                  Eigen::Vector3d::Constant(params.sigmaOmega),
                  Eigen::Vector3d::Constant(params.sigmaGyroBias),
-                 params.sigmaCamBias, params.sigmaCamBias;
+                 Eigen::Vector3d::Constant(params.sigmaCamBias);
     }
 
     Eigen::MatrixXd XiQ = Eigen::MatrixXd::Zero(nx, nx);

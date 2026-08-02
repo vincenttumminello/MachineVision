@@ -125,7 +125,7 @@ public:
     //   7..9    vBb          body-fixed linear velocity [m/s]
     //   10..12  omegaBb      body-fixed angular velocity [rad/s]
     //   13..15  bGyro        gyroscope bias in {b} [rad/s]
-    //   16..17  camera mount bias (roll, pitch) [rad]
+    //   16..18  camera mount bias (roll, pitch, yaw) [rad]
     //
     // Attitude was roll-pitch-yaw until the fall work. The Euler-rate transform
     // is singular at pitch = +-90 deg, which is not an edge case for a falling
@@ -143,7 +143,7 @@ public:
     // the MAP Hessian non-singular. See attitudeTangent() for the mapping used
     // wherever a 3-DOF attitude quantity (process noise, yaw variance, a yaw
     // inflation) has to be expressed in these four components.
-    static constexpr Eigen::Index nx = 18;  ///< State dimension
+    static constexpr Eigen::Index nx = 19;  ///< State dimension
 
     static constexpr Eigen::Index iPos      = 0;    ///< First position index
     static constexpr Eigen::Index iQuat     = 3;    ///< First quaternion index
@@ -185,7 +185,7 @@ public:
     static Eigen::Matrix3<Scalar> cameraBiasRotation(const Eigen::VectorX<Scalar> & x)
     {
         Eigen::Vector3<Scalar> rpy;
-        rpy << x(iBias), x(iBias + 1), Scalar(0);
+        rpy << x(iBias), x(iBias + 1), x(iBias + 2);
         return rpy2rot(rpy);
     }
 

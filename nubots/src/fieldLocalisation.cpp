@@ -748,6 +748,19 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     // roll/pitch and 0.5 rad yaw priors become 0.025 and 0.25. Yaw dominates, and
     // it is not separable across components, so all four carry the loose figure --
     // the tight roll/pitch prior is re-established within a frame by gravity.
+    // CAM_YAW=off pins the camera yaw bias at zero, to answer whether the state is
+    // estimating a real mount offset or just absorbing heading error. A camera-frame
+    // yaw bias is only separable from a torso yaw error when the camera z axis is off
+    // vertical, i.e. while the head is pitched, so this is a question about how much
+    // the head actually moves rather than one settled by argument. Its random walk PSD
+    // is shared with roll and pitch and is already tiny (3e-4, ~0.2 deg over a 100 s
+    // run), so the initial covariance does the pinning on its own.
+    const bool freezeCamYaw = [] {
+        const char * e = std::getenv("CAM_YAW");
+        return e != nullptr && std::string(e) == "off";
+    }();
+    const double s0CamYaw = freezeCamYaw ? 1e-4 : 0.02;
+
     // The velocity states start at zero (the robot is stationary at kick-off) with
     // a prior wide enough to cover a walk if it is not; the gyroscope bias starts
     // at zero with a prior covering a few deg/s, which is the scale of the drift
@@ -768,7 +781,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                      0.30, 0.30, 0.10,           // body linear velocity [m/s]
                      0.50, 0.50, 0.50,           // body angular velocity [rad/s]
                      s0GyroBias, s0GyroBias, s0GyroBias,   // gyroscope bias [rad/s] (~3 deg/s)
-                     0.02, 0.02;                 // camera mount bias
+                     0.02, 0.02, s0CamYaw;       // camera mount bias (roll, pitch, yaw)
     auto p0 = GaussianInfo<double>::fromSqrtMoment(eta0, S0);
 
     SystemLocalisation system(p0);
@@ -1677,6 +1690,13 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                      "(sigma [{:.3f}, {:.3f}, {:.3f}] deg/s)",
                      b.x()*180.0/M_PI, b.y()*180.0/M_PI, b.z()*180.0/M_PI,
                      bs.x()*180.0/M_PI, bs.y()*180.0/M_PI, bs.z()*180.0/M_PI);
+        const Eigen::Vector3d cb  = muEnd.segment<3>(SystemLocalisation::iBias);
+        const Eigen::Vector3d cbs = Pend.block<3, 3>(SystemLocalisation::iBias, SystemLocalisation::iBias)
+                                        .diagonal().cwiseMax(0.0).cwiseSqrt();
+        std::println("Estimated camera mount bias: roll {:+.3f} pitch {:+.3f} yaw {:+.3f} deg "
+                     "(sigma [{:.3f}, {:.3f}, {:.3f}] deg)",
+                     cb.x()*180.0/M_PI, cb.y()*180.0/M_PI, cb.z()*180.0/M_PI,
+                     cbs.x()*180.0/M_PI, cbs.y()*180.0/M_PI, cbs.z()*180.0/M_PI);
         std::println("Final body velocity: [{:+.3f}, {:+.3f}, {:+.3f}] m/s",
                      SystemLocalisation::bodyVelocity(muEnd).x(),
                      SystemLocalisation::bodyVelocity(muEnd).y(),
