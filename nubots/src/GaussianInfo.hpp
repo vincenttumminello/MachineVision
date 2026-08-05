@@ -682,22 +682,31 @@ public:
         const Scalar kappa = 1e6 * sigma_max_ub;
         
 
-        // Create the augmented matrix for QR decomposition
-        Eigen::MatrixX<Scalar> augmented(n + m - r, n + m + 1);  // Adjusted dimensions for rank-r components
+        // Create the augmented matrix for QR decomposition. Its columns are
+        //   [ z (n-r) | y (m) | rhs (1) ]
+        // and the right-hand side must sit immediately after the y block. Writing it
+        // at n+r instead only coincides with nz+m when m == 2r: for m < 2r it leaves
+        // r zero columns wedged between y and the rhs (harmless but wasteful), and
+        // for m > 2r the rhs index falls inside the y block and corrupts it. The read
+        // -back uses the same index, so no full-rank test can catch the difference.
+        const Eigen::Index nz   = static_cast<Eigen::Index>(n) - r;  // Null-space coordinates
+        const Eigen::Index iRhs = nz + static_cast<Eigen::Index>(m); // Right-hand-side column
+        // Rows are n + m - r, which is exactly nz + m == iRhs
+        Eigen::MatrixX<Scalar> augmented(iRhs, iRhs + 1);
         augmented.setZero();
 
         // Precompute
         Eigen::MatrixX<Scalar> XiV1SigmaInvU1T = Xi_ * V1 * Sigma11_inv * U1.transpose();
 
-        // Fill top part: [ΞV1Σ⁻¹U1ᵀ, ν + ΞV1Σ⁻¹U1ᵀb]
-        augmented.topLeftCorner(n, n - r) = Xi_ * V2;
-        augmented.block(0, n - r, n, m) = XiV1SigmaInvU1T;
-        augmented.block(0, n + r, n, 1) = nu_ + XiV1SigmaInvU1T * b;
+        // Fill top part: [ΞV2, ΞV1Σ⁻¹U1ᵀ, ν + ΞV1Σ⁻¹U1ᵀb]
+        augmented.topLeftCorner(n, nz) = Xi_ * V2;
+        augmented.block(0, nz, n, m) = XiV1SigmaInvU1T;
+        augmented.block(0, iRhs, n, 1) = nu_ + XiV1SigmaInvU1T * b;
 
-        // Fill bottom part: [κU2ᵀ, κU2ᵀb]
+        // Fill bottom part: [0, κU2ᵀ, κU2ᵀb]
         if (m > r) {
-            augmented.block(n, n-r, m-r, m) = kappa * U2.transpose(); 
-            augmented.block(n, n + r, m - r, 1) = kappa * U2.transpose() * b;
+            augmented.block(n, nz, m - r, m) = kappa * U2.transpose();
+            augmented.block(n, iRhs, m - r, 1) = kappa * U2.transpose() * b;
         }
 
         // Perform Q-less QR decomposition
@@ -706,8 +715,8 @@ public:
         // Extract the marginal for y (tail partition)
         // p(y) = N^(-1/2)(y; ν₂, R₃) from equation (42)
         GaussianInfo out(m);
-        out.Xi_ = augmented.block(n-r, n-r, m, m).template triangularView<Eigen::Upper>();
-        out.nu_ = augmented.block(n-r, n + r, m, 1);
+        out.Xi_ = augmented.block(nz, nz, m, m).template triangularView<Eigen::Upper>();
+        out.nu_ = augmented.block(nz, iRhs, m, 1);
 
         return out;
     }
