@@ -517,7 +517,6 @@ int SR1Trust(Func costFunc, Eigen::VectorXd & x, int verbosity = 0)
 template <typename Func>
 int BFGSTrustSqrt(Func costFunc, Eigen::VectorXd & x, Eigen::VectorXd & g, Eigen::MatrixXd & Xi, int verbosity = 3)
 {
-    verbosity = 1;
     typedef double Scalar;
     typedef Eigen::VectorXd Vector;
     typedef Eigen::MatrixXd Matrix;

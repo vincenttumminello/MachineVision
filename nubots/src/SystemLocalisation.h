@@ -540,6 +540,22 @@ public:
     void process(Event & event);
 
     /**
+     * @brief Set the verbosity applied to every event routed through process().
+     *
+     * 0 silences per-event logging, 1 prints one line per event, and 2 and above
+     * additionally surface the optimiser's own output and the per-hypothesis
+     * detail that is otherwise suppressed to keep the log readable.
+     *
+     * @param verbosity New verbosity level
+     */
+    void setVerbosity(int verbosity) { verbosity_ = verbosity; }
+
+    /**
+     * @brief Verbosity applied to every event routed through process().
+     */
+    int verbosity() const { return verbosity_; }
+
+    /**
      * @brief Number of live hypotheses (1 in single-hypothesis mode).
      */
     std::size_t numHypotheses() const { return components_.empty() ? 1 : components_.size(); }
@@ -577,6 +593,7 @@ protected:
     std::vector<GaussianInfo<double>> components_;   ///< Mixture components (empty => single-hypothesis)
     std::vector<double> logWeights_;                 ///< Unnormalised log weights per component
     Eigen::VectorXd lastRepMean_;                    ///< Outgoing representative mean (setRepresentative hysteresis)
+    int verbosity_ = 1;                              ///< Verbosity applied to events routed through process()
 
     void normaliseWeights();        ///< Renormalise logWeights_ (subtract log-sum-exp)
     void mergeComponents();         ///< Merge components within the merge gate (keep-best)

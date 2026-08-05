@@ -21,8 +21,11 @@
  *                 selects it from the recorded frame size
  * @param fieldName Field the recording was made on (see FieldMap.h); empty
  *                  follows the camera calibration
+ * @param verbosity Log verbosity forwarded to every event (0 silences per-event
+ *                  logging, 1 prints one line per event, 2 and above add
+ *                  optimiser and per-hypothesis detail)
  */
 void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive, const std::filesystem::path & outputDirectory,
-                          const std::string & lensName = {}, const std::string & fieldName = {});
+                          const std::string & lensName = {}, const std::string & fieldName = {}, int verbosity = 1);
 
 #endif

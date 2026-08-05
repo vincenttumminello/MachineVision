@@ -18,6 +18,7 @@ int main(int argc, char* argv [])
         "{calibrate c     |          | perform camera calibration for given configuration XML}"
         "{robocup r       |          | run RoboCup field localisation on recorded data directory}"
         "{interactive i   | 0        | interactivity (0:none, 1:last frame, 2:all frames)}"
+        "{verbosity v     | 1        | log verbosity (0:silent, 1:one line per event, 2:+optimiser summary and per-hypothesis detail, 3:+per-iteration optimiser trace)}"
         "{lens l          |          | camera calibration to replay with (default: from the frame size)}"
         "{field f         |          | field the recording was made on (default: follows the camera)}"
         "{export e        |          | export results}";
@@ -40,6 +41,7 @@ int main(int argc, char* argv [])
     }
 
     int interactive = parser.get<int>("interactive");
+    int verbosity = parser.get<int>("verbosity");
     std::string lensName = parser.get<std::string>("lens");
     std::string fieldName = parser.get<std::string>("field");
     bool hasExport = parser.has("export");
@@ -62,6 +64,12 @@ int main(int argc, char* argv [])
     if (!fieldName.empty() && !fieldByName(fieldName))
     {
         std::println("Unknown --field '{}'. Available fields: {}", fieldName, fieldNames());
+        return EXIT_FAILURE;
+    }
+
+    if (verbosity < 0 || verbosity > 3)
+    {
+        std::println("--verbosity must be in 0..3, got {}", verbosity);
         return EXIT_FAILURE;
     }
 
@@ -90,7 +98,7 @@ int main(int argc, char* argv [])
         assert(0 <= interactive && interactive <= 2);
         std::println("Running RoboCup field localisation");
         std::println("Data directory: {}", inputPath.string());
-        runFieldLocalisation(inputPath, interactive, outputDirectory, lensName, fieldName);
+        runFieldLocalisation(inputPath, interactive, outputDirectory, lensName, fieldName, verbosity);
     }
 
     return EXIT_SUCCESS;

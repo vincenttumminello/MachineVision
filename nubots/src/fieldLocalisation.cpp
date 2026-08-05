@@ -551,7 +551,7 @@ static bool solveInitialPose(const SensorLog & log, const FieldMap & map,
 }
 
 void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive, const std::filesystem::path & outputDirectory,
-                          const std::string & lensName, const std::string & fieldName)
+                          const std::string & lensName, const std::string & fieldName, int verbosity)
 {
     const std::filesystem::path jsonPath = dataDir / "recorded_data.json";
     const std::filesystem::path timecodePath = dataDir / "Left_timecode.txt";
@@ -773,6 +773,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
 
     SystemLocalisation system(p0);
     system.resetTo(p0, tInit);
+    system.setVerbosity(verbosity);
 
     // Multi-hypothesis field-symmetry handling. When enabled the belief is a
     // Gaussian mixture seeded with the initial pose and its 180 deg mirror.

@@ -595,6 +595,8 @@ void SystemLocalisation::setRepresentative()
 
 void SystemLocalisation::process(Event & event)
 {
+    event.setVerbosity(verbosity_);
+
     // Single-hypothesis mode: ordinary single-Gaussian event processing.
     if (components_.empty())
     {
@@ -608,7 +610,9 @@ void SystemLocalisation::process(Event & event)
     // so every component predicts over the identical interval.
     const double t0 = time_;
     Measurement * meas = dynamic_cast<Measurement *>(&event);
-    event.setVerbosity(0);                       // Suppress per-component log spam
+    // Suppress per-component log spam: one line per hypothesis per measurement is
+    // unreadable at the default level. Asking for verbosity 2 or above opts back in.
+    event.setVerbosity(verbosity_ >= 2 ? verbosity_ : 0);
 
     for (std::size_t i = 0; i < components_.size(); ++i)
     {
