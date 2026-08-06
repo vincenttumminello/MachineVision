@@ -151,6 +151,8 @@ public:
         assocKeys_ = associate(system.density.mean(), system.density.cov());
     }
 
+    virtual std::string getProcessString() const override { return "Field landmarks:"; }
+
 protected:
     /**
      * @brief MAP update with iterated re-association (cf. iterative landmark matching).

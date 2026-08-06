@@ -61,6 +61,8 @@ public:
         return Scalar(-1.5*std::log(2.0*M_PI*sigma2)) - Scalar(0.5)*e.squaredNorm()/Scalar(sigma2);
     }
 
+    virtual std::string getProcessString() const override { return "Gyroscope:"; }
+
 protected:
     Eigen::Vector3d y_;   ///< Measured angular velocity [rad/s]
     double sigma_;        ///< Noise standard deviation [rad/s]
@@ -97,7 +99,14 @@ public:
     /// @brief A zero-velocity update: the robot is known not to be translating.
     static MeasurementBodyVelocity stationary(double time, double sigma = 0.02)
     {
-        return MeasurementBodyVelocity(time, Eigen::Vector3d::Zero(), sigma);
+        MeasurementBodyVelocity m(time, Eigen::Vector3d::Zero(), sigma);
+        m.stationary_ = true;   // Distinguishes the ZUPT from odometry in the verbose log
+        return m;
+    }
+
+    virtual std::string getProcessString() const override
+    {
+        return stationary_ ? "Zero velocity:" : "Odometry velocity:";
     }
 
     virtual Eigen::VectorXd simulate(const Eigen::VectorXd & x, const SystemEstimator & system) const override;
@@ -117,6 +126,7 @@ public:
 protected:
     Eigen::Vector3d y_;   ///< Measured body velocity [m/s]
     double sigma_;        ///< Noise standard deviation [m/s]
+    bool stationary_ = false;  ///< Built by stationary(): a ZUPT rather than odometry
 };
 
 #endif

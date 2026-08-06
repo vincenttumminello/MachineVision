@@ -34,6 +34,8 @@ public:
     virtual double logLikelihood(const Eigen::VectorXd & x, const SystemEstimator & system, Eigen::VectorXd & g) const override;
     virtual double logLikelihood(const Eigen::VectorXd & x, const SystemEstimator & system, Eigen::VectorXd & g, Eigen::MatrixXd & H) const override;
 
+    virtual std::string getProcessString() const override { return "Kinematic height:"; }
+
 protected:
     double y_;      ///< Measured torso height [m]
     double sigma_;  ///< Noise standard deviation [m]

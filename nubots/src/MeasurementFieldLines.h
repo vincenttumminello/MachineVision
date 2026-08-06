@@ -90,6 +90,8 @@ public:
 
     std::size_t numPoints() const { return static_cast<std::size_t>(rays_.cols()); }
 
+    virtual std::string getProcessString() const override { return "Field lines:"; }
+
 protected:
     virtual void update(SystemBase & system) override;
 

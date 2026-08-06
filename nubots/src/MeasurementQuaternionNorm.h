@@ -70,6 +70,8 @@ public:
         return Scalar(-0.5*std::log(2.0*M_PI*sigma2)) - Scalar(0.5)*e*e/Scalar(sigma2);
     }
 
+    virtual std::string getProcessString() const override { return "Quaternion norm:"; }
+
 protected:
     double sigma_;   ///< Std dev on |q|
 };

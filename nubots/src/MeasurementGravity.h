@@ -42,6 +42,8 @@ public:
      */
     template <typename Scalar> Scalar logLikelihoodImpl(const Eigen::VectorX<Scalar> & x) const;
 
+    virtual std::string getProcessString() const override { return "Gravity:"; }
+
 protected:
     Eigen::Vector3d y_;     ///< Measured specific force in torso frame [m/s^2]
     double sigma_;          ///< Noise standard deviation [m/s^2]

@@ -1011,6 +1011,58 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     std::size_t nGravityRejected = 0;   ///< Frames where the specific force was not quasi-static
     std::size_t nZupt = 0;              ///< Zero-velocity updates applied while fallen
 
+    // Posture as a function of time, so a measurement taken between vision frames is
+    // gated on the posture at ITS timestamp rather than the enclosing frame's.
+    auto postureAt = [&](double tt) {
+        Posture p = fallGate ? falls.at(tt) : Posture::UPRIGHT;
+        if (fallGate && std::isfinite(fallT) && tt >= fallT && tt < fallT + fallDuration)
+        {
+            p = Posture::FALLEN;        // Simulated fall (see FALL_T above)
+        }
+        return p;
+    };
+
+    // Body-rate measurement sources, merged into ONE time-ordered stream.
+    //
+    // These used to be sampled at the vision rate: each frame took the single
+    // nearestIndex() IMU sample and odometry twist and discarded the rest. The IMU
+    // runs at ~90 Hz (data2) to ~124 Hz (data4_webots) against ~25 Hz vision, so
+    // that threw away three readings in four -- and the gyroscope is the one sensor
+    // that measures a topple honestly, exactly when omegaBb is changing fastest.
+    //
+    // The streams are merged rather than processed one after the other because
+    // Event::process predicts to the event's own time, and SystemEstimator::predict
+    // requires dt >= 0. The assert that would catch a violation is compiled out in
+    // Release (CMakeLists defines NDEBUG for every non-Debug build), so an
+    // out-of-order event would predict backwards and silently corrupt the state.
+    struct RateEvent
+    {
+        double t;                               ///< Time relative to t0 [s]
+        enum class Kind { Gyro, Odom } kind;
+        std::size_t idx;                        ///< Index into log.sensors (Gyro) or twists (Odom)
+    };
+    std::vector<RateEvent> rateEvents;
+    rateEvents.reserve(log.sensors.size() + twists.size());
+    for (std::size_t i = 0; i < log.sensors.size(); ++i)
+    {
+        if (log.sensors[i].gyroscope.allFinite())
+        {
+            rateEvents.push_back({log.sensors[i].t - t0, RateEvent::Kind::Gyro, i});
+        }
+    }
+    for (std::size_t i = 0; i < twists.size(); ++i)
+    {
+        if (twists[i].vBb.allFinite())
+        {
+            rateEvents.push_back({twists[i].t, RateEvent::Kind::Odom, i});
+        }
+    }
+    std::stable_sort(rateEvents.begin(), rateEvents.end(),
+                     [](const RateEvent & a, const RateEvent & b) { return a.t < b.t; });
+    std::size_t kRate = 0;              ///< Next unconsumed entry of rateEvents
+    std::size_t nGyroUpdates = 0;       ///< Gyroscope measurements actually applied
+    std::size_t nOdomUpdates = 0;       ///< Odometry velocity measurements actually applied
+
     for (const VisionSample & v : log.vision)
     {
         const double t = v.t - t0;
@@ -1043,11 +1095,7 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         // FALL_GATE=off makes the whole run read as upright, so the recovery block
         // below never fires either -- the ablation is "no posture handling at all",
         // not "suppression off but recovery still on".
-        Posture posture = fallGate ? falls.at(t) : Posture::UPRIGHT;
-        if (fallGate && std::isfinite(fallT) && t >= fallT && t < fallT + fallDuration)
-        {
-            posture = Posture::FALLEN;      // Simulated fall (see FALL_T above)
-        }
+        Posture posture = postureAt(t);
         const bool upright = posture == Posture::UPRIGHT;
         if (!upright)
         {
@@ -1157,49 +1205,55 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         // The gyroscope runs unconditionally, including through a fall: it is the
         // one sensor that measures a topple honestly, and its reading is valid
         // whatever the robot's posture.
-        if (useGyroscope && log.sensors[k].gyroscope.allFinite())
+        // Drain every body-rate measurement whose timestamp has arrived, each applied
+        // at its OWN time rather than at this frame's. Event::process predicts to the
+        // event time, so the filter steps IMU-sample to IMU-sample between frames
+        // instead of taking one ~40 ms leap driven by the estimated omegaBb.
+        //
+        // Posture is re-evaluated per event, so a gyroscope reading taken mid-topple
+        // is gated on the posture at that instant. fallStartT lags by up to one frame,
+        // which is immaterial against the 2 s disturbedWindow it feeds.
+        while (kRate < rateEvents.size() && rateEvents[kRate].t <= t)
         {
-            MeasurementGyroscope mg(t, log.sensors[k].gyroscope, sigmaGyro);
-            system.process(mg);
-        }
-        // The walk-engine odometry velocity, on the other hand, describes the gait
-        // the engine believes it is executing. Upright that is loose but real
-        // information; on the ground it is fiction, and during a getup it is a
-        // scripted flail that is not locomotion. So it is suppressed while not
-        // upright -- the same per-model gating as kinematic height, which is a
-        // tidier way to say it than the special case that used to live inside the
-        // process model's input().
-        if (upright)
-        {
-            std::size_t vi = nearestIndex(twists, t, [](const BodyTwistSample & s) { return s.t; });
-            if (!twists.empty() && std::abs(twists[vi].t - t) < 0.1 && twists[vi].vBb.allFinite())
+            const RateEvent & re = rateEvents[kRate++];
+            // The belief is seeded at tInit, so samples from earlier in the recording
+            // predate it. Feeding one in would predict with a negative dt: the assert
+            // in SystemEstimator::predict that would catch that is compiled out in
+            // Release, and the state goes to NaN on the first frame.
+            if (re.t < tInit) continue;
+            const Posture rPosture = postureAt(re.t);
+            const bool rUpright = rPosture == Posture::UPRIGHT;
+            const double rElapsed = (!rUpright && std::isfinite(fallStartT)) ? re.t - fallStartT : 0.0;
+            system.setPosture(rUpright, rElapsed);
+
+            if (re.kind == RateEvent::Kind::Gyro)
             {
-                MeasurementBodyVelocity mv(t, twists[vi].vBb, sigmaOdomVel);
+                if (!useGyroscope) continue;
+                MeasurementGyroscope mg(re.t, log.sensors[re.idx].gyroscope, sigmaGyro);
+                system.process(mg);
+                nGyroUpdates++;
+            }
+            else if (rUpright)
+            {
+                // Walk-engine odometry. Loose, but real information, and now sampled
+                // per twist rather than once per frame.
+                MeasurementBodyVelocity mv(re.t, twists[re.idx].vBb, sigmaOdomVel);
                 system.process(mv);
+                nOdomUpdates++;
+            }
+            else
+            {
+                // Zero-velocity update. Consecutive twists are separated by process
+                // noise on vBb, so asserting stationarity at each epoch is a distinct
+                // constraint on a diffusing state, not the same claim repeated.
+                const double sigma = rPosture == Posture::FALLEN ? sigmaZupt : sigmaZuptDynamic;
+                MeasurementBodyVelocity zupt = MeasurementBodyVelocity::stationary(re.t, sigma);
+                system.process(zupt);
+                nZupt++;
             }
         }
-        else
-        {
-            // Zero-velocity update. A robot lying on the carpet is not translating,
-            // and saying so is the most confident measurement available. It is also
-            // the only thing stopping the pre-fall walking velocity from integrating
-            // across the whole fall, which with velocity in the state is exactly how
-            // the estimate walks off the field: measured across data4_webots,
-            // leaving the toppling and getting-up frames unmeasured let the error
-            // compound 0.12 -> 0.62 -> 1.76 m over two falls and never recover.
-            //
-            // It is applied through the whole non-upright window, not just while
-            // FALLEN, because "no measurement" is not the neutral choice it looks
-            // like -- it says the robot may still be travelling at whatever it was
-            // doing when it fell, which is the one thing it is certainly not doing.
-            // The sigma is what changes with posture: lying still the robot really
-            // is stationary, whereas toppling and being levered upright genuinely
-            // move the torso, just not anywhere.
-            const double sigma = posture == Posture::FALLEN ? sigmaZupt : sigmaZuptDynamic;
-            MeasurementBodyVelocity zupt = MeasurementBodyVelocity::stationary(t, sigma);
-            system.process(zupt);
-            nZupt++;
-        }
+        // Restore this frame's posture for the vision measurements below.
+        system.setPosture(upright, fallElapsed);
 
         // Prediction used to happen only inside Event::process, so a frame that
         // produced no usable measurement advanced neither the state nor the clock.
@@ -1693,6 +1747,10 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                      xFinal(SystemLocalisation::iBias + 1)*180.0/M_PI);
     }
     std::println("Mean update time {:.2f} ms, max {:.2f} ms", nUpdates ? sumMs/nUpdates : 0.0, maxMs);
+    std::println("Body-rate updates: {} gyroscope, {} odometry velocity, {} zero velocity "
+                 "over {} vision frames ({:.2f} gyro/frame)",
+                 nGyroUpdates, nOdomUpdates, nZupt, nUpdates,
+                 nUpdates ? static_cast<double>(nGyroUpdates)/nUpdates : 0.0);
     if (system.backwardPredicts() > 0)
     {
         std::println("WARNING: {} out-of-sequence events rejected (worst lag {:.4f} s). These were "
