@@ -121,3 +121,51 @@ SCENARIO("SystemLocalisation twist from odometry")
         }
     }
 }
+
+SCENARIO("Out-of-sequence events are rejected rather than integrated backwards")
+{
+    GIVEN("A system predicted forward to t = 1 s")
+    {
+        Eigen::VectorXd eta0 = makeState(0, 0, 0, 0, 0, 0);
+        eta0.segment<3>(SystemLocalisation::iVel) << 0.5, 0.0, 0.0;
+        Eigen::MatrixXd S0 = Eigen::MatrixXd::Identity(SystemLocalisation::nx, SystemLocalisation::nx)*0.01;
+        SystemLocalisation system(GaussianInfo<double>::fromSqrtMoment(eta0, S0));
+        system.resetTo(GaussianInfo<double>::fromSqrtMoment(eta0, S0), 0.0);
+        system.predict(1.0);
+
+        REQUIRE(system.backwardPredicts() == 0);
+        const Eigen::VectorXd muBefore = system.density.mean();
+        REQUIRE(muBefore.allFinite());
+
+        WHEN("an event stamped earlier than the filter's clock arrives")
+        {
+            system.predict(0.75);
+
+            THEN("it is counted, and the belief and clock are left untouched")
+            {
+                // The whole point: a negative dt puts the process-noise square root at
+                // 1/(sigma*sqrt(dt)) and runs RK4 backwards, so an unguarded predict
+                // returns NaN. assert() cannot catch it because Release defines NDEBUG.
+                CHECK(system.backwardPredicts() == 1);
+                CHECK(system.maxBackwardDt() == doctest::Approx(0.25));
+
+                const Eigen::VectorXd muAfter = system.density.mean();
+                REQUIRE(muAfter.allFinite());
+                CHECK((muAfter - muBefore).norm() == doctest::Approx(0.0));
+                CHECK(system.time() == doctest::Approx(1.0));
+            }
+        }
+
+        WHEN("a correctly ordered event follows")
+        {
+            system.predict(1.5);
+
+            THEN("prediction proceeds normally and nothing is counted")
+            {
+                CHECK(system.backwardPredicts() == 0);
+                CHECK(system.density.mean().allFinite());
+                CHECK(system.time() == doctest::Approx(1.5));
+            }
+        }
+    }
+}

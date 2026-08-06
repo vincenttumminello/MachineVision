@@ -60,6 +60,14 @@ public:
      */
     virtual Eigen::VectorXd input(double t, const Eigen::VectorXd & x) const = 0;
 
+    /**
+     * @brief The time the belief is currently valid at [s].
+     *
+     * An event stamped before this is out of sequence; see
+     * SystemEstimator::backwardPredicts().
+     */
+    double time() const { return time_; }
+
 protected:
     double time_;  ///< The current system time.
 };

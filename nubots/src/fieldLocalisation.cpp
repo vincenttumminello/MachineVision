@@ -1693,6 +1693,12 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                      xFinal(SystemLocalisation::iBias + 1)*180.0/M_PI);
     }
     std::println("Mean update time {:.2f} ms, max {:.2f} ms", nUpdates ? sumMs/nUpdates : 0.0, maxMs);
+    if (system.backwardPredicts() > 0)
+    {
+        std::println("WARNING: {} out-of-sequence events rejected (worst lag {:.4f} s). These were "
+                     "applied at the filter's current time rather than their own.",
+                     system.backwardPredicts(), system.maxBackwardDt());
+    }
     if (nCompared > 0)
     {
         std::println("vs NUbots baseline over {} samples: RMSE position {:.3f} m, yaw {:.2f} deg",

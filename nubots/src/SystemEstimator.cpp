@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <Eigen/Core>
 #include "GaussianInfo.hpp"
 #include "SystemEstimator.h"
@@ -13,7 +14,24 @@ SystemEstimator::~SystemEstimator() = default;
 void SystemEstimator::predict(double time)
 {
     double dt = time - time_;
-    assert(dt >= 0);
+    // Out-of-sequence event. Integrating backwards is not merely inaccurate, it is
+    // undefined: RK4 runs with a negative step and the process-noise square-root
+    // information is 1/(sigma*sqrt(dt)), so the belief goes to NaN on the spot and
+    // every subsequent measurement inherits it. assert() cannot catch this in
+    // practice because CMakeLists defines NDEBUG for every non-Debug build, which
+    // is exactly how a stale sample silently NaN'd a whole run during the move to
+    // native-rate body-rate measurements.
+    //
+    // Rejecting is not the same as handling it. The measurement that follows will be
+    // applied at the current time rather than its own, which is a real (if usually
+    // small) modelling error -- see backwardPredicts() to find out whether it is
+    // happening at all. Doing better needs an out-of-sequence measurement update.
+    if (dt < 0.0)
+    {
+        ++nBackwardPredicts_;
+        maxBackwardDt_ = std::max(maxBackwardDt_, -dt);
+        return;                     // Leave both the belief and the clock alone
+    }
     if (dt == 0.0) return;
 
     // Augment state density with independent noise increment dw ~ N^{-1}(0, LambdaQ/dt)

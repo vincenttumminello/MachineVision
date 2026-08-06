@@ -6,6 +6,7 @@
 #ifndef SYSTEMESTIMATOR_H
 #define SYSTEMESTIMATOR_H
 
+#include <cstddef>
 #include <vector>
 #include <Eigen/Core>
 #include "GaussianInfo.hpp"
@@ -36,6 +37,20 @@ public:
      * @param time The time to predict the system state for.
      */
     virtual void predict(double time) override;
+
+    /**
+     * @brief Number of predicts rejected for arriving out of sequence (dt < 0).
+     *
+     * Always zero for a correctly ordered event stream. Non-zero means something
+     * upstream delivered a measurement stamped earlier than one already applied,
+     * and that measurement was folded in at the wrong time.
+     */
+    std::size_t backwardPredicts() const { return nBackwardPredicts_; }
+
+    /**
+     * @brief Largest backward step seen, i.e. the worst out-of-sequence lag [s].
+     */
+    double maxBackwardDt() const { return maxBackwardDt_; }
 
     GaussianInfo<double> density;  ///< The current state density estimate.
 
@@ -88,6 +103,9 @@ protected:
     virtual std::vector<Eigen::Index> processNoiseIndex() const = 0;
 
     double dtMaxEst = 1e-2;         ///< Maximum time step for process model prediction
+
+    std::size_t nBackwardPredicts_ = 0;   ///< Events rejected for arriving out of sequence
+    double maxBackwardDt_ = 0.0;          ///< Worst out-of-sequence lag seen [s]
 };
 
 #endif
