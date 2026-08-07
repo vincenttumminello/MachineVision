@@ -252,6 +252,32 @@ std::vector<SideDisambiguator::Association> SideDisambiguator::associate(
         // clutter density (positive by the acceptance gate above).
         score += -pq.surprisal - logClutter;
     }
+
+    // Null-hypothesis term: a landmark predicted well inside the image and not
+    // matched is evidence AGAINST the pose that predicted it, and until now cost
+    // nothing. Summing only over accepted associations rewards a hypothesis for
+    // predicting a lot and never charges it for being wrong about most of it.
+    //
+    // That is what saturated the LLR on data4_webots. After a 123 deg turn the own
+    // hypothesis faces unmapped bearings and predicts nothing (score 0, no
+    // opportunity to be tested), while the mirror looks back over the mapped region
+    // and predicts 302 landmarks of which 70 match -- a 23% hit rate against the 68%
+    // the own hypothesis sustained while it had coverage. Unpenalised, those 70
+    // associations outscored a silent hypothesis and the LLR ran to the clamp; the
+    // freezeLlr guard then locked map building out of ever covering the new
+    // direction, so the asymmetry became permanent.
+    //
+    // This is equation (13)'s -4|U|log|Y| in the assignment: |U| visible-but-
+    // unassociated landmarks, each charged the log image area under the clutter
+    // model. Here it is one constant per miss, since the landmarks are points
+    // rather than four-corner tags.
+    std::size_t missed = 0;
+    for (const Prediction & p : predictions)
+    {
+        if (!p.associated && !p.ambiguous && p.wellInside) missed++;
+    }
+    score -= options.missPenalty*static_cast<double>(missed);
+
     return assoc;
 }
 
@@ -523,10 +549,17 @@ SideDisambiguator::FrameResult SideDisambiguator::process(double t, const cv::Ma
         {
             lv.status = LANDMARK_ASSOCIATED;
             lv.matchPx = features[p.feature].px;
+            stats_.predAssociated++;
+            if (lv.far) stats_.predAssociatedFar++;
         }
-        else if (p.ambiguous)  lv.status = LANDMARK_AMBIGUOUS;
-        else if (p.wellInside) lv.status = LANDMARK_MISSED;
-        else                   lv.status = LANDMARK_EDGE;
+        else if (p.ambiguous)
+        {
+            lv.status = LANDMARK_AMBIGUOUS;
+            stats_.predAmbiguous++;
+            if (lv.far) stats_.predAmbiguousFar++;
+        }
+        else if (p.wellInside) { lv.status = LANDMARK_MISSED; stats_.predMissed++; }
+        else                   { lv.status = LANDMARK_EDGE;   stats_.predEdge++; }
         landmarks_[p.landmark].lastStatus = lv.status;
         viewOfLandmark[p.landmark] = static_cast<int>(res.landmarkViews.size());
         res.landmarkViews.push_back(lv);

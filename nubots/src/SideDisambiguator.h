@@ -58,6 +58,13 @@ public:
     {
         // --- SNN association ---
         double sigmaAngular   = 0.05;   ///< Corner bearing noise std dev [rad] (~3 deg: pixel noise + unmodelled pose drift)
+        double missPenalty    = 0.5;    ///< Charged per landmark predicted well inside the image and not
+                                        ///< matched [nats]. Without it a hypothesis is rewarded for
+                                        ///< predicting a lot and never charged for being wrong about most
+                                        ///< of it, so a mirror looking back over the mapped region after a
+                                        ///< turn outscores an own hypothesis that predicts nothing. This is
+                                        ///< equation (13)'s -4|U|log|Y| null-hypothesis term. SIDE_MISS
+                                        ///< overrides it, for sweeping against ground truth.
         double clutterDensity = 5.0;    ///< Effective clutter density [features/steradian] (physical is ~55;
                                         ///< lower widens acceptance so the true side survives estimator drift)
         double posStdFloor    = 0.6;    ///< Floor on the camera position std used for gating [m]: the filter
@@ -349,6 +356,19 @@ public:
         std::size_t upgraded = 0;           ///< Bearing-only landmarks upgraded to points by later parallax
         std::size_t landmarkCulledChi2 = 0; ///< Landmarks culled by the static-consistency re-test
         std::size_t landmarkCulledMiss = 0; ///< Landmarks culled by the miss-streak rule
+
+        // Per-prediction outcome, summed over frames. A landmark excluded as
+        // AMBIGUOUS contributes nothing to the side score, so the share of
+        // predictions landing there is how much of the map is being wasted. Split
+        // by far/point because a bearing-only landmark's predicted bearing smears
+        // with the baseline it is viewed from, which is the assumedRange prior
+        // showing up as lost discrimination rather than as a wrong answer.
+        std::size_t predAssociated = 0;     ///< Predicted in view and matched to a corner
+        std::size_t predMissed = 0;         ///< Predicted well inside the image, no match
+        std::size_t predAmbiguous = 0;      ///< Bearing too smeared to discriminate: excluded
+        std::size_t predEdge = 0;           ///< Projects too near the image border to count
+        std::size_t predAmbiguousFar = 0;   ///< ... of which bearing-only landmarks
+        std::size_t predAssociatedFar = 0;  ///< ... associated ones that are bearing-only
     };
     const Stats & stats() const { return stats_; }
 

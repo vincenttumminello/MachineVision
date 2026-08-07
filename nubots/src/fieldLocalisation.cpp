@@ -654,6 +654,8 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         return fallback;
     };
 
+    sideDis.options.missPenalty = envDouble("SIDE_MISS", sideDis.options.missPenalty);
+
     // Simulated kidnap for verification: KIDNAP_T=<seconds> mirrors the filter
     // state once at that time WITHOUT telling the disambiguator, emulating an
     // unnoticed symmetry flip that it must detect and correct.
@@ -1743,6 +1745,25 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                      ss.promoteAttempts, ss.parallaxWait, ss.triFailGeometry, ss.triFailRange, ss.triFailChi2,
                      ss.backgroundFail, ss.farSpreadFail, ss.promoted, ss.promotedFar, ss.upgraded,
                      ss.landmarkCulledChi2, ss.landmarkCulledMiss);
+        {
+            // What the map actually contributed. An AMBIGUOUS prediction is excluded
+            // from matching AND from scoring, so it is map that was built, kept and
+            // then not used. The far/point split says whether the loss is the
+            // bearing-only depth prior smearing predictions or something else.
+            const std::size_t predTotal = ss.predAssociated + ss.predMissed + ss.predAmbiguous + ss.predEdge;
+            const auto pct = [&](std::size_t n) { return predTotal ? 100.0*n/predTotal : 0.0; };
+            std::println("  predictions: {} total -> {} associated ({:.1f}%), {} missed ({:.1f}%), "
+                         "{} ambiguous ({:.1f}%), {} edge ({:.1f}%)",
+                         predTotal, ss.predAssociated, pct(ss.predAssociated),
+                         ss.predMissed, pct(ss.predMissed),
+                         ss.predAmbiguous, pct(ss.predAmbiguous),
+                         ss.predEdge, pct(ss.predEdge));
+            std::println("    bearing-only share: {}/{} of ambiguous ({:.1f}%), {}/{} of associated ({:.1f}%)",
+                         ss.predAmbiguousFar, ss.predAmbiguous,
+                         ss.predAmbiguous ? 100.0*ss.predAmbiguousFar/ss.predAmbiguous : 0.0,
+                         ss.predAssociatedFar, ss.predAssociated,
+                         ss.predAssociated ? 100.0*ss.predAssociatedFar/ss.predAssociated : 0.0);
+        }
         // Depth quality of the surviving map. Bearing-only landmarks carry no
         // triangulated depth at all -- they sit at the assumed range along their
         // bearing -- so they cluster on a shell around whichever camera position
