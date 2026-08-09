@@ -798,13 +798,3 @@ Environment switches, all defaulting to the shipped behaviour:
 
 The exported `out/field_localisation.csv` contains the full state, 1-sigma
 bounds, baseline comparison, ground truth and side-evidence per frame.
-
-## Background notes
-
-Two companion write-ups on the estimator's Gaussian representation, both against
-this repo's `nubots/src/GaussianInfo.hpp`:
-
-- [SQUARE_ROOT_INFORMATION.md](SQUARE_ROOT_INFORMATION.md) — the algebra, the code
-  references and the literature.
-- [INFORMATION_FORM_INTUITION.md](INFORMATION_FORM_INTUITION.md) — the same ground
-  as a surveyor with a map and a pencil, no equations.
