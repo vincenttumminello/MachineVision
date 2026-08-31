@@ -1,6 +1,8 @@
 #ifndef ROTATION_HPP
 #define ROTATION_HPP
 
+#include <algorithm>    // logSO3 clamps the trace before the arccosine
+#include <cmath>
 #include <Eigen/Core>
 #include <Eigen/Geometry>   // tangentBasis uses cross products
 
@@ -231,6 +233,82 @@ inline Eigen::Matrix<double, 3, 2> tangentBasis(const Eigen::Vector3d & u)
     T.col(0) = t1;
     T.col(1) = u.cross(t1).normalized();
     return T;
+}
+
+/**
+ * @brief Exponential map from a rotation vector to SO(3) (Rodrigues' formula).
+ *
+ * expSO3(w) is the rotation of |w| radians about w/|w|, and is the inverse of
+ * logSO3 below. Templated on the scalar so autodiff can differentiate through
+ * it: the small-angle branch exists because sin(t)/t and (1 - cos t)/t^2 are
+ * 0/0 at the origin, which is not merely inaccurate but a NaN in the value and
+ * in every derivative that passes through it. The series are used well before
+ * the closed forms lose precision, so the two agree to machine epsilon at the
+ * switch.
+ *
+ * @param w Rotation vector (axis times angle) [rad]
+ * @return The corresponding rotation matrix
+ */
+template <typename Derived>
+Eigen::Matrix3<typename Derived::Scalar> expSO3(const Eigen::MatrixBase<Derived> & w)
+{
+    using Scalar = typename Derived::Scalar;
+    using std::sqrt, std::sin, std::cos;
+
+    const Scalar theta2 = w.squaredNorm();
+    const Eigen::Matrix3<Scalar> W = hatSO3(w);
+
+    Scalar a, b;    // sin(theta)/theta and (1 - cos(theta))/theta^2
+    if (theta2 < Scalar(1e-8))
+    {
+        a = Scalar(1) - theta2/Scalar(6);
+        b = Scalar(0.5) - theta2/Scalar(24);
+    }
+    else
+    {
+        const Scalar theta = sqrt(theta2);
+        a = sin(theta)/theta;
+        b = (Scalar(1) - cos(theta))/theta2;
+    }
+    return Eigen::Matrix3<Scalar>::Identity() + a*W + b*W*W;
+}
+
+/**
+ * @brief Logarithm map from SO(3) to a rotation vector.
+ *
+ * The inverse of expSO3 for rotations of less than pi. Used to report an
+ * inter-frame rotation as an angular velocity, and by the unit tests; the
+ * measurement models themselves only ever need the forward map.
+ *
+ * @param R Rotation matrix
+ * @return Rotation vector (axis times angle) [rad]
+ */
+inline Eigen::Vector3d logSO3(const Eigen::Matrix3d & R)
+{
+    // Antisymmetric part of R is sin(theta)*axis, trace gives cos(theta).
+    const Eigen::Vector3d v(R(2, 1) - R(1, 2), R(0, 2) - R(2, 0), R(1, 0) - R(0, 1));
+    const double s = 0.5*v.norm();                                  // |sin(theta)|
+    const double c = std::clamp(0.5*(R.trace() - 1.0), -1.0, 1.0);  // cos(theta)
+    const double theta = std::atan2(s, c);
+
+    if (s < 1e-8)
+    {
+        // Near identity (theta ~ 0): v/2 IS the rotation vector to first order.
+        // Near a half turn (theta ~ pi) the antisymmetric part vanishes and the
+        // axis has to come from the symmetric part instead. Neither case arises
+        // for an inter-frame rotation at video rate, but returning a silently
+        // wrong axis in the pi case would be worse than the cost of handling it.
+        if (c > 0.0)
+        {
+            return 0.5*v;
+        }
+        const Eigen::Matrix3d A = 0.5*(R + Eigen::Matrix3d::Identity());   // = axis*axis'
+        Eigen::Index i;
+        A.diagonal().maxCoeff(&i);
+        Eigen::Vector3d axis = A.col(i)/std::sqrt(std::max(A(i, i), 1e-12));
+        return theta*axis.normalized();
+    }
+    return (0.5*theta/s)*v;
 }
 
 #endif

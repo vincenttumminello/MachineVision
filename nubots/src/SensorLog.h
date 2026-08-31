@@ -37,6 +37,19 @@ struct SensorsSample
     Pose<double> Htw;                ///< world -> torso
     Eigen::Vector3d accelerometer;  ///< [m/s^2], torso frame
     Eigen::Vector3d gyroscope;      ///< [rad/s], torso frame
+
+    // Neck joints. The torso-from-camera extrinsic is normally recovered as
+    // Htw*Hcw^-1, which is accurate enough for anything that uses it once per
+    // frame, but both factors carry the world-referenced torso attitude and the
+    // two messages are not stamped at the same instant, so their product picks
+    // up a spurious rotation of order (body rate)x(clock skew) -- a few
+    // milliradians while walking. That is invisible against a 0.25 rad landmark
+    // sigma and larger than the whole signal for a model that measures the
+    // rotation between consecutive frames. The joints themselves have no such
+    // problem: they are small, slow, and read at one time.
+    double headYaw = 0.0;           ///< HEAD_YAW servo present position [rad]
+    double headPitch = 0.0;         ///< HEAD_PITCH servo present position [rad]
+    bool headValid = false;         ///< True if both head servos were present in the message
 };
 
 /**

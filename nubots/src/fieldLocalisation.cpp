@@ -6,6 +6,7 @@
 #include <format>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <print>
 #include <stdexcept>
 #include <string>
@@ -19,6 +20,7 @@
 #include <opencv2/videoio.hpp>
 #include "FallDetector.h"
 #include "FieldMap.h"
+#include "FlowTracker.h"
 #include "fieldLocalisation.h"
 #include "CameraLens.h"
 #include "GaussianInfo.hpp"
@@ -26,9 +28,11 @@
 #include "MeasurementBodyRates.h"
 #include "MeasurementFieldLandmarks.h"
 #include "MeasurementFieldLines.h"
+#include "MeasurementFlowRotation.h"
 #include "MeasurementGravity.h"
 #include "MeasurementKinematicHeight.h"
 #include "MeasurementQuaternionNorm.h"
+#include "NeckKinematics.h"
 #include "SideDisambiguator.h"
 #include "Pose.hpp"
 #include "rotation.hpp"
@@ -645,8 +649,35 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     // the start-half prior used at initialisation). The disambiguator maps
     // background corners online and compares how well the estimate and its
     // mirror explain them; a sustained mirror preference flips the filter.
-    constexpr bool useOutOfField = true;
+    //
+    // Off while the flow-rotation work below is being evaluated. The two are
+    // independent -- the disambiguator is a side channel whose only coupling to
+    // the estimator is a discrete 180 deg flip -- but it is also the one thing
+    // in the pipeline that can move the pose by 180 deg without a measurement
+    // saying so, which would make a yaw-accuracy comparison unreadable. It also
+    // costs the largest single share of the per-frame budget, so leaving it out
+    // makes the flow model's own cost legible.
+    constexpr bool useOutOfField = false;
     SideDisambiguator sideDis(lens, map.dims);
+
+    // Far-field optical flow as a bias-free measurement of the body angular
+    // rate. The gyroscope sees omegaBb + bGyro and cannot separate them; the
+    // rotational part of the flow field is depth-independent and carries no
+    // bias, so the difference between the two is the bias -- measured per frame
+    // rather than inferred over seconds against the landmarks. The yaw-rate
+    // component is the one the upstream Mahony filter is structurally blind to.
+    // See MeasurementFlowRotation.
+    constexpr bool useFlowRotation = true;
+    FlowTracker flowTracker(lens, map.dims);
+
+    // The flow model needs the torso-from-camera extrinsic at two instants a
+    // frame apart, and needs the DIFFERENCE between them to a milliradian. The
+    // usual Htw*Hcw^-1 cannot supply that: both factors carry the world attitude
+    // from messages stamped at different times, so their product reports up to
+    // 0.5 rad/s of head motion on a recording whose head servos never move. The
+    // servo chain is measured at one instant and has no such term. See
+    // NeckKinematics for the calibration that establishes it.
+    NeckKinematics neck;
 
     // Read a tuning override from the environment, for ablation sweeps.
     auto envDouble = [](const char * name, double fallback) {
@@ -686,14 +717,32 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                      fallT, fallT + fallDuration);
     }
     cv::VideoCapture videoCap;
-    if (useOutOfField)
+    if (useOutOfField || useFlowRotation)
     {
         videoCap.open((dataDir / "Left.mp4").string());
         if (!videoCap.isOpened())
         {
-            std::println("WARNING: could not open {} - out-of-field features disabled", (dataDir / "Left.mp4").string());
+            std::println("WARNING: could not open {} - out-of-field and optical flow features disabled",
+                         (dataDir / "Left.mp4").string());
         }
     }
+    if (useFlowRotation)
+    {
+        const std::size_t nCal = neck.calibrate(log.sensors, log.vision);
+        if (nCal > 0)
+        {
+            const Eigen::Vector3d m = rot2rpy(neck.mount())*180.0/M_PI;
+            std::println("Neck extrinsic calibrated on {} quiet frames: mount rpy = "
+                         "[{:+.2f}, {:+.2f}, {:+.2f}] deg, residual {:.2f} deg RMS vs Htw*Hcw^-1",
+                         nCal, m.x(), m.y(), m.z(), neck.residualRms()*180.0/M_PI);
+        }
+        else
+        {
+            std::println("WARNING: no head servo data in this log - the flow model will fall back "
+                         "to the logged extrinsic, which is noisier than the rotation it measures");
+        }
+    }
+
     // Sequential fetch of a video frame by index (vision samples are time-ordered,
     // so targets are non-decreasing; a backwards seek is supported but not expected).
     int videoNextFrame = 0;
@@ -923,6 +972,19 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
     double sumZerr = 0, sumSqZerr = 0;      ///< est z - truth marker z
     double sumOofMs = 0, maxOofMs = 0;
     std::size_t nOofFrames = 0, sumOofOut = 0, sumOofTotal = 0, sumOofAssoc = 0, nSideFlips = 0;
+
+    // Optical-flow rotation tallies. nFlowFrames counts frames the tracker saw,
+    // nFlowApplied the ones that became a measurement; the gap between them is
+    // the model's duty cycle, which is the first thing to look at if it is not
+    // helping.
+    double sumFlowMs = 0, maxFlowMs = 0;
+    std::size_t nFlowFrames = 0, nFlowApplied = 0, nFlowUnusable = 0;
+    std::size_t sumFlowTracked = 0, sumFlowFar = 0, sumFlowMatches = 0, sumFlowGated = 0;
+    double sumFlowSigma = 0, sumFlowInterval = 0;
+    // FLOW_APPLY=0 computes the flow measurement and its diagnostics but does
+    // not fold it into the belief, so it can be evaluated against a filter that
+    // is still tracking properly instead of one it has already corrupted.
+    const bool flowApply = !std::getenv("FLOW_APPLY") || std::atoi(std::getenv("FLOW_APPLY")) != 0;
 
     // DIAGNOSTIC: mean landmark reprojection residual at a given pose, using that
     // pose's own associations. Lets us ask which pose the vision data supports
@@ -1213,6 +1275,101 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         // those falls, and the filter came out holding pre-fall confidence in a mean
         // that had moved -- an association gate too narrow to ever re-acquire.
         const bool poseFinite = v.Hcw.rotationMatrix.allFinite() && v.Hcw.translationVector.allFinite();
+
+        // Camera extrinsic from kinematics, hoisted above the no-detections gate
+        // because the flow measurement below needs it and does not need
+        // detections. Only meaningful when the logged camera pose is finite;
+        // every use of it is guarded on that.
+        Pose<double> Tbc;
+        if (poseFinite)
+        {
+            Tbc = log.sensors[k].Htw*v.Hcw.inverse();
+        }
+
+        // Far-field optical flow, applied BEFORE the no-detections gate. Flow
+        // needs texture, not landmarks, so the frames where YOLO returns nothing
+        // -- a face-down fall, a getup ending in motion blur, a robot facing a
+        // blank wall -- are exactly the ones where it still has something to say
+        // about how the robot is turning, and exactly the ones where the
+        // gyroscope currently runs unopposed. Tracking also has to advance on
+        // those frames whatever happens, or the next usable pair straddles a gap.
+        cv::Mat gray;
+        bool haveGray = false;
+        if (useFlowRotation && poseFinite && fetchVideoFrame(v.videoFrame))
+        {
+            auto ticFlow = std::chrono::steady_clock::now();
+            cv::cvtColor(videoFrameBgr, gray, cv::COLOR_BGR2GRAY);
+            haveGray = true;
+
+            // Camera pose at the current belief, for the far-field test only.
+            // The body-rate measurements above have already advanced the filter
+            // to t, so this is the belief the frame is actually being read under.
+            const Eigen::VectorXd xNow = system.density.mean();
+            const Pose<double> TfcNow = SystemLocalisation::fieldPose<double>(xNow)*Tbc
+                     *Pose<double>(SystemLocalisation::cameraBiasRotation<double>(xNow), Eigen::Vector3d::Zero());
+
+            const double frameT = (v.videoFrame >= 0 && v.videoFrame < static_cast<int>(log.frameTimes.size()))
+                                ? log.frameTimes[static_cast<std::size_t>(v.videoFrame)] : t;
+            // Position from the logged extrinsic (the lever arm is irrelevant to
+            // a rotation measurement and only feeds the far-field test), rotation
+            // from the servos.
+            Pose<double> TbcFlow = Tbc;
+            if (neck.calibrated() && log.sensors[k].headValid)
+            {
+                TbcFlow.rotationMatrix = neck.Rbc(log.sensors[k]);
+            }
+            const FlowFrame ff = flowTracker.track(gray, frameT, TbcFlow, TfcNow);
+            nFlowFrames++;
+            sumFlowTracked += ff.nTracked;
+            sumFlowFar += static_cast<int>(ff.matches.size());
+
+            if (ff.valid)
+            {
+                MeasurementFlowRotation::Options flowOpts;
+                flowOpts.sigmaOmegaPsd = upright ? system.params.sigmaOmega : system.params.sigmaOmegaDisturbed;
+                MeasurementFlowRotation mfr(t, ff, system, flowOpts);
+                if (mfr.usable())
+                {
+                    // Log what the two instruments say before the update folds
+                    // them together. Their difference IS the gyroscope bias, so
+                    // this is the diagnostic that says whether the model is
+                    // doing the job it was added for.
+                    // The two instruments side by side. Their difference IS the
+                    // gyroscope bias -- the model's whole reason for existing --
+                    // so this is the line that says whether it is doing its job.
+                    if (nFlowApplied % 250 == 0 && log.sensors[k].gyroscope.allFinite())
+                    {
+                        const Eigen::Vector3d wFlow = mfr.bodyRate();
+                        const Eigen::Vector3d wGyro = log.sensors[k].gyroscope;
+                        const Eigen::Vector3d b = system.density.mean().segment<3>(SystemLocalisation::iGyroBias);
+                        std::println("  flow t={:6.1f}s: {:3} matches ({} gated), resid {:.2f} px, "
+                                     "sigma {:.3f} rad/s ({:.0f}% interval) | flow-gyro=[{:+.3f} {:+.3f} {:+.3f}] "
+                                     "bGyro=[{:+.3f} {:+.3f} {:+.3f}]",
+                                     t, mfr.numMatches(), mfr.numGated(), mfr.fitResidual()*lens.width*lens.focalLength,
+                                     mfr.sigma().maxCoeff(), 100.0*mfr.intervalVarianceShare(),
+                                     wFlow.x() - wGyro.x(), wFlow.y() - wGyro.y(), wFlow.z() - wGyro.z(),
+                                     b.x(), b.y(), b.z());
+                    }
+                    if (flowApply)
+                    {
+                        system.process(mfr);
+                    }
+                    nFlowApplied++;
+                    sumFlowMatches += mfr.numMatches();
+                    sumFlowGated += mfr.numGated();
+                    sumFlowSigma += mfr.sigma().maxCoeff();
+                    sumFlowInterval += mfr.intervalVarianceShare();
+                }
+                else
+                {
+                    nFlowUnusable++;
+                }
+            }
+            double flowMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ticFlow).count();
+            sumFlowMs += flowMs;
+            maxFlowMs = std::max(maxFlowMs, flowMs);
+        }
+
         if (v.detections.empty() || !poseFinite)
         {
             system.predictAll(t);
@@ -1220,8 +1377,6 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
             captureSkipped(v, t, !poseFinite ? FrameSkip::BAD_POSE : FrameSkip::NO_DETECTIONS);
             continue;
         }
-
-        Pose<double> Tbc = log.sensors[k].Htw*v.Hcw.inverse();
 
         // Simulated kidnap: mirror the filter state once, without notifying the
         // side disambiguator, and let it detect and correct the flip.
@@ -1421,8 +1576,11 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
         if (useOutOfField && fetchVideoFrame(v.videoFrame))
         {
             auto ticOof = std::chrono::steady_clock::now();
-            cv::Mat gray;
-            cv::cvtColor(videoFrameBgr, gray, cv::COLOR_BGR2GRAY);
+            if (!haveGray)
+            {
+                cv::cvtColor(videoFrameBgr, gray, cv::COLOR_BGR2GRAY);
+                haveGray = true;
+            }
 
             // Camera pose under the mirrored state (same kinematics, mirrored torso pose).
             Eigen::VectorXd mirrorEta = SystemLocalisation::mirrorState(r.mean);
@@ -1730,6 +1888,30 @@ void runFieldLocalisation(const std::filesystem::path & dataDir, int interactive
                      truthSource == TruthSource::SIMULATOR
                          ? "truth z is the torso origin, so 0 is the target"
                          : "markers sit ~6 cm above the torso origin, so ~-0.06 m is expected");
+    }
+    if (nFlowFrames > 0)
+    {
+        std::println("Optical flow rotation: {} of {} frames became a measurement ({:.0f}%), {} unusable, "
+                     "{:.0f} tracked/frame -> {:.0f} far-field, {:.0f} used ({:.1f} pre-gated), "
+                     "{:.2f} ms mean / {:.2f} ms max",
+                     nFlowApplied, nFlowFrames, 100.0*static_cast<double>(nFlowApplied)/nFlowFrames,
+                     nFlowUnusable,
+                     static_cast<double>(sumFlowTracked)/nFlowFrames,
+                     static_cast<double>(sumFlowFar)/nFlowFrames,
+                     nFlowApplied > 0 ? static_cast<double>(sumFlowMatches)/nFlowApplied : 0.0,
+                     nFlowApplied > 0 ? static_cast<double>(sumFlowGated)/nFlowApplied : 0.0,
+                     sumFlowMs/nFlowFrames, maxFlowMs);
+        if (nFlowApplied > 0)
+        {
+            // Which way to spend effort. The interval share is the fraction of
+            // the measurement variance that comes from not knowing how omegaBb
+            // varied within the frame rather than from the rays: near 100% the
+            // tracking is already exact by comparison and only a faster camera
+            // helps, and no amount of extra features will sharpen it.
+            std::println("  measured rate sigma {:.4f} rad/s mean ({:.0f}% of the variance is the "
+                         "frame-interval term, not the rays); vs gyroscope sigma {:.4f} rad/s",
+                         sumFlowSigma/nFlowApplied, 100.0*sumFlowInterval/nFlowApplied, envDouble("SIGMA_GYRO", 0.02));
+        }
     }
     if (nOofFrames > 0)
     {

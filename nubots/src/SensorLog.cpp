@@ -291,6 +291,34 @@ SensorLog::SensorLog(const std::filesystem::path & jsonPath, const std::filesyst
             sample.Htw = parseIso3(data["Htw"]);
             sample.accelerometer = parseVec3(data["accelerometer"]);
             sample.gyroscope = parseVec3(data["gyroscope"]);
+
+            // Head servos, by NUbots ServoID: 18 = HEAD_YAW, 19 = HEAD_PITCH.
+            // The identification is not taken on trust -- Rz(yaw)*Ry(pitch) is
+            // what makes neckRotation^T * (Htw*Hcw^-1) constant to a median
+            // 0.02 deg across the 104 deg head scan in `data`, against 19.8 deg
+            // for assuming the head does not move at all.
+            simdjson::ondemand::array servos;
+            if (data["servo"].get_array().get(servos) == simdjson::SUCCESS)
+            {
+                int found = 0;
+                for (auto servoResult : servos)
+                {
+                    simdjson::ondemand::object servo;
+                    if (servoResult.get_object().get(servo) != simdjson::SUCCESS)
+                    {
+                        continue;
+                    }
+                    const double id = getDoubleTolerant(servo["id"]);
+                    if (id != 18.0 && id != 19.0)
+                    {
+                        continue;
+                    }
+                    const double position = getDoubleTolerant(servo["presentPosition"]);
+                    (id == 18.0 ? sample.headYaw : sample.headPitch) = position;
+                    found++;
+                }
+                sample.headValid = found == 2;
+            }
             sensors.push_back(std::move(sample));
         }
         else if (type == "message.vision.BoundingBoxes")
