@@ -1,5 +1,10 @@
 # MCHA4400 toolchain — dockerised
 
+
+https://github.com/user-attachments/assets/e9e0e93a-b026-40aa-af4a-73a470dc6e0d
+
+
+
 The Lab 1 "Toolchain setup" (clang, cmake, ninja, cppcheck, doctest, nanobench,
 boost, Eigen3, autodiff, SuiteSparse, OpenCV, VTK, ONNX Runtime, doxygen)
 packaged as a container. No Homebrew, no `apt`/`update-alternatives` dance, no
@@ -7,15 +12,12 @@ packaged as a container. No Homebrew, no `apt`/`update-alternatives` dance, no
 
 ## What you need on the host
 
-Already present on this machine:
-
 - Docker
-- An X server. On Wayland (Fedora KDE), XWayland provides this automatically via
-  `DISPLAY=:0`, so GUI windows just work.
+- An X server.
 
 ## Two ways to use it
 
-### 1. VS Code (recommended — matches the course's "VS Code as IDE" section)
+### 1. VS Code 
 
 1. Open this repository in VS Code.
 2. Install the **Dev Containers** extension if you haven't.
