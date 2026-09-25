@@ -43,7 +43,6 @@ struct ChessboardData
 
     Chessboard chessboard;
     std::vector<ChessboardImage> chessboardImages;
-    bool isFisheye = false;                                 // Calibrate with cv::fisheye (<camera_model>fisheye</camera_model>)
 
     void drawCorners();
     void drawBoxes(const Camera &);
@@ -85,7 +84,6 @@ struct Camera
     cv::Mat cameraMatrix;                                   // Camera matrix
     cv::Mat distCoeffs;                                     // Lens distortion coefficients
     int flags = 0;                                          // Calibration flags
-    bool isFisheye = false;                                 // Kannala-Brandt (cv::fisheye) model; distCoeffs = k1..k4
     cv::Size imageSize;                                     // Image size
 
     Pose<double> Tbc;                                       // Relative pose of camera in body coordinates (Rbc, rCBb)
@@ -109,11 +107,6 @@ Eigen::Vector2<Scalar> Camera::vectorToPixel(const Eigen::Vector3<Scalar> & rPCc
     bool isRationalModel    = (flags & cv::CALIB_RATIONAL_MODEL)    == cv::CALIB_RATIONAL_MODEL;
     bool isThinPrismModel   = (flags & cv::CALIB_THIN_PRISM_MODEL)  == cv::CALIB_THIN_PRISM_MODEL;
     bool isTiltedModel      = (flags & cv::CALIB_TILTED_MODEL)      == cv::CALIB_TILTED_MODEL;
-
-    if (isFisheye)
-    {
-        throw std::logic_error("Fisheye camera model not implemented in Eigen vectorToPixel.");
-    }
 
     if (isTiltedModel)
     {
