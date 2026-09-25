@@ -84,7 +84,10 @@ ChessboardImage::ChessboardImage(const cv::Mat & image_, const Chessboard & ches
         cv::cornerSubPix(
             gray,
             corners,
-            cv::Size(11, 11),
+            // Half-width of the search window. It must stay below half the corner spacing,
+            // or corners snap to neighbouring features: 11 (a 23 px window) gave 3.7 px RMS
+            // on the 544x448 K1 video, whose squares are only 8-16 px across.
+            cv::Size(5, 5),
             cv::Size(-1, -1),
             cv::TermCriteria(cv::TermCriteria::EPS + cv::TermCriteria::COUNT, 30, 0.001)
         );
@@ -193,7 +196,17 @@ void ChessboardImage::recoverPose(const Chessboard & chessboard, const Camera & 
     std::vector<cv::Point3f> rPNn_all = chessboard.gridPoints();
 
     cv::Mat Thetacn, rNCc;
-    cv::solvePnP(rPNn_all, corners, camera.cameraMatrix, camera.distCoeffs, Thetacn, rNCc);
+    if (camera.isFisheye)
+    {
+        // solvePnP only knows the standard model, so undistort to normalised coordinates first
+        std::vector<cv::Point2f> normalised;
+        cv::fisheye::undistortPoints(corners, normalised, camera.cameraMatrix, camera.distCoeffs);
+        cv::solvePnP(rPNn_all, normalised, cv::Mat::eye(3, 3, CV_64F), cv::noArray(), Thetacn, rNCc);
+    }
+    else
+    {
+        cv::solvePnP(rPNn_all, corners, camera.cameraMatrix, camera.distCoeffs, Thetacn, rNCc);
+    }
 
     Pose<double> Tcn(Thetacn, rNCc);
     Tnc = Tcn.inverse();
@@ -222,6 +235,11 @@ ChessboardData::ChessboardData(const std::filesystem::path & configPath)
     // Read file pattern for chessboard images
     std::string pattern;
     node["file_regex"] >> pattern;
+
+    // Optional lens model to calibrate: "standard" (default) or "fisheye"
+    std::string cameraModel;
+    node["camera_model"] >> cameraModel;
+    isFisheye = (cameraModel == "fisheye");
     fs.release();
 
     // Create regex object from pattern
@@ -272,7 +290,7 @@ ChessboardData::ChessboardData(const std::filesystem::path & configPath)
                             std::println(" done, found {} frames", nFrames);
 
                             // Loop through selected frames
-                            for (int idxFrame = 0; idxFrame < nFrames; idxFrame += 50/*Use every 50th frame*/)
+                            for (int idxFrame = 0; idxFrame < nFrames; idxFrame += 25/*Use every 25th frame*/)
                             {
                                 // Read frame
                                 std::print("Reading {} frame {}...", p.path().filename().string(), idxFrame);
@@ -342,26 +360,53 @@ void Camera::calibrate(ChessboardData & chessboardData)
 
     imageSize = chessboardData.chessboardImages[0].image.size();
     
-    flags = cv::CALIB_RATIONAL_MODEL | cv::CALIB_THIN_PRISM_MODEL;
-
     std::vector<std::vector<cv::Point3f>> objectPoints(chessboardData.chessboardImages.size(), rPNn_all);
 
     // Find intrinsic and extrinsic camera parameters
+    isFisheye = chessboardData.isFisheye;
     cameraMatrix = cv::Mat::eye(3, 3, CV_64F);
-    distCoeffs = cv::Mat::zeros(12, 1, CV_64F);
     // std::vector<cv::Mat> Thetacn_all, rNCc_all;
     std::vector<cv::Mat> rvecs, tvecs;
-    std::print("Calibrating camera...");
-    double rms = cv::calibrateCamera(
-        objectPoints,   // vector<vector<Point3f>>
-        rQOi_all,       // vector<vector<Point2f>>
-        imageSize,      // cv::Size
-        cameraMatrix,   // CV_64F
-        distCoeffs,     // CV_64F (size matches flags)
-        rvecs,          // output rvecs (size = nimages)
-        tvecs,          // output tvecs (size = nimages)
-        flags
-    );
+    double rms;
+    if (isFisheye)
+    {
+        // Kannala-Brandt model: theta_d = theta*(1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8)
+        flags = cv::fisheye::CALIB_RECOMPUTE_EXTRINSIC | cv::fisheye::CALIB_FIX_SKEW;
+        distCoeffs = cv::Mat::zeros(4, 1, CV_64F);
+        std::print("Calibrating camera (fisheye model)...");
+        rms = cv::fisheye::calibrate(
+            objectPoints,   // vector<vector<Point3f>>
+            rQOi_all,       // vector<vector<Point2f>>
+            imageSize,      // cv::Size
+            cameraMatrix,   // CV_64F
+            distCoeffs,     // CV_64F, k1..k4
+            rvecs,          // output rvecs (size = nimages)
+            tvecs,          // output tvecs (size = nimages)
+            flags,
+            cv::TermCriteria(cv::TermCriteria::COUNT + cv::TermCriteria::EPS, 200, 1e-10)
+        );
+    }
+    else
+    {
+        // Fit only k1, k2, p1, p2, k3 (standard 5-coefficient model). The rational and
+        // thin-prism terms stay in distCoeffs, fixed at zero, because projection code
+        // reads all 12 coefficients.
+        flags = cv::CALIB_RATIONAL_MODEL | cv::CALIB_THIN_PRISM_MODEL
+              | cv::CALIB_FIX_K4 | cv::CALIB_FIX_K5 | cv::CALIB_FIX_K6
+              | cv::CALIB_FIX_S1_S2_S3_S4;
+        distCoeffs = cv::Mat::zeros(12, 1, CV_64F);
+        std::print("Calibrating camera...");
+        rms = cv::calibrateCamera(
+            objectPoints,   // vector<vector<Point3f>>
+            rQOi_all,       // vector<vector<Point2f>>
+            imageSize,      // cv::Size
+            cameraMatrix,   // CV_64F
+            distCoeffs,     // CV_64F (size matches flags)
+            rvecs,          // output rvecs (size = nimages)
+            tvecs,          // output tvecs (size = nimages)
+            flags
+        );
+    }
     std::println(" done");
     
     // Pre-compute constants used in isVectorWithinFOV
@@ -409,6 +454,7 @@ void Camera::printCalibration() const
 {
     std::bitset<8*sizeof(flags)> bitflag(flags);
     std::println("\nCalibration data:");
+    std::println("{:>30} {}", "Lens model:", isFisheye ? "fisheye (Kannala-Brandt)" : "standard");
     std::println("{:>30} {}", "Bit flags:", bitflag.to_string());
     std::println("{:>30}\n{}", "cameraMatrix:", to_string(cameraMatrix));
     std::println("{:>30}\n{}", "distCoeffs:", to_string(distCoeffs.t()));
@@ -482,14 +528,28 @@ cv::Vec2d Camera::vectorToPixel(const cv::Vec3d & rPCc) const
 {
     cv::Vec2d rQOi;
     std::vector<cv::Point2d> imagePoints;
-    cv::projectPoints(
-        std::vector<cv::Vec3d>{rPCc}, 
-        cv::Vec3d::zeros(), // no rotation
-        cv::Vec3d::zeros(), // no translation
-        cameraMatrix, 
-        distCoeffs, 
-        imagePoints
-    );
+    if (isFisheye)
+    {
+        cv::fisheye::projectPoints(
+            std::vector<cv::Vec3d>{rPCc},
+            imagePoints,
+            cv::Vec3d::zeros(), // no rotation
+            cv::Vec3d::zeros(), // no translation
+            cameraMatrix,
+            distCoeffs
+        );
+    }
+    else
+    {
+        cv::projectPoints(
+            std::vector<cv::Vec3d>{rPCc}, 
+            cv::Vec3d::zeros(), // no rotation
+            cv::Vec3d::zeros(), // no translation
+            cameraMatrix, 
+            distCoeffs, 
+            imagePoints
+        );
+    }
     // Check if projection was successful
     if (imagePoints.empty()) {
         throw std::runtime_error("vectorToPixel: projection returned no points");
@@ -504,6 +564,11 @@ cv::Vec2d Camera::vectorToPixel(const cv::Vec3d & rPCc) const
 
 Eigen::Vector2d Camera::vectorToPixel(const Eigen::Vector3d & rPCc, Eigen::Matrix23d & J) const
 {
+    if (isFisheye)
+    {
+        throw std::logic_error("Fisheye camera model not implemented in Eigen vectorToPixel.");
+    }
+
     Eigen::Vector2d rQOi;
     double fx_ = cameraMatrix.at<double>(0, 0);
     double fy_ = cameraMatrix.at<double>(1, 1);
@@ -588,12 +653,19 @@ cv::Vec3d Camera::pixelToVector(const cv::Vec2d & rQOi) const
     std::vector<cv::Point2f> pxLocation = {cv::Point2f(rQOi[0], rQOi[1])};
     // pxLocation.push_back(cv::Point2f(static_cast<float>(rQOi[0]), static_cast<float>(rQOi[1])));
 
-    cv::undistortPoints(
-        pxLocation,
-        undistorted,
-        cameraMatrix,
-        distCoeffs
-    );
+    if (isFisheye)
+    {
+        cv::fisheye::undistortPoints(pxLocation, undistorted, cameraMatrix, distCoeffs);
+    }
+    else
+    {
+        cv::undistortPoints(
+            pxLocation,
+            undistorted,
+            cameraMatrix,
+            distCoeffs
+        );
+    }
 
     if (undistorted.empty())
     {
@@ -642,7 +714,14 @@ Eigen::Matrix<double, 2, Eigen::Dynamic> Camera::undistort(const Eigen::Matrix<d
     // Undistort points
     std::vector<cv::Point2d> rQbarOi_cv;
 
-    cv::undistortPoints(rQOi_cv, rQbarOi_cv, cameraMatrix, distCoeffs, cv::noArray(), cameraMatrix);
+    if (isFisheye)
+    {
+        cv::fisheye::undistortPoints(rQOi_cv, rQbarOi_cv, cameraMatrix, distCoeffs, cv::noArray(), cameraMatrix);
+    }
+    else
+    {
+        cv::undistortPoints(rQOi_cv, rQbarOi_cv, cameraMatrix, distCoeffs, cv::noArray(), cameraMatrix);
+    }
 
     // Convert from std::vector of cv::Point2d to Eigen matrix
     Eigen::Matrix<double, 2, Eigen::Dynamic> rQbarOi(2, rQOi.cols());
@@ -784,6 +863,7 @@ void Camera::write(cv::FileStorage & fs) const
        << "camera_matrix"           << cameraMatrix
        << "distortion_coefficients" << distCoeffs
        << "flags"                   << flags
+       << "fisheye"                 << static_cast<int>(isFisheye)
        << "imageSize"               << imageSize
        << "}";
 }
@@ -793,6 +873,9 @@ void Camera::read(const cv::FileNode & node)
     node["camera_matrix"]           >> cameraMatrix;
     node["distortion_coefficients"] >> distCoeffs;
     node["flags"]                   >> flags;
+    int fisheye = 0;                                        // Absent in older files: standard model
+    node["fisheye"]                 >> fisheye;
+    isFisheye = (fisheye != 0);
     node["imageSize"]               >> imageSize;
 
     // Pre-compute constants used in isVectorWithinFOV
